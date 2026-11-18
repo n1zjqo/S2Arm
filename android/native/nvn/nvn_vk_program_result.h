@@ -7,8 +7,8 @@
 /* 结果 bindings 条数的合同上限——按 producer 合同推导，不是拍出来的常量：
  * DirectAllocator/DirectProfile 每阶段至多 18 uniform（NVN/Maxwell cbuf 槽）+
  * 16 storage（存储描述符表项）+ 64 texture（执行层组合纹理上限）+ 16 image；
- * DirectShaderCompiler 的图形程序固定 vs+fs 两阶段，再加 1 条全程序共享的
- * support binding：1 + 2×(18+16+64+16) = 229。compute 程序仅 cs 一阶段
+ * DirectShaderCompiler 的图形程序固定 vs+fs+gs 三阶段，再加 1 条全程序共享的
+ * support binding：1 + 3×(18+16+64+16) = 343。compute 程序仅 cs 一阶段
  * （1+18+16=35），同一上限同样覆盖。
  * 超过此数的结果已违反 s2a-direct-program-v1 合同或已损坏——照旧准确失败，
  * 绝不静默截断。设备端能否容纳另由 maxDescriptorSet* / maxPerStageDescriptor*
@@ -19,7 +19,11 @@
 #define FD_STAGE_MAX_STORAGE 16
 #define FD_STAGE_MAX_TEXTURES 64
 #define FD_STAGE_MAX_IMAGES 16
-#define FD_GRAPHICS_STAGE_COUNT 2
+/* Replay's RP_TEXARR_MAX; validate before the 16-bit backend layout count. */
+#define FD_MAX_ARRAY_ELEMENTS 64
+/* Parsed layout needs more descriptors than the replay layer can bind per array. */
+#define NVK_PROGRAM_ARRAY_UNSUPPORTED (-2)
+#define FD_GRAPHICS_STAGE_COUNT 3
 #define FD_MAX_BINDINGS (1 + FD_GRAPHICS_STAGE_COUNT * \
     (FD_STAGE_MAX_UNIFORMS + FD_STAGE_MAX_STORAGE + FD_STAGE_MAX_TEXTURES + FD_STAGE_MAX_IMAGES))
 #define FD_MAX_STAGES 6
@@ -29,15 +33,32 @@ struct fd_stage {
     uint8_t *spirv;
     size_t spirv_bytes;
     uint32_t attr_mask;
+    uint32_t fragment_output_map;   // 片元阶段：每个颜色目标 4 位（RGBA）= 着色器写了哪些输出分量；读不到为全 1
+    int binst_unread;               // 图形阶段：结果的 c0Reads 证明不读 c0 + 0x644（本笔 base instance）；0 = 读或未知
 };
+#define FD_C0_BASE_INSTANCE 0x644u   // 驱动常量段里图形阶段的 base instance 字（nvn_vk_mrt.h、回放 fill_graphics_drv 同位）
+
+/* 句柄放在游戏用户常量缓冲里的一个 32 位字（v1 uboHandle / sampler.handle；iOS nvn_refl.h NVN_RB_TEXU / SAMPU / TBUFU 的 reg / off / sid / pair）：
+ * 用户常量槽 slot 的字节 offset 处；sid = 这个字是采样器号（读出后左移 20）；pair = 同一句柄的另一半（pair_sid：那半是采样器号字，左移 20 后相或）。 */
+struct fd_ubo_word { uint8_t slot, sid, pair, pair_slot, pair_sid; uint16_t offset, pair_offset; };
+enum { FD_SAMP_NONE = 0, FD_SAMP_UBO, FD_SAMP_ID, FD_SAMP_SLOT };   // fd_binding.samp_src
 
 struct fd_binding {
     int set, binding, kind;   // kind: 0 uniform/support, 1 storage, 2 texture, 3 image
     int slot;
+    uint16_t count;           // 描述符数组长度（不是数组为 1）。kind==2 且 count>1 = 从句柄表第 slot 项起的贴图数组
     char stage[16];
     // 下面这些只由 program 内容决定，加载时算一次；逐笔 draw 不再做 strcmp / 除法。
     int8_t stage_idx;         // 0=vs 1=fs 2=gs 3=tcs 4=tes 5=cs，-1 = 其它/未知
-    int8_t tex_slot;          // kind==2 的组合纹理槽（<0 = 该 handleIndex 不合法）
+    int16_t tex_slot;         // 组合槽 0..31 或分离贴图槽 128..255；-1 = 未解析
+    int16_t samp_slot;        // -1 = 组合句柄；0..127 = 分离采样器来源槽
+    uint8_t texel_buffer;     // 真实 SPIR-V 证明该 texture 是只读 Buffer；不是普通采样图像
+    // kind==2 且 tex_ubo = 1：贴图句柄不在槽里，在用户常量缓冲 tex_u 处（_b.json tex_ubo / tbuf_ubo）。此时 tex_slot = -1。
+    //   samp_src = 组合采样的采样器从哪来：FD_SAMP_UBO = 常量缓冲 samp_u 处的字；FD_SAMP_ID = 常量采样器号 samp_val；
+    //   FD_SAMP_SLOT = NVN 采样器槽 samp_val；FD_SAMP_NONE = 着色器没有采样器半边
+    uint8_t tex_ubo, samp_src;
+    uint16_t samp_val;
+    struct fd_ubo_word tex_u, samp_u;
     int16_t ubo_slot;         // kind==0 的 NVN 用户槽（cbuf - 3，clamp 到 0）
     uint8_t is_support;       // kind==0 且 stage=="program"（SupportBuffer）
     // kind==1 的地址来源（编译期从 ShaderProgramInfo.SBuffers 解析）：
@@ -60,6 +81,8 @@ extern "C" {
 #endif
 int nvn_vk_program_graphics_stage_index(const char *name);
 int nvn_vk_program_parse_graphics(const uint8_t *bytes, size_t length, struct fd_program *out, char *why, size_t why_size);
+// 同上，allow_vs_only = 1 时也接受只有顶点阶段的程序（只写深度的绘制；新回放层用）。
+int nvn_vk_program_parse_graphics_stages(const uint8_t *bytes, size_t length, struct fd_program *out, int allow_vs_only, char *why, size_t why_size);
 void nvn_vk_program_free(struct fd_program *program);
 int nvn_vk_program_vertex_storage_safe(const uint8_t *bytes, size_t length, char *why, size_t why_size);
 #ifdef __cplusplus
@@ -75,6 +98,7 @@ struct nvn_vk_compute_storage {
     uint32_t index, offset; /* proven NVN slot / UBO slot and optional byte offset */
 };
 #define NVK_COMPUTE_C0_MAX_READS 256
+#define NVK_PROGRAM_RESULT_MAX_BYTES (64u * 1024u * 1024u)   // 编译结果文档上限：同跨局程序缓存单条（program_cache.c PCACHE_MAX_PAYLOAD）
 #define NVK_COMPUTE_C0_BYTES 0x410u
 struct nvn_vk_c0_read { uint32_t offset, size; };
 struct nvn_vk_support_scale { uint32_t offset, stride, count, element_bytes; };

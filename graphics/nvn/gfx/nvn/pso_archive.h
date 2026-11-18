@@ -26,6 +26,75 @@ static NSMutableDictionary<NSString *, id<MTLBinaryArchive>> *g_par_open; // ope
 static NSString *g_par_dir, *g_par_bdir;                                // g_par_bdir: the package's read-only archives (shaders/direct/pipelines, made at pack time)
 static NSMutableSet<NSString *> *g_par_bhave;                             // keys with a package file
 static int g_par_on;
+// #756（iPad Pro M1、iOS 18.3.1：每次起局预热后，后台写管线归档时在 Metal 里 objc_retain 崩，之后每次打开都闪退）：写归档只是「下次起得快」的优化，
+//   写不成不影响玩。每批写之前在归档目录留 .writing、写完删掉；起局发现它还在 = 上次进程死在写归档里 → 这台设备这个系统版本不再写（照常读已有的、照常编），
+//   记一行黄字。标记留着不删，之后每次起局都不写；系统 / GPU / 翻译链一变，identity.json 对不上，整个目录连标记一起删掉、重新开写
+//   #618 诊断包（v0.3.2，Mac）：一局 91 s 优雅退出时写线程正在写，收局 _exit(0) 把它连同标记一起留下，下一局误判成 #756、从此不写，每局重编管线、卡顿。
+//   根修：标记只表示「进程死在写里」，正常收局不算——收局一开头调 s2a_pso_archive_exit：停写（g_par_closing）并删标记（见那里）。
+//   标记内容带版本行 PAR_WRITING_TAG；修之前的版本留下的标记（没有这行）分不清是崩还是正常收局，删掉、重新写一次（真崩的设备会再崩一次、留下新标记，之后不再写）
+static int g_par_nowrite;
+static _Atomic int g_par_closing;   // 进程在收局：不再起新的一批写（s2a_pso_archive_exit）
+static pthread_mutex_t g_par_mkmu = PTHREAD_MUTEX_INITIALIZER;   // 留标记与收局删标记互斥（只包住一次 open / write / fsync，不包 Metal）
+#define PAR_WRITING @".writing"
+#define PAR_WRITING_TAG "s2a-pso-writing 2"
+// 写一批之前留标记：版本行 + 进程号 + 批文件名。已在收局返回 0、不留（与 s2a_pso_archive_exit 在 g_par_mkmu 下互斥：
+//   收局先置位再删，持锁期间留下的标记一定在它删之前，之后留的一定看到收局，标记不会留到 _exit 之后）
+static int par_mark_writing(const char *path, NSString *batch) {
+    pthread_mutex_lock(&g_par_mkmu);
+    int go = !atomic_load(&g_par_closing);
+    if (go) { int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+              if (fd >= 0) { dprintf(fd, PAR_WRITING_TAG " pid=%d %s\n", getpid(), batch.UTF8String); fsync(fd); close(fd); } }
+    pthread_mutex_unlock(&g_par_mkmu);
+    return go;
+}
+// #756 进阶（11-16）：每款各自的 .writing 标记要每款先崩一次才学会，且用户划掉 / 内存杀也会留下它（玩家诊断 27.x 上 3214 局里 143 局），不能直接全机共享。另加两道：
+//   ① 版本先验：iOS 18.0–18.3.x 不写。依据玩家诊断：崩溃线程栈在归档写入器里的 7 局全在 18.1.1 / 18.3.2，18.2 / 18.3.2 有 18 局「上次死在写里」、0 局写成；18.4、18.7.x 共 13 局写成、0 崩
+//   ② 全机学习：只在崩溃线程正在写归档（g_par_in_write）时由崩溃处理器（runtime/src/crash.c）记一行系统版本串进全机标记（Application Support/S2Arm/pso_archive_dead.txt）；
+//      起局读到本系统版本串就不写。版本串含构建号，系统升级后自动不再命中、重新判
+static __thread int g_par_in_write;
+static char g_par_dead_path[1024], g_par_os_key[192];
+static int par_os_gate(int ios, long major, long minor) { return ios && major == 18 && minor < 4; }
+void s2a_pso_archive_crash_note(void);
+void s2a_pso_archive_crash_note(void) {   // 崩溃处理器在崩溃线程上调（信号处理里：只用 open / write / close）
+    if (!g_par_in_write || !g_par_dead_path[0] || !g_par_os_key[0]) return;
+    int fd = open(g_par_dead_path, O_WRONLY | O_CREAT | O_APPEND, 0644); if (fd < 0) return;
+    (void)!write(fd, g_par_os_key, strlen(g_par_os_key)); (void)!write(fd, "\n", 1); close(fd);
+}
+static int par_dead_global_has(void) {   // 全机标记里有本系统版本串
+    if (!g_par_dead_path[0] || !g_par_os_key[0]) return 0;
+    NSString *s = [NSString stringWithContentsOfFile:@(g_par_dead_path) encoding:NSUTF8StringEncoding error:nil];
+    for (NSString *ln in [s componentsSeparatedByString:@"\n"]) if ([ln isEqualToString:@(g_par_os_key)]) return 1;
+    return 0;
+}
+static void par_global_init(void) {
+    NSString *osk = NSProcessInfo.processInfo.operatingSystemVersionString ?: @""; snprintf(g_par_os_key, sizeof g_par_os_key, "%s", osk.UTF8String);
+    NSURL *as = [NSFileManager.defaultManager URLsForDirectory:NSApplicationSupportDirectory inDomains:NSUserDomainMask].firstObject;
+    if (!as) return;
+    NSString *dir = [as.path stringByAppendingPathComponent:@"S2Arm"];
+    [NSFileManager.defaultManager createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    snprintf(g_par_dead_path, sizeof g_par_dead_path, "%s", [dir stringByAppendingPathComponent:@"pso_archive_dead.txt"].fileSystemRepresentation);
+}
+// ①② 之一命中返回 1（并打一行原因）。单测直接调
+static int par_gate_or_learned(int ios, long major, long minor) {
+    if (par_os_gate(ios, major, minor)) { MLOG("【黄】 pipeline archive: iOS %ld.%ld: Metal's archive writer crashes on iOS 18.0–18.3 (#756, player diagnoses): reading it as usual, writing nothing", major, minor); return 1; }
+    if (par_dead_global_has()) { MLOG("【黄】 pipeline archive: a game on this device crashed inside the archive writer on this OS version (%s, #756): reading it as usual, writing nothing", g_par_os_key); return 1; }
+    return 0;
+}
+static void par_check_dead_write(void) {   // 起局（打开归档目录时）调：上次进程死在写归档里 → 这个系统版本不再写
+    { NSOperatingSystemVersion v = NSProcessInfo.processInfo.operatingSystemVersion;
+      if (par_gate_or_learned(TARGET_OS_IPHONE, (long)v.majorVersion, (long)v.minorVersion)) { g_par_nowrite = 1; return; } }
+    NSString *path = [g_par_dir stringByAppendingPathComponent:PAR_WRITING];
+    NSData *d = [NSData dataWithContentsOfFile:path]; if (!d) return;
+    NSString *s = [[[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] ?: @"";
+    if (![s hasPrefix:@PAR_WRITING_TAG " "]) {   // 修之前的标记：正常收局也会留下（#618），不当崩溃
+        unlink(path.fileSystemRepresentation);
+        MLOG("【黄】 pipeline archive: removed a .writing marker from an older build (it was also left by a normal exit then, #618): writing again; a real crash in the writer leaves a new one");
+        return;
+    }
+    g_par_nowrite = 1;
+    MLOG("【黄】 pipeline archive: the last run died while writing it (%s; #756: Metal crashed inside the archive writer on iOS 18): reading it as usual, writing nothing more on this OS version",
+         [s substringFromIndex:strlen(PAR_WRITING_TAG " ")].UTF8String);
+}
 static const char *g_par_harvest;                                        // S2A_PSO_HARVEST: the folder the harvest writes into (nvn_pso_harvest); writes at once instead of noting
 static _Atomic uint64_t g_par_hits, g_par_misses, g_par_written, g_par_write_failed, g_par_stale, g_par_ga_removed;
 static __thread int par_write_in_place;                                  // the prewarm's threads: what they compile is noted for writing (par_flush_bg)
@@ -146,6 +215,8 @@ static void par_open_dir(void) {
             g_par_bmap[c[0]] = c[1]; [g_par_have addObject:c[0]];
         }
         for (NSString *f in bfiles) { bytes += [[fm attributesOfItemAtPath:[g_par_dir stringByAppendingPathComponent:f] error:nil] fileSize]; nb++; }
+        par_global_init();
+        par_check_dead_write();
         g_par_on = 1;
         MLOG("pipeline archive %s: %lu pipelines (%lu in %lu batch files, the rest one file each; %.1f MB), opened when used", g_par_dir.UTF8String, (unsigned long)g_par_have.count,
              (unsigned long)g_par_bmap.count, (unsigned long)nb, bytes / 1048576.0);
@@ -232,6 +303,10 @@ static void par_write_batch(NSArray<NSArray *> *items) {
     NSMutableArray<NSString *> *keys = [NSMutableArray array]; NSError *e = nil; BOOL ok = NO;
     pthread_mutex_lock(&g_par_wmu); int lk = par_ga_lock();
     NSSet<NSString *> *before = par_ga_list(0);
+    // #756：写之前留标记、写完（成不成都算）删掉；进程死在这一段里，标记留下，下次起局就不再写。#618：已在收局就不留、不写（par_mark_writing）
+    const char *writing = [g_par_dir stringByAppendingPathComponent:PAR_WRITING].fileSystemRepresentation;
+    if (!par_mark_writing(writing, name)) { par_ga_unlock(lk); pthread_mutex_unlock(&g_par_wmu); return; }
+    g_par_in_write = 1;   // 崩在这一段里：崩溃处理器记全机标记（s2a_pso_archive_crash_note）
     @autoreleasepool {
         id<MTLBinaryArchive> a = [g_dev newBinaryArchiveWithDescriptor:[MTLBinaryArchiveDescriptor new] error:&e];
         for (NSArray *it in todo) { NSError *e1 = nil; id desc = it[1];
@@ -239,6 +314,8 @@ static void par_write_batch(NSArray<NSArray *> *items) {
             if (one) [keys addObject:it[0]]; else { e = e1; atomic_fetch_add(&g_par_write_failed, 1); } }
         if (keys.count) ok = [a serializeToURL:[NSURL fileURLWithPath:temp] error:&e] && rename(temp.fileSystemRepresentation, path.fileSystemRepresentation) == 0;
     }
+    g_par_in_write = 0;
+    unlink(writing);
     par_ga_remove_new(before);
     if (ok) {   // the index after the file: a line always names a file that is there
         NSMutableString *lines = [NSMutableString string]; for (NSString *k in keys) [lines appendFormat:@"%@\t%@\n", k, name];
@@ -257,13 +334,14 @@ static void par_writer(void) { @autoreleasepool {
     for (;;) @autoreleasepool {
         pthread_mutex_lock(&g_par_mu);
         NSUInteger n = MIN(g_par_todo.count, (NSUInteger)PAR_BATCH); NSArray *batch = n ? [g_par_todo subarrayWithRange:NSMakeRange(0, n)] : nil;
-        if (n) [g_par_todo removeObjectsInRange:NSMakeRange(0, n)]; else g_par_writer = 0;
+        if (n && !atomic_load(&g_par_closing)) [g_par_todo removeObjectsInRange:NSMakeRange(0, n)]; else { batch = nil; g_par_writer = 0; }
         pthread_mutex_unlock(&g_par_mu);
         if (!batch) break;
         par_write_batch(batch);   // whatever is noted when the writer comes round, up to PAR_BATCH a file
     }
 } }
 static void par_note(NSString *key, id desc) {
+    if (g_par_nowrite || atomic_load(&g_par_closing)) return;   // #756：上次死在写归档里，这个系统版本不再写；#618：在收局
     pthread_mutex_lock(&g_par_mu);
     if (!g_par_todo) g_par_todo = [NSMutableArray array];
     [g_par_todo addObject:@[key, desc]];
@@ -271,6 +349,17 @@ static void par_note(NSString *key, id desc) {
     if (start && !g_par_w_t0) { g_par_w_t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); g_par_w_n0 = atomic_load(&g_par_written); }
     pthread_mutex_unlock(&g_par_mu);
     if (start) dispatch_async(s2a_qos_global(S2A_QOS_IO_BG), ^{ par_writer(); });
+}
+// #618：进程正常收局（runtime/src/lifecycle.c s2a_host_shutdown 一开头经 dlsym 调，两个 _exit(0) 出口之前）：不再起新的一批写，删掉本进程留的 .writing。
+//   本局起局就见到标记（g_par_nowrite，上次真死在写里）时不删：那是 #756 的持久判定，本局没写过、标记不是本局的。
+//   正在写的那一批不等（收局有 1.5 s 兜底，丢一批下次再写），它随 _exit 结束不算「死在写里」。之后写线程若真在 Metal 里崩，这一次漏记，
+//   下一局再写再崩时照样留下标记（#756 是每局都崩）
+void s2a_pso_archive_exit(void);
+void s2a_pso_archive_exit(void) {
+    pthread_mutex_lock(&g_par_mkmu);
+    atomic_store(&g_par_closing, 1);
+    NSString *dir = g_par_dir; if (dir && !g_par_nowrite) unlink([dir stringByAppendingPathComponent:PAR_WRITING].fileSystemRepresentation);
+    pthread_mutex_unlock(&g_par_mkmu);
 }
 // After the prewarm: how far the writer is (it goes on until what the prewarm noted is written)
 static void par_flush_bg(void) {
@@ -290,24 +379,31 @@ static void par_count(int hit) {
 //   原先各编各的：提交线程急用的那条若正被预热工人编着，它自己再编一遍，两份一起排编译服务（Switch2 线时之笛读数：与提交线程重复建同一条；
 //   斯普拉遁3 c1104_r2 第 232 帧单条首用等待 36.7 s）。现在后到的等先到的那份、把自己的 QoS 借给它（同 flight_wait_locked），拿同一个管线对象（Metal 管线对象线程安全）；
 //   先到的失败（nil）时后到的自己再编一次，取它自己的错误信息
-@interface ParFlight : NSObject { @public dispatch_group_t done; id result; pthread_t builder; } @end
+@interface ParFlight : NSObject { @public dispatch_group_t done; id result; pthread_t builder; _Atomic int gave_up; } @end
 @implementation ParFlight @end
 static NSMutableDictionary<NSString *, ParFlight *> *g_par_flights;
+// 调用方等不及先走了（par_compute_wait 超时）、之后才编完的管线：下一次同键请求直接取走（#884）
+static NSMutableDictionary<NSString *, id> *g_par_late;
 static os_unfair_lock g_par_fl_lock = OS_UNFAIR_LOCK_INIT;
-// 进：有人在编同一键 → 等它编完返回 1、*out = 它的结果；否则登记本线程为编者、*mine = 本次的在途记录，返回 0
-static int par_fl_enter(NSString *key, id *out, ParFlight **mine) {
-    *mine = nil; *out = nil;
+// 进：有人在编同一键 → 等它编完返回 1、*out = 它的结果；否则登记本线程为编者、*mine = 本次的在途记录，返回 0。
+//   wait_ns < 0 = 一直等（原行为）；≥ 0 = 至多等这么久：等不到（或这一键早有人等超时过）返回 1、*out = nil、*gave_up = 1，在途记录留着、编者照常编完（#884）
+static int par_fl_enter_wait(NSString *key, id *out, ParFlight **mine, int64_t wait_ns, int *gave_up) {
+    *mine = nil; *out = nil; if (gave_up) *gave_up = 0;
     if (!key) return 0;
     os_unfair_lock_lock(&g_par_fl_lock);
+    id late = g_par_late[key];
+    if (late) { [g_par_late removeObjectForKey:key]; os_unfair_lock_unlock(&g_par_fl_lock); *out = late; return 1; }
     ParFlight *f = g_par_flights[key];
     if (f) {
+        if (wait_ns >= 0 && atomic_load(&f->gave_up)) { os_unfair_lock_unlock(&g_par_fl_lock); if (gave_up) *gave_up = 1; return 1; }   // 已有人等超时：不再每次都等满
         pthread_override_t ov = f->builder && !pthread_equal(f->builder, pthread_self()) ? pthread_override_qos_class_start_np(f->builder, qos_class_self(), 0) : NULL;
         os_unfair_lock_unlock(&g_par_fl_lock);
         struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
-        dispatch_group_wait(f->done, DISPATCH_TIME_FOREVER);
+        long w = dispatch_group_wait(f->done, wait_ns < 0 ? DISPATCH_TIME_FOREVER : dispatch_time(DISPATCH_TIME_NOW, wait_ns));
         clock_gettime(CLOCK_MONOTONIC, &t1);
         if (ov) pthread_override_qos_class_end_np(ov);
         atomic_fetch_add(&g_par_dedup, 1); atomic_fetch_add(&g_par_dedup_ns, (uint64_t)((t1.tv_sec - t0.tv_sec) * 1000000000ll + (t1.tv_nsec - t0.tv_nsec)));
+        if (w) { atomic_store(&f->gave_up, 1); if (gave_up) *gave_up = 1; return 1; }
         *out = f->result; return 1;
     }
     f = [ParFlight new]; f->done = dispatch_group_create(); dispatch_group_enter(f->done); f->builder = pthread_self();
@@ -316,9 +412,12 @@ static int par_fl_enter(NSString *key, id *out, ParFlight **mine) {
     os_unfair_lock_unlock(&g_par_fl_lock);
     return 0;
 }
-static void par_fl_leave(NSString *key, ParFlight *mine, id result) {   // 编者编完：登记结果、摘掉在途、放行等它的
+static int par_fl_enter(NSString *key, id *out, ParFlight **mine) { return par_fl_enter_wait(key, out, mine, -1, NULL); }
+static void par_fl_leave(NSString *key, ParFlight *mine, id result) {   // 编者编完：登记结果、摘掉在途、放行等它的；有人等超时先走了的，结果留给下一次同键请求
     if (!mine) return;
-    os_unfair_lock_lock(&g_par_fl_lock); mine->result = result; [g_par_flights removeObjectForKey:key]; os_unfair_lock_unlock(&g_par_fl_lock);
+    os_unfair_lock_lock(&g_par_fl_lock); mine->result = result; [g_par_flights removeObjectForKey:key];
+    if (result && atomic_load(&mine->gave_up)) { if (!g_par_late) g_par_late = [NSMutableDictionary dictionary]; g_par_late[key] = result; }
+    os_unfair_lock_unlock(&g_par_fl_lock);
     dispatch_group_leave(mine->done);
 }
 static id<MTLRenderPipelineState> par_render_(MTLRenderPipelineDescriptor *d, NSString *key, NSError **e);
@@ -327,22 +426,38 @@ static id<MTLComputePipelineState> par_compute_(id<MTLFunction> fn, NSString *ke
 //   thread stood inside a compute pipeline build for over 30 s on the first gameplay frame, and nothing in the log named the shader, because a build is logged only when it
 //   returns). The note fires from a timer while the build still runs; a build that took longer than PAR_SLOW_MS also logs its time when it returns, and whether it built or failed (11-05: a compile the system killed at its 150 MB limit returned nil after 8.4 s and read as built). Nothing else changes.
 enum { PAR_SLOW_MS = 5000 };
-typedef struct { _Atomic int done; char key[96]; char kind[8]; char thread[32]; char fns[160]; uint64_t t0; } ParSlow;
+static int g_par_slow_ms = PAR_SLOW_MS;   // 单测改短
+// #065090：慢编译那一行带上 MSL 摘要（谁的源、行数、哈希、main0 体多长、大计算核拆分 DshOutline 拆没拆，见 msl_note），回落翻译的还把源文件留一份
+//   <键>.slow.metal 在兜底目录（诊断包随 .inflight / .fail 一起带走，ios/diag.m）：发版后同类停帧还在，就能当场判拆分是没覆盖到还是拆了也慢。
+//   调用方在本线程建管线前设 t_par_msl_note / t_par_msl_src（par_slow_begin 同步拷走），建完清空
+static __thread const char *t_par_msl_note, *t_par_msl_src;
+enum { PAR_SLOW_KEEP_MAX = 4 };   // 一局至多留几份源
+static void par_slow_keep_src(const char *src) {
+    static _Atomic int n;
+    size_t L = strlen(src); if (L < 7 || strcmp(src + L - 6, ".metal") || atomic_fetch_add(&n, 1) >= PAR_SLOW_KEEP_MAX) return;
+    NSString *s = @(src), *d = [[s stringByDeletingPathExtension] stringByAppendingString:@".slow.metal"];
+    [NSFileManager.defaultManager removeItemAtPath:d error:nil];
+    NSError *e = nil; BOOL ok = [NSFileManager.defaultManager copyItemAtPath:s toPath:d error:&e];
+    MLOG("%s MSL source %s kept as %s for the diagnostic package%s%s", ok ? "slow pipeline:" : "【红】 slow pipeline:", s.lastPathComponent.UTF8String, d.lastPathComponent.UTF8String, ok ? "" : ": ", ok ? "" : e.localizedDescription.UTF8String);
+}
+typedef struct { _Atomic int done; char key[96]; char kind[8]; char thread[32]; char fns[160]; char note[224]; char src[1024]; uint64_t t0; } ParSlow;
 static ParSlow *par_slow_begin(NSString *key, const char *kind, NSString *fns) {
     ParSlow *w = calloc(1, sizeof *w); if (!w) return NULL;
     snprintf(w->key, sizeof w->key, "%s", key ? key.UTF8String : "-"); snprintf(w->kind, sizeof w->kind, "%s", kind); snprintf(w->fns, sizeof w->fns, "%s", fns ? fns.UTF8String : "-");
+    snprintf(w->note, sizeof w->note, "%s", t_par_msl_note ? t_par_msl_note : "unknown"); snprintf(w->src, sizeof w->src, "%s", t_par_msl_src ? t_par_msl_src : "");
     pthread_getname_np(pthread_self(), w->thread, sizeof w->thread); w->t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     atomic_store(&w->done, 0);
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)PAR_SLOW_MS * 1000000), s2a_qos_global(S2A_QOS_IO_BG), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)g_par_slow_ms * 1000000), s2a_qos_global(S2A_QOS_IO_BG), ^{
         if (atomic_exchange(&w->done, 2) == 1) { free(w); return; }   // the build returned first: its end freed nothing and left the memory to this block
-        MLOG("【红】 %s pipeline %s (functions %s) still compiling after %d ms on thread %s", w->kind, w->key, w->fns, PAR_SLOW_MS, w->thread[0] ? w->thread : "?");
+        MLOG("【红】 %s pipeline %s (functions %s) still compiling after %d ms on thread %s; MSL: %s", w->kind, w->key, w->fns, g_par_slow_ms, w->thread[0] ? w->thread : "?", w->note);
+        if (w->src[0]) par_slow_keep_src(w->src);   // 编完先返回就不进这里：只留真慢的
     });
     return w;
 }
 static void par_slow_end(ParSlow *w, int ok) {
     if (!w) return;
     double ms = (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - w->t0) / 1e6;
-    if (ms >= PAR_SLOW_MS) MLOG("%s%s pipeline %s (functions %s) %s after %.0f ms on thread %s", ok ? "" : "【红】 ", w->kind, w->key, w->fns, ok ? "built" : "FAILED", ms, w->thread[0] ? w->thread : "?");
+    if (ms >= g_par_slow_ms) MLOG("%s%s pipeline %s (functions %s) %s after %.0f ms on thread %s", ok ? "" : "【红】 ", w->kind, w->key, w->fns, ok ? "built" : "FAILED", ms, w->thread[0] ? w->thread : "?");
     if (atomic_exchange(&w->done, 1) == 2) free(w);   // the timer already ran: the memory is the end's to free
 }
 // Build a render pipeline through the archive. key = par_rkey(...), nil = not archived (built as before)
@@ -355,16 +470,80 @@ static id<MTLRenderPipelineState> par_render(MTLRenderPipelineDescriptor *d, NSS
     par_fl_leave(key, mine, ps);
     return ps;
 }
-static id<MTLComputePipelineState> par_compute(id<MTLFunction> fn, NSString *key, NSError **e) {
+// 重译抢跑（par_compute_wait）：调用方在本线程设 t_par_race（只用一次、取走即清）；块在后台跑、返回替代管线或 nil（做不了）
+typedef id<MTLComputePipelineState> (^ParRace)(void);
+static __thread __unsafe_unretained ParRace t_par_race;   // 调用方的强引用撑着这次调用
+static int64_t g_par_race_wait_ns = 60ll * 1000000000;   // 抢跑在途时的等待上限（单测改短）
+static _Atomic uint64_t g_par_race_n, g_par_race_won, g_par_race_lost;   // 起了几次抢跑、抢跑先好、原管线先好
+@interface ParWait : NSObject { @public dispatch_semaphore_t sem; int odone, rstate; id<MTLComputePipelineState> ores, rres; NSError *oerr; } @end   // rstate：0 没起 / 1 在跑 / 2 好了 / 3 做不了 / 4 已处理
+@implementation ParWait @end
+// 建计算管线的实现（单测换成不返回 / 晚返回的桩，#884）
+static id<MTLComputePipelineState> (*g_par_compute_impl)(id<MTLFunction>, NSString *, NSError **) = par_compute_;
+// 至多等 wait_ns 建一条计算管线（< 0 = 一直等，原行为）。#884：Metal 编译服务对一条计算管线现编一直不返回，提交线程跟着卡死、开场剧情固定定格。
+//   有界时在后台队列编、调用方等到上限就返回 nil 且 *gave_up = 1（调用方跳过这一次、不记失败）；后台照常编完，结果登记给下一次同键请求（g_par_late）。
+//   同键已经有人等超时过：后到的不再等满、直接 *gave_up = 1
+static id<MTLComputePipelineState> par_compute_wait(id<MTLFunction> fn, NSString *key, NSError **e, int64_t wait_ns, int *gave_up) {
+    if (gave_up) *gave_up = 0;
     if (!fn) return nil;
-    id got; ParFlight *mine;
-    if (par_fl_enter(key, &got, &mine) && got) return got;
+    // 在途键：有界时没有归档键也要登记在途（函数对象地址），否则卡住的编译每次派发都再起一份、越堆越多；交给 Metal 的归档键照旧是 key
+    NSString *fk = key ?: (wait_ns >= 0 ? [NSString stringWithFormat:@"fn:%p", (__bridge void *)fn] : nil);
+    id got; ParFlight *mine; int gu = 0;
+    if (par_fl_enter_wait(fk, &got, &mine, wait_ns, &gu)) {
+        if (got) return got;
+        if (gu) { if (gave_up) *gave_up = 1; return nil; }
+    }
     ParSlow *sw = par_slow_begin(key ? key : fn.name, "compute", fn.name);
-    id<MTLComputePipelineState> ps = par_compute_(fn, key, e);
-    par_slow_end(sw, ps != nil);
-    par_fl_leave(key, mine, ps);
-    return ps;
+    if (wait_ns < 0) {
+        id<MTLComputePipelineState> ps = g_par_compute_impl(fn, key, e);
+        par_slow_end(sw, ps != nil);
+        par_fl_leave(fk, mine, ps);
+        return ps;
+    }
+    // 重译抢跑（v0.4.1，#065090）：调用方给了 t_par_race（出包库是旧翻译器出的计算着色器）→ 编满 g_par_slow_ms 还没完就在后台起一份重译管线，谁先好用谁，执行的就是这一次派发
+    //   （跳过这一次救不回来：诊断 D-EVQ3 卡住那支 20.5 秒后自己编出，之后 18 秒游戏仍不出帧——它在等被跳过那次派发的结果）。抢跑在途时上限放宽到 g_par_race_wait_ns，
+    //   抢跑做不了（返回 nil）上限回到 wait_ns；两边都没好到上限才跳过（#884 的老行为）
+    ParWait *w = [ParWait new]; w->sem = dispatch_semaphore_create(0);
+    ParFlight *m2 = mine; NSString *k2 = key, *fk2 = fk; id<MTLFunction> f2 = fn;
+    dispatch_async(dispatch_get_global_queue(qos_class_self(), 0), ^{
+        NSError *ee = nil; id<MTLComputePipelineState> r = g_par_compute_impl(f2, k2, &ee);
+        par_slow_end(sw, r != nil);
+        w->ores = r; w->oerr = ee;
+        par_fl_leave(fk2, m2, r);
+        __atomic_store_n(&w->odone, 1, __ATOMIC_RELEASE); dispatch_semaphore_signal(w->sem);
+    });
+    ParRace race = t_par_race;
+    uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); int64_t cap = wait_ns, race_at = race ? (int64_t)g_par_slow_ms * 1000000 : -1;
+    for (;;) {
+        int64_t el = (int64_t)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0), until = race_at >= 0 && race_at < cap ? race_at : cap;
+        long to = until > el ? dispatch_semaphore_wait(w->sem, dispatch_time(DISPATCH_TIME_NOW, until - el)) : 1;
+        if (__atomic_load_n(&w->odone, __ATOMIC_ACQUIRE)) {
+            if (__atomic_load_n(&w->rstate, __ATOMIC_ACQUIRE) == 1) atomic_fetch_add(&g_par_race_lost, 1);
+            if (e) *e = w->oerr;
+            return w->ores;
+        }
+        int rs = __atomic_load_n(&w->rstate, __ATOMIC_ACQUIRE);
+        if (rs == 2) {   // 原管线还在编：在途记录照「等超时过」处理，同键后到的有界请求不再等满（结果仍登记给下一次，g_par_late）
+            if (m2) { os_unfair_lock_lock(&g_par_fl_lock); if (!m2->result) atomic_store(&m2->gave_up, 1); os_unfair_lock_unlock(&g_par_fl_lock); }
+            atomic_fetch_add(&g_par_race_won, 1); return w->rres;
+        }
+        if (rs == 3) { __atomic_store_n(&w->rstate, 4, __ATOMIC_RELEASE); cap = wait_ns; continue; }   // 抢跑做不了：回到原上限（已过就立刻跳过）
+        if (!to) continue;   // 被信号叫醒但两边都没出结果（抢跑失败的那次已在上面处理）
+        el = (int64_t)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0);
+        if (race_at >= 0 && el >= race_at) {
+            race_at = -1; __atomic_store_n(&w->rstate, 1, __ATOMIC_RELEASE); cap = wait_ns > g_par_race_wait_ns ? wait_ns : g_par_race_wait_ns; atomic_fetch_add(&g_par_race_n, 1);
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ @autoreleasepool {
+                id<MTLComputePipelineState> r = race(); w->rres = r;
+                __atomic_store_n(&w->rstate, r ? 2 : 3, __ATOMIC_RELEASE); dispatch_semaphore_signal(w->sem);
+            } });
+            continue;
+        }
+        if (el < cap) continue;
+        if (m2) { os_unfair_lock_lock(&g_par_fl_lock); if (!m2->result) atomic_store(&m2->gave_up, 1); os_unfair_lock_unlock(&g_par_fl_lock); }
+        if (gave_up) *gave_up = 1;
+        return nil;
+    }
 }
+static id<MTLComputePipelineState> par_compute(id<MTLFunction> fn, NSString *key, NSError **e) { return par_compute_wait(fn, key, e, -1, NULL); }
 static id<MTLRenderPipelineState> par_render_(MTLRenderPipelineDescriptor *d, NSString *key, NSError **e) {
     id<MTLBinaryArchive> b = par_bundle_for(key);
     if (b) {   // a miss (another OS / GPU than the package was made for) is no error: the device's archive and the compiler follow

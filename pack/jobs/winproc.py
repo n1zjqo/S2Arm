@@ -339,14 +339,24 @@ class _FileInfo(C.Structure):
                 ('size_low', W.DWORD), ('links', W.DWORD), ('index_high', W.DWORD), ('index_low', W.DWORD)]
 
 
+EPOCH_AS_FILETIME = 116444736000000000   # 1970-01-01 距 1601-01-01 的 100 纳秒数（FILETIME 的起点）
+
+
+def _unix_time(ft):
+    """FILETIME（1601 起的 100 纳秒数）→ Unix 秒（浮点，同 os.stat 的 st_mtime）"""
+    return (((ft.dwHighDateTime << 32) | ft.dwLowDateTime) - EPOCH_AS_FILETIME) / 1e7
+
+
 def _info(handle):
     info = _FileInfo()
     _checked(_api('kernel32', 'GetFileInformationByHandle', W.BOOL, W.HANDLE, C.c_void_p)(handle, C.byref(info)))
     mode = stat.S_IFDIR if info.attributes & 0x10 else stat.S_IFREG
     if info.attributes & 0x400:
         mode = stat.S_IFLNK
+    # st_mtime：诊断包按任务记录改动时间挑最近 50 个（library.diagnostics）要用；原先没给，Windows 上「故障报修」打包即 AttributeError（#854）
     return SimpleNamespace(st_mode=mode, st_dev=info.volume, st_ino=(info.index_high << 32) | info.index_low,
-                           st_size=(info.size_high << 32) | info.size_low, attributes=info.attributes)
+                           st_size=(info.size_high << 32) | info.size_low, attributes=info.attributes,
+                           st_mtime=_unix_time(info.written))
 
 
 def _sid_bytes(sid):
@@ -357,6 +367,9 @@ def _sid_bytes(sid):
 
 
 def _current_sid():
+    """当前进程用户的 SID（字节）。pack/orch/roots.py _win_acl 封存 / 删目录前改权限要用。
+    11-11 删请求文件 ACL 复核时连它一起删了，Windows 上播种、删目录全部报 AttributeError（#669 复现时发现）；
+    tests 里有守卫：全仓引用的 winproc.<名字> 必须存在"""
     token = W.HANDLE()
     current = _api('kernel32', 'GetCurrentProcess', W.HANDLE)()
     _checked(_api('advapi32', 'OpenProcessToken', W.BOOL, W.HANDLE, W.DWORD, C.c_void_p)(current, 8, C.byref(token)))
@@ -370,59 +383,6 @@ def _current_sid():
         return _sid_bytes(C.c_void_p.from_buffer(data).value)
     finally:
         _close(token)
-
-
-def _well_known_sid(kind):
-    size = W.DWORD(68); data = C.create_string_buffer(size.value)
-    _checked(_api('advapi32', 'CreateWellKnownSid', W.BOOL, C.c_int, C.c_void_p,
-                  C.c_void_p, C.c_void_p)(kind, None, data, C.byref(size)))
-    return _sid_bytes(data)
-
-
-def _private_security(handle):
-    owner, dacl, descriptor = C.c_void_p(), C.c_void_p(), C.c_void_p()
-    result = _api('advapi32', 'GetSecurityInfo', W.DWORD, W.HANDLE, C.c_int, W.DWORD,
-                  C.c_void_p, C.c_void_p, C.c_void_p, C.c_void_p, C.c_void_p)(
-                      handle, 1, 5, C.byref(owner), None, C.byref(dacl), None, C.byref(descriptor))
-    if result:
-        raise C.WinError(result)
-    try:
-        current = _current_sid()
-        if _sid_bytes(owner) != current or not dacl.value:
-            return False
-        allowed = {current, _well_known_sid(22), _well_known_sid(26)}  # SYSTEM, Administrators
-        # ACL header: revision, reserved, size WORD, ace count WORD, reserved.
-        count = C.c_ushort.from_address(dacl.value + 4).value
-        for index in range(count):
-            ace = C.c_void_p()
-            _checked(_api('advapi32', 'GetAce', W.BOOL, C.c_void_p, W.DWORD, C.c_void_p)(dacl, index, C.byref(ace)))
-            kind, flags, size = struct.unpack('<BBH', C.string_at(ace, 4))
-            if flags & 8:  # INHERIT_ONLY_ACE does not grant access to this file
-                continue
-            if kind == 1:  # A deny ACE grants no rights
-                continue
-            if kind != 0 or size < 16:
-                return False  # Unknown/object/callback ACEs are not proof of privacy
-            mask = C.c_uint32.from_address(ace.value + 4).value
-            if mask & 0x90020089 and _sid_bytes(ace.value + 8) not in allowed:
-                return False
-        return True
-    finally:
-        if descriptor.value:
-            _api('kernel32', 'LocalFree', C.c_void_p, C.c_void_p)(descriptor)
-
-
-def request_is_private(path):
-    if os.name != 'nt':
-        path = Path(path)
-        return not (path.stat().st_mode & 0o077 or path.stat().st_uid != os.getuid())
-    try:
-        # Pin the inspected leaf for security queries; never query an unchecked
-        # path again (GetNamedSecurityInfo would follow a replaced link).
-        with open_dir_nofollow(path, directory=False, security=True) as opened:
-            return stat.S_ISREG(opened.info.st_mode) and _private_security(opened.handle)
-    except (OSError, ValueError):
-        return False
 
 
 class _UnicodeString(C.Structure):
@@ -530,7 +490,7 @@ def pinnable_path(text):
     return absolute
 
 
-def open_dir_nofollow(path, parent=None, *, directory=True, security=False):
+def open_dir_nofollow(path, parent=None, *, directory=True):
     if parent is not None:
         return _relative(parent, str(path), directory)
     # Open and pin every lexical ancestor from the volume / share root. No resolve(),
@@ -548,15 +508,6 @@ def open_dir_nofollow(path, parent=None, *, directory=True, security=False):
             child = _relative(current, name, directory if final else True)
             current.close()
             current = child
-        if security:
-            # Relative handles need READ_CONTROL for GetSecurityInfo. Reopen
-            # the *same object* with that additional access, not its path.
-            handle = _api('kernel32', 'ReOpenFile', W.HANDLE, W.HANDLE, W.DWORD, W.DWORD, W.DWORD)(
-                current.handle, 0x20081, 3, 0x02200000)
-            if handle == C.c_void_p(-1).value:
-                raise C.WinError(C.get_last_error())
-            old, current = current, Opened(handle, directory)
-            old.close()
         return current
     except BaseException:
         current.close()
@@ -614,3 +565,66 @@ def prepare_child_environment():
     folder = str(vcrt_dir())
     if os.path.isdir(folder) and folder not in os.environ.get("PATH", "").split(os.pathsep):
         os.environ["PATH"] = folder + os.pathsep + os.environ.get("PATH", "")
+
+
+# 任务记录的读写两端（#245 / #561 journal_write_failed）。
+# 根因：os.replace 走 MoveFileExW（旧语义），目标只要还被任何句柄打开，哪怕对方带了 FILE_SHARE_DELETE，也报 ERROR_ACCESS_DENIED（「拒绝访问。」）。
+#   启动器每秒轮询读 jobs/*.json（ControlPort.Tasks，已带 FileShare.Delete），长任务里作业每次重写记录都在和它抢；退避重试只是把撞车概率压低。
+# 根修：写端用 FileRenameInfoEx + POSIX 语义替换（Windows 10 1709+ 的 NTFS / ReFS；Rust std::fs::rename 同法），旧文件从目录里立刻摘掉，
+#   读方手里的句柄继续读旧内容；读端（本仓的 Python 读方）一律带 FILE_SHARE_DELETE 打开，不再挡写端。
+#   卷不支持 POSIX 语义（FAT / exFAT、老系统：ERROR_INVALID_PARAMETER / ERROR_NOT_SUPPORTED / ERROR_INVALID_FUNCTION）→ 回落 os.replace。
+_GENERIC_READ, _DELETE = 0x80000000, 0x00010000
+_SHARE_ALL = 7   # FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+_OPEN_EXISTING = 3
+_FILE_RENAME_INFO_EX = 22
+_RENAME_REPLACE_POSIX = 0x1 | 0x2   # FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS
+_POSIX_RENAME_UNSUPPORTED = (1, 50, 87)   # ERROR_INVALID_FUNCTION / ERROR_NOT_SUPPORTED / ERROR_INVALID_PARAMETER
+
+
+def _open_shared(path, access, flags=0x80):
+    handle = _api('kernel32', 'CreateFileW', W.HANDLE, W.LPCWSTR, W.DWORD, W.DWORD, C.c_void_p, W.DWORD, W.DWORD, W.HANDLE)(
+        win_path(os.path.abspath(path)), access, _SHARE_ALL, None, _OPEN_EXISTING, flags, None)
+    if handle == C.c_void_p(-1).value:
+        raise C.WinError(C.get_last_error())
+    return handle
+
+
+def read_shared(path):
+    """整份读出文件字节，打开时带 FILE_SHARE_DELETE：读的同时作业可以照常替换这份记录（读到的是替换前或替换后的完整一份）"""
+    import msvcrt
+    handle = _open_shared(path, _GENERIC_READ)
+    try:
+        fd = msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY)
+    except BaseException:
+        _close(handle)
+        raise
+    with os.fdopen(fd, 'rb') as f:   # CRT 接管句柄，关文件即关句柄
+        return f.read()
+
+
+def _rename_posix(src, dst):
+    name = win_path(os.path.abspath(dst))
+    units = len(name.encode('utf-16-le')) // 2
+
+    class Rename(C.Structure):
+        _fields_ = [('Flags', W.DWORD), ('RootDirectory', W.HANDLE),
+                    ('FileNameLength', W.DWORD), ('FileName', W.WCHAR * (units + 1))]
+
+    info = Rename(_RENAME_REPLACE_POSIX, None, units * 2, name)
+    handle = _open_shared(src, _DELETE)
+    try:
+        if not _api('kernel32', 'SetFileInformationByHandle', W.BOOL, W.HANDLE, C.c_int, C.c_void_p, W.DWORD)(
+                handle, _FILE_RENAME_INFO_EX, C.byref(info), C.sizeof(info)):
+            raise C.WinError(C.get_last_error())
+    finally:
+        _close(handle)
+
+
+def replace_file(src, dst):
+    """os.replace 的 Windows 版：先按 POSIX 语义替换（目标被带共享删除的读方打开着也能换），卷不支持再回落 os.replace"""
+    try:
+        return _rename_posix(src, dst)
+    except OSError as error:
+        if getattr(error, 'winerror', None) not in _POSIX_RENAME_UNSUPPORTED:
+            raise
+    return os.replace(src, dst)

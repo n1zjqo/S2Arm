@@ -6,7 +6,7 @@
 判法（静态，按「这次遍历的目标是不是 RomFS」）：
   Python（.py，以及 .sh 里内嵌的 Python 段）：遍历调用 = os.walk / os.fwalk / os.scandir / os.listdir / glob.glob / glob.iglob / 任意对象的 .rglob / .iterdir / .glob
     （re.glob 之类不算；romfs_list.* 本身不算）。目标是 RomFS ⇔ 参数（含方法的接收者）文字里有 romfs，或参数里的变量在同一函数里由含 romfs 的式子赋值 / 循环取值；
-    递归类（os.walk / os.fwalk / os.scandir / .rglob / 带 ** 的 glob）另加：所在函数里有含 romfs 的字符串常量。
+    递归类（os.walk / os.fwalk / os.scandir / .rglob / 带 ** 的 glob）另加：所在函数里有含 romfs 的字符串常量（文档字符串不算，那是说明文字）。
   shell（.sh）：find / ls -R / du 的同一条命令里出现 romfs（字面或由含 romfs 的变量给出）；内嵌 Python 段（<<'X' … X）开头那行带 romfs、段里有遍历调用。
   C#（.cs）：Directory.EnumerateFiles / GetFiles / EnumerateDirectories / GetDirectories / EnumerateFileSystemEntries / GetFileSystemEntries，文件里提到 romfs。
 不扫：compat/（上游树）、tests 目录（单测自建夹具）、romfs_list.py 本身、本文件。
@@ -30,6 +30,8 @@ CS = re.compile(r"Directory\.(Enumerate|Get)(Files|Directories|FileSystemEntries
 
 # (文件, 范围（Python 函数名 / shell 行内特征串 / C# 方法外层：*）) → 理由
 ALLOW = {
+    ("pack/img.py", "convert:walk"):
+        "误判：删的是出包目录 pack_dir 里搬进 game.img 后留下的空目录（自下而上），不是 RomFS",
     ("translator/shader_split.py", "main:listdir"):
         "误判：列的是 RomFS 旁边的 glslc_capture/、ue_shaders/ 与输出目录（路径由 RomFS 路径的上一级拼出），不是 RomFS；RomFS 本身经 romfs_list.walk",
     ("tools/nostall.py", "walk:scandir"):
@@ -47,6 +49,10 @@ ALLOW = {
         "运行期（起局）：没有预建索引时现建 RomFS 镜像，要在设备上枚举游戏目录；出包期不经这里",
     ("services/S2A.Services/Host.cs", "*"):
         "运行期（宿主服务）：设备上读游戏数据目录，不是出包步骤",
+    ("pack/jobs/mods.py", "_find:rglob"):
+        "误判：导入 / 列出的是玩家给的 mod 压缩包或文件夹（只有 mod 自己的几个文件），不是游戏 RomFS；不进出包流程",
+    ("services/S2A.Services/RomFsMods.cs", "*"):
+        "运行期（起局）：列的是玩家放进 <文档根>/mods/ 的 mod 文件夹（只有 mod 自己的几个文件），不是游戏 RomFS；游戏 RomFS 经 LibHac 文件表读，不遍历目录",
 }
 
 
@@ -86,6 +92,10 @@ def python_hits(src, offset=0, scope_hint=None, every=False, receiver=False):
         for c in ast.iter_child_nodes(p):
             parent[c] = p
     lines = src.split("\n")
+    # 文档字符串是说明文字、不是代码：函数说明里提到 romfs（比如「推 romfs.img 后核大小」）不算这个函数在遍历 RomFS
+    docs = {id(n.body[0].value) for n in ast.walk(tree)
+            if isinstance(n, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and n.body
+            and isinstance(n.body[0], ast.Expr) and isinstance(n.body[0].value, ast.Constant) and isinstance(n.body[0].value.value, str)}
     out = []
     for call in ast.walk(tree):
         if not isinstance(call, ast.Call):
@@ -121,7 +131,8 @@ def python_hits(src, offset=0, scope_hint=None, every=False, receiver=False):
             # romfs_list.*(…) 参数里的常量不算（已经经模块了）
             skip = {id(c) for n in ast.walk(scope) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
                     and isinstance(n.func.value, ast.Name) and n.func.value.id == "romfs_list" for c in ast.walk(n)}
-            hit = any(isinstance(c, ast.Constant) and isinstance(c.value, str) and R.search(c.value) and id(c) not in skip for c in ast.walk(scope))
+            hit = any(isinstance(c, ast.Constant) and isinstance(c.value, str) and R.search(c.value) and id(c) not in skip and id(c) not in docs
+                      for c in ast.walk(scope))
         if hit:
             out.append((call.lineno + offset, f"{scope_name}:{name}", lines[call.lineno - 1].strip()))
     return out

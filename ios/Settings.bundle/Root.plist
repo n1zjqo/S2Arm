@@ -7,30 +7,8 @@
         <dict>
             <key>Type</key>
             <string>PSGroupSpecifier</string>
-            <key>Title</key>
-            <string>Phone as Controller (When No Controller Is Connected)</string>
             <key>FooterText</key>
-            <string>Gyro: tilt the phone for Switch handheld motion controls (such as tilt aiming in Splatoon); the sensor only runs when the game needs motion. Rumble: game rumble plays through the phone’s motor. A connected controller takes over automatically.</string>
-        </dict>
-        <dict>
-            <key>Type</key>
-            <string>PSToggleSwitchSpecifier</string>
-            <key>Title</key>
-            <string>Phone Gyro</string>
-            <key>Key</key>
-            <string>S2APhoneGyro</string>
-            <key>DefaultValue</key>
-            <true/>
-        </dict>
-        <dict>
-            <key>Type</key>
-            <string>PSToggleSwitchSpecifier</string>
-            <key>Title</key>
-            <string>Phone Haptics</string>
-            <key>Key</key>
-            <string>S2APhoneHaptics</string>
-            <key>DefaultValue</key>
-            <true/>
+            <string>Other settings are inside S2Arm: the gear at the top right of the library, or the gear at the top left in a game. Only what you may need when the app won’t open is kept here.</string>
         </dict>
         <dict>
             <key>Type</key>
@@ -96,21 +74,21 @@
             <key>Type</key>
             <string>PSGroupSpecifier</string>
             <key>FooterText</key>
-            <string>Used to scale the game picture to the screen; doesn’t change the internal render resolution.</string>
+            <string>Used to scale the game picture to the screen; doesn’t change the internal render resolution. Sharp Upscaling (MetalFX) adds a little GPU time every frame, so frame rate and battery use may be slightly affected.</string>
         </dict>
         <dict>
             <key>Type</key>
             <string>PSMultiValueSpecifier</string>
             <key>Title</key>
-            <string>Scaling Filter</string>
+            <string>Picture Quality</string>
             <key>Key</key>
             <string>S2AScalingFilter</string>
             <key>DefaultValue</key>
             <string>Bilinear</string>
             <key>Titles</key>
-            <array><string>Bilinear (Smooth)</string><string>Nearest Neighbor (Crisp Pixels)</string></array>
+            <array><string>Standard</string><string>For 2D Games</string><string>Sharp Upscaling (MetalFX)</string></array>
             <key>Values</key>
-            <array><string>Bilinear</string><string>Nearest</string></array>
+            <array><string>Bilinear</string><string>Nearest</string><string>MetalFX</string></array>
         </dict>
         <dict>
             <key>Type</key>
@@ -131,24 +109,6 @@
             <array><string>30 FPS</string><string>60 FPS</string><string>120 FPS</string><string>Unlimited</string></array>
             <key>Values</key>
             <array><string>30</string><string>60</string><string>120</string><string>0</string></array>
-        </dict>
-        <dict>
-            <key>Type</key>
-            <string>PSGroupSpecifier</string>
-            <key>Title</key>
-            <string>Controller</string>
-            <key>FooterText</key>
-            <string>When on, you can connect a Switch 2 Pro Controller in game and use its buttons, HD rumble and motion controls. Hold the SYNC button on top of the controller to connect. This setting applies only to this app.</string>
-        </dict>
-        <dict>
-            <key>Type</key>
-            <string>PSToggleSwitchSpecifier</string>
-            <key>Title</key>
-            <string>Enable Switch 2 Pro Controller Support</string>
-            <key>Key</key>
-            <string>S2ANS2ProAdapterEnabled</string>
-            <key>DefaultValue</key>
-            <false/>
         </dict>
         <dict>
             <key>Type</key>
@@ -183,34 +143,6 @@
             <string>Export Diagnostics When the App Opens</string>
             <key>Key</key>
             <string>S2ADiagExportOnOpen</string>
-            <key>DefaultValue</key>
-            <false/>
-        </dict>
-        <dict>
-            <key>Type</key>
-            <string>PSGroupSpecifier</string>
-            <key>Title</key>
-            <string>Development</string>
-            <key>FooterText</key>
-            <string>The S2Arm diagnostics overlay shows the target frame rate, slow-frame ratio, graphics path, first-use compilation, audio and build ID. Metal HUD shows the frame rate, GPU time and a frame-interval graph, for manual viewing only; while it’s on, screenshots, frame capture, autoplay and full-screen checks are unavailable. Takes effect the next time the app starts. Metal HUD is for apps you build and install on a development device yourself.</string>
-        </dict>
-        <dict>
-            <key>Type</key>
-            <string>PSToggleSwitchSpecifier</string>
-            <key>Title</key>
-            <string>S2Arm Diagnostics Overlay</string>
-            <key>Key</key>
-            <string>S2ADevHUD</string>
-            <key>DefaultValue</key>
-            <false/>
-        </dict>
-        <dict>
-            <key>Type</key>
-            <string>PSToggleSwitchSpecifier</string>
-            <key>Title</key>
-            <string>Metal HUD</string>
-            <key>Key</key>
-            <string>MetalHUDForceEnabled</string>
             <key>DefaultValue</key>
             <false/>
         </dict>

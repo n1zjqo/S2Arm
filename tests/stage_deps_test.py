@@ -108,6 +108,19 @@ class StageDeps(unittest.TestCase):
                            env=dict(os.environ, TMPDIR=str(tmp), S2A_ROOTS=str(roots), S2A_JOB_TMP=str(job), S2A_DEPS_EXTERNAL=''))
         self.assertEqual((r.returncode, r.stdout.strip()), (0, 'BASEKEY'), r.stdout + r.stderr)
 
+    def test_skips_macos_metadata_in_records(self):
+        """#812：记录目录在游戏库卷上；exFAT / FAT 上 macOS 把扩展属性存成旁边的 ._<名>（AppleDouble 二进制，头里有 0x09 后跟 NUL），
+        还可能有 .DS_Store。期望：collect 只读本机制写的记录，清单只有真实记录里那一行；修前读到 ._ 文件报 ValueError: embedded null character"""
+        raw = Path(self.t.name) / 'raw_exfat'; raw.mkdir()
+        (raw / '1-2.tsv').write_text(f'f\t{self.repo}/table.tsv\n')
+        apple_double = bytes.fromhex('00051607000200004d6163204f53205820202020202020200002000000090000'
+                                     '00320000 0eb0000000020000 0ee20000 011e0000'.replace(' ', '')) + bytes(4096 - 0x30)
+        (raw / '._1-2.tsv').write_bytes(apple_double)   # 真实 exFAT 卷上 xattr -w 后系统生成的头（11-13 本机 hdiutil exFAT 镜像实录）
+        (raw / '.DS_Store').write_bytes(b'\x00\x00\x00\x01Bud1\t\x00')
+        import hashlib
+        want = [('f', 'R:table.tsv', hashlib.sha256(b'a\t1\n').hexdigest()[:16])]
+        self.assertEqual(stage_deps.collect(str(raw), str(self.repo), [str(self.excl)]), want)
+
     def test_hook_off_without_env(self):
         env = {k: v for k, v in os.environ.items() if k != 'S2A_DEPS_OUT'}; env['PYTHONPATH'] = str(ROOT / 'tools/stage_deps_hook')
         r = subprocess.run([sys.executable, '-c', 'import sys; print(sys.audit is not None)'], env=env, capture_output=True, text=True, check=True)
@@ -127,6 +140,25 @@ class StageDeps(unittest.TestCase):
                 raw = Path(self.t.name) / 'raw_chain'; raw.mkdir(exist_ok=True); env['S2A_DEPS_OUT'] = str(raw)
             r = subprocess.run([sys.executable, '-c', 'import os; print(os.environ.get("S2A_T_CHAINED", "缺"))'], env=env, capture_output=True, text=True, check=True)
             self.assertEqual(r.stdout.strip(), '1', f'记依赖={deps}：排在后面的 sitecustomize 应被接续执行')
+
+    def test_peer_chaining_back_runs_each_once(self):
+        # 11-14 门禁根修：排在后面的另一个接续型 sitecustomize（门禁实读采集即此写法）按「sys.path 上第一个不是自己的」接续 → 回头执行本钩子 →
+        #   本钩子又接续它……修前来回执行到递归上限：一个进程装 100 多个审计钩子、退出写 140 多份记录。期望：本钩子与对方各执行 1 次、记录恰 1 份
+        peer = Path(self.t.name) / 'peer_site'; peer.mkdir(); runs = Path(self.t.name) / 'peer_runs'
+        (peer / 'sitecustomize.py').write_text(
+            "import importlib.util, os, sys\n"
+            f"open({str(runs)!r}, 'a').write('peer\\n')\n"
+            "here = os.path.dirname(os.path.abspath(__file__))\n"
+            "for p in sys.path:\n"
+            "    f = os.path.join(p or '.', 'sitecustomize.py')\n"
+            "    if os.path.abspath(p or '.') != here and os.path.isfile(f):\n"
+            "        s = importlib.util.spec_from_file_location('_peer_chained', f); s.loader.exec_module(importlib.util.module_from_spec(s)); break\n")
+        raw = Path(self.t.name) / 'raw_peer'; raw.mkdir()
+        env = dict(os.environ, S2A_DEPS_OUT=str(raw), PYTHONPATH=str(ROOT / 'tools/stage_deps_hook') + os.pathsep + str(peer))
+        r = subprocess.run([sys.executable, '-c', 'print("ok")'], env=env, capture_output=True, text=True)
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, 'ok'), r.stderr[-2000:])
+        self.assertEqual(runs.read_text().splitlines(), ['peer'], '对方 sitecustomize 应只执行 1 次')
+        self.assertEqual(len(list(raw.glob('*.tsv'))), 1, f'记录应恰 1 份（实 {len(list(raw.glob("*.tsv")))} 份）')
 
 
 class EveryStageWired(unittest.TestCase):
@@ -158,6 +190,27 @@ class EveryStageWired(unittest.TestCase):
                     self.assertTrue(first is None or on <= first, f'{rel}：stage_deps_on（第 {on + 1} 行）要在第一个 Python 调用（第 {(first or 0) + 1} 行）之前')
                     for rp in re.findall(r"ROOT_REPLAY='([^']*)'", t):
                         if f'.stage_{st}' in rp.split(): self.assertIn(f'.stage_{st}.deps', rp.split(), f'{rel}：ROOT_REPLAY 带 .stage_{st} 没带清单')
+
+
+
+class SnapshotListing(unittest.TestCase):
+    """发布快照不带 .git：仓库内算输入的名单取 engine.json 的 listed（打包时 git ls-files -co --exclude-standard 的结果）+ 装好后才有的 .installed.json / .last-used。
+    期望手写：根目录项 = listed 里的顶层名 + 在场的安装标记；不在 listed 的文件（被忽略的产物）不算；读不到的路径一律记「缺」（判不了忽略）"""
+    def test_listed_from_engine_json(self):
+        import hashlib, json
+        with tempfile.TemporaryDirectory(prefix='stage-deps-snap-') as t:
+            r = Path(t)
+            (r / 'a').mkdir(); (r / 'a' / 'x.txt').write_text('x'); (r / 'b.txt').write_text('b'); (r / 'ignored.o').write_text('o')
+            (r / '.installed.json').write_text('{}')
+            (r / 'engine.json').write_text(json.dumps(dict(schema=1, listed=['a/x.txt', 'b.txt', 'engine.json'])))
+            raw = r.parent / (r.name + '-raw'); raw.mkdir()
+            (raw / '1-1.tsv').write_text(f'd\t{r}\nf\t{r}/b.txt\nf\t{r}/build/missing.bin\n')
+            got = {(k, n): h for k, n, h in stage_deps.collect(str(raw), str(r), [])}
+            want = hashlib.sha256('\n'.join(sorted(['.installed.json', 'a', 'b.txt', 'engine.json'])).encode()).hexdigest()[:16]
+            self.assertEqual(got[('d', 'R:.')], want)
+            self.assertEqual(got[('f', 'R:b.txt')], hashlib.sha256(b'b').hexdigest()[:16])
+            self.assertEqual(got[('f', 'R:build/missing.bin')], '缺')
+            self.assertEqual(len(got), 3)
 
 
 if __name__ == '__main__':

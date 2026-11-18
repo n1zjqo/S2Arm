@@ -24,7 +24,10 @@ GL(glScissor, void, GLint x, GLint y, GLsizei w, GLsizei h) {
 }
 static uint32_t cap_bit(GLenum cap) {
     switch (cap) { case GL_CULL_FACE: return GLE_CULL; case GL_DEPTH_TEST: return GLE_DEPTH; case GL_STENCIL_TEST: return GLE_STENCIL; case GL_SCISSOR_TEST: return GLE_SCISSOR;
-                   case GL_POLYGON_OFFSET_FILL: return GLE_POLY_OFFSET; case GL_COLOR_TABLE: return GLE_COLOR_TABLE; }
+                   case GL_POLYGON_OFFSET_FILL: return GLE_POLY_OFFSET; case GL_COLOR_TABLE: return GLE_COLOR_TABLE;
+                   case 0x8DB9 /* GL_FRAMEBUFFER_SRGB */: return GLE_FB_SRGB;
+                   case 0x92E0 /* GL_DEBUG_OUTPUT */: return GLE_DEBUG; case 0x8242 /* GL_DEBUG_OUTPUT_SYNCHRONOUS */: return GLE_DEBUG_SYNC; }   // 只记开关：本层不发调试消息
+                   //   （glDebugMessageCallback 是安全空实现）；小丑牌 / LÖVE 起局 glDisable(GL_DEBUG_OUTPUT)，原先置 0x500、LÖVE 查到 GL 错误抛异常   // 只记开关（LÖVE 11 起局先 glIsEnabled 再 glDisable，原先两处都置 0x500）
     return 0;
 }
 // 对 Metal 无作用的开关：GL_TEXTURE_2D（固定管线纹理，程序取代）、抖动、多重采样（单采样附件上无效）、程序点大小（着色器总写点大小）、立方体无缝（Metal 恒无缝）
@@ -34,6 +37,7 @@ static void cap_set(GLenum cap, int on) {
     if (cap == GL_BLEND) { for (int i = 0; i < GL_COLOR_TARGETS; i++) gl_cur->color[i].blend = on; gl_cur->dirty |= GLD_PIPE; return; }
     uint32_t b = cap_bit(cap);
     if (!b) { if (!cap_noop(cap)) { GLRED1("gl%s %#x 没实现", on ? "Enable" : "Disable", cap); gl_set_error(GL_INVALID_ENUM); } return; }
+    if (b == GLE_FB_SRGB && on) { static int n; if (!n++) GLOG("GL_FRAMEBUFFER_SRGB 打开：Metal 的 sRGB 目标恒做线性 → sRGB 转换，关着时 GL 不转、这里照转（非 sRGB 目标两边一样）"); }
     if (on) gl_cur->enable |= b; else gl_cur->enable &= ~b;
     gl_cur->dirty |= GLD_PIPE | GLD_DSS | GLD_SC;
 }
@@ -602,8 +606,14 @@ GLB(glBlitFramebuffer, void, GLint sx0, GLint sy0, GLint sx1, GLint sy1, GLint d
 GLB(glReadPixels, void, GLint x, GLint y, GLsizei w, GLsizei h, GLenum format, GLenum type, void *data) { @autoreleasepool {
     CTX();
     if (w < 0 || h < 0) { gl_set_error(GL_INVALID_VALUE); return; }
-    if (!w || !h || !data) return;
     if (format != 0x1908 || type != 0x1401) { GLRED1("glReadPixels 格式 %#x / 类型 %#x 没实现（只有 RGBA / UNSIGNED_BYTE）", format, type); gl_set_error(GL_INVALID_OPERATION); return; }
+    // 绑着像素打包缓冲：data 是缓冲内偏移，读回写进缓冲（GL 4.5 §18.2 / ES 3.0 §4.3.2）。缓冲映射着（持久映射除外）或放不下 → INVALID_OPERATION
+    if (gl_pack_buffer_name()) {
+        struct gl_buffer *pb = gl_pack_buffer(); size_t off = (size_t)(uintptr_t)data, need = (size_t)w * (size_t)h * 4;
+        if (!pb || !pb->buf || (pb->map_access && !(pb->map_bits & 0x40)) || off > pb->size || need > pb->size - off) { gl_set_error(GL_INVALID_OPERATION); return; }
+        data = (uint8_t *)pb->buf.contents + off; pb->idx16 = nil; pb->fan32_cache = nil;   // 写进新内容：索引副本失效（同 BufferSubData）
+    }
+    if (!w || !h || !data) return;
     fb_side rs; if (!fb_resolve(1, &rs)) return;
     id<MTLTexture> t = rs.col; if (!t) { gl_set_error(GL_INVALID_OPERATION); return; }   // 读缓冲 GL_NONE / 没有附件（规范：INVALID_OPERATION）
     MTLPixelFormat pf = t.pixelFormat; int bgra = pf == MTLPixelFormatBGRA8Unorm || pf == MTLPixelFormatBGRA8Unorm_sRGB;
@@ -720,6 +730,7 @@ static int query(GLenum p, double v[4]) {
         case 0x8B8D: v[0] = gl_cur->prog; return 1;                             // CURRENT_PROGRAM
         case 0x85B5: v[0] = gl_cur->vao; return 1;                              // VERTEX_ARRAY_BINDING
         case 0x8894: v[0] = gl_cur->buf_bound[0]; return 1;                     // ARRAY_BUFFER_BINDING
+        case 0x88ED: v[0] = gl_pack_buffer_name(); return 1;                    // PIXEL_PACK_BUFFER_BINDING
         case 0x84E0: v[0] = 0x84C0 + gl_cur->active_unit; return 1;             // ACTIVE_TEXTURE
         case 0x8069: v[0] = gl_cur->tex_unit[gl_cur->active_unit][0]; return 1; // TEXTURE_BINDING_2D
         case 0x8514: v[0] = gl_cur->tex_unit[gl_cur->active_unit][1]; return 1; // TEXTURE_BINDING_CUBE_MAP

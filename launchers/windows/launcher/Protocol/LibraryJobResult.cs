@@ -10,50 +10,34 @@ public sealed record LibraryJobResult(string State, string Message, JsonElement 
 {
     public bool Succeeded => State == "succeeded";
 
+    /// <summary>让这次作业停下的那条诊断的码（同 Mac JobOutcome.failureDiagnostic）。</summary>
+    public string? FailureCode => FailureCodeOf(Diagnostics);
+
+    /// <summary>
+    /// 作业层把终态错误追加在诊断列表最后（pack/jobs/core.py report_failure），前面可能有中途记的警告。
+    /// 取最后一条 error 级的码，没有就取最后一条带码的。原先取第一条：更新 iPhone 时先记了补着色器的警告，
+    /// 停装码 save_backup_failed 排在后面，认不出、不问「仍然继续」。
+    /// </summary>
+    public static string? FailureCodeOf(JsonElement diagnostics)
+    {
+        if (diagnostics.ValueKind != JsonValueKind.Array) return null;
+        string? lastError = null, last = null;
+        foreach (var d in diagnostics.EnumerateArray())
+        {
+            if (d.ValueKind != JsonValueKind.Object || !d.TryGetProperty("code", out var code) || code.ValueKind != JsonValueKind.String || code.GetString() is not { Length: > 0 } c) continue;
+            last = c;
+            if (d.TryGetProperty("severity", out var s) && s.ValueKind == JsonValueKind.String && s.GetString() == "error") lastError = c;
+        }
+        return lastError ?? last;
+    }
+
     // Jobs NDJSON is not the oneclick ev/t stream. A terminal event alone is not process success.
+    //   整段输出也逐行交 JobEventReader：事件流规则只有那一份（剃刀 W17：原先这里另写一遍，改一处漏一处）
     public static LibraryJobResult Parse(string ndjson, int exitCode, string jobId, string operation)
     {
-        try
-        {
-            LibraryJobResult? result = null;
-            long previous = 0;
-            foreach (var line in ndjson.Split('\n', StringSplitOptions.RemoveEmptyEntries))
-            {
-                if (string.IsNullOrWhiteSpace(line)) continue;
-                if (result is not null) throw new LibraryProtocolException("Event follows the terminal result.");
-                using var document = JsonDocument.Parse(line);
-                var e = document.RootElement;
-                UniqueFields(e);
-                if (e.GetProperty("schema").GetInt32() != 1 || Text(e, "jobId") != jobId ||
-                    Text(e, "operation") != operation ||
-                    (e.TryGetProperty("taskId", out var task) && task.GetString() != jobId))
-                    throw new LibraryProtocolException("Event schema, task or operation does not match the request.");
-                var seq = e.GetProperty("seq").GetInt64();
-                if (seq <= previous) throw new LibraryProtocolException("Event sequence is not increasing.");
-                previous = seq;
-                var type = Text(e, "type");
-                var state = Text(e, "state");
-                if (type != "result")
-                {
-                    if (state != "running") throw new LibraryProtocolException("Terminal state lacks a result event.");
-                    continue;
-                }
-                if (state is not ("succeeded" or "failed" or "cancelled"))
-                    throw new LibraryProtocolException("Unknown terminal result state.");
-                var payload = e.GetProperty("result");
-                if (payload.ValueKind != JsonValueKind.Object) throw new LibraryProtocolException("Result must be an object.");
-                result = new(state, Text(e, "message", allowEmpty: true), payload.Clone(),
-                    e.TryGetProperty("diagnostics", out var diagnostics) ? diagnostics.Clone() : default);
-            }
-            if (result is null) throw new LibraryProtocolException("EOF without a terminal result.");
-            if (exitCode != (result.State == "succeeded" ? 0 : result.State == "cancelled" ? 130 : 1))
-                throw new LibraryProtocolException("Terminal result disagrees with process exit.");
-            return result;
-        }
-        catch (Exception error) when (error is JsonException or InvalidOperationException or KeyNotFoundException or FormatException or OverflowException)
-        {
-            throw new LibraryProtocolException("Invalid jobs event stream.", error);
-        }
+        var reader = new JobEventReader(jobId, operation);
+        foreach (var line in ndjson.Split('\n')) reader.Accept(line);
+        return reader.Finish(exitCode);
     }
 
     internal static string Text(JsonElement value, string key, bool allowEmpty = false)
@@ -81,25 +65,34 @@ public sealed record LibraryJobResult(string State, string Message, JsonElement 
 }
 
 /// <summary>One registered package in the library (base / update / dlc), mirrors GamePackage in the Mac adapter.</summary>
-public sealed record GamePackage(string Type, string TitleId, int Version, string Display, long Size, string Format, string Sha256 = "", long ContentBytes = 0);
+/// <summary>IntegritySkipped：导入时内容哈希对不上、跳过完整性校验照常导入了（catalog packages[].integritySkipped 非空，11-17 维护者：校验不过不再拒收）</summary>
+public sealed record GamePackage(string Type, string TitleId, int Version, string Display, long Size, string Format, string Sha256 = "", long ContentBytes = 0, bool IntegritySkipped = false);
 
+/// <param name="NeedsKeys">出包要不要 prod.keys：作业层 catalog 直接给（library.KEYLESS_FORMATS 一份判据；剃刀 W10：原先这里另抄一份格式名单）。</param>
 public sealed record LibraryGame(string Id, string Name, string Version, string Cover, bool Hidden,
     IReadOnlyList<string> Missing, bool IphoneReady = false, double? IphoneInstalledAt = null,
     bool IphoneFree = false, IReadOnlyList<GamePackage>? Packages = null, bool CustomName = false, bool CustomCover = false,
-    GameLocation? Location = null, bool IphoneRestorable = false, GameSizes? Sizes = null)
+    GameLocation? Location = null, bool IphoneRestorable = false, GameSizes? Sizes = null, bool NeedsKeys = false, string IphoneInstallDevice = "",
+    bool OnPhone = false, string Banner = "", bool SGrade = false, bool IphoneExportable = false, DownstreamOffer? Downstream = null)   // SGrade：已打上 S 级优化（catalog sgrade，pack/jobs/library.py sgrade_badge）→ 封面左上角金色 S（同 Mac）
 {
     /// <summary>Storage state (library layout v3): ok / offline / missing / none; older catalogues without the field read as none.</summary>
     public string LocationState => Location?.State ?? "none";
 
+    /// <summary>有原件导入时跳过了完整性校验（同 Mac GameSummary.integritySkipped）：游戏库卡片标「数据校验不过」</summary>
+    public bool IntegritySkipped => Packages?.Any(p => p.IntegritySkipped) == true;
+
     /// <summary>可以显示的本地封面路径：只认作业层给的、就在这款自己文件夹里（catalog location.folder，按英文名或游戏号命名都行）的
     /// cover.jpg（游戏包自带图标）、玩家换的 cover.custom.&lt;8 位十六进制&gt;.jpg（作业层 _CUSTOM_COVER），或没有自带图标时的商店横图 banner.jpg；其它一律 null。
     /// 不按游戏号拼 games\&lt;号&gt;\：v0.2.0 起文件夹按英文名命名（#330）。</summary>
-    public string? CoverFile()
+    public string? CoverFile() => FolderImage(Cover);
+    /// <summary>游戏库顶部大图用的商店横图（作业层 game.banner = 这款文件夹里的 banner.jpg，1920×1080）；没有就 null，界面退回封面卡片。同 CoverFile 只认这款自己文件夹里的。</summary>
+    public string? BannerFile() => FolderImage(Banner) is { } path && System.IO.Path.GetFileName(path) == "banner.jpg" ? path : null;
+    private string? FolderImage(string file)
     {
-        if (Cover.Length == 0 || Location is not { State: "ok", Folder.Length: > 0 } location) return null;
+        if (file.Length == 0 || Location is not { State: "ok", Folder.Length: > 0 } location) return null;
         try
         {
-            var path = System.IO.Path.GetFullPath(Cover);
+            var path = System.IO.Path.GetFullPath(file);
             var folder = System.IO.Path.TrimEndingDirectorySeparator(System.IO.Path.GetFullPath(location.Folder));
             var parent = System.IO.Path.GetDirectoryName(path);
             var comparison = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
@@ -110,8 +103,6 @@ public sealed record LibraryGame(string Id, string Name, string Version, string 
     }
     /// <summary>Offline or missing games cannot be exported, moved or cleaned (mirrors the Mac card menu).</summary>
     public bool Reachable => LocationState is not ("offline" or "missing");
-    /// <summary>NSP / XCI need prod.keys; extracted folders and NUP containers do not (mirrors GameSummary.needsKeys).</summary>
-    public bool NeedsKeys => (Packages ?? []).Any(p => p.Format is not ("nup" or "dump" or "extract" or "loose"));
     /// <summary>DLC count deduplicated by title id (mirrors GameSummary.dlcCount).</summary>
     public int DlcCount => (Packages ?? []).Where(p => p.Type == "dlc")
         .Select(p => p.TitleId).Distinct(StringComparer.Ordinal).Count();
@@ -129,6 +120,43 @@ public sealed record LibraryGame(string Id, string Name, string Version, string 
         (Packages ?? []).Where(p => p.Type == type).OrderByDescending(p => p.Version).FirstOrDefault() is { } pkg
             ? (pkg.Display.Length > 0 ? pkg.Display : "v" + pkg.Version) : null;
 };
+
+/// <summary>下游深度方案（catalog 每款的 downstream，pack/jobs/downstream.py describe；同 Mac DownstreamOffer）：方案、能不能选与原因、
+/// 确认页文案（按语言）、玩家上次的选择（null = 没选过，导出 iPhone 前弹确认页；"" = 仍用原版）。</summary>
+public sealed record DownstreamOffer(string Id, string Name, bool Eligible, IReadOnlyDictionary<string, string> Reason,
+    IReadOnlyDictionary<string, DownstreamOffer.Copy> Copies, string? Choice)
+{
+    public sealed record Copy(string Title, string Body, IReadOnlyList<string> Points, string Recommend, string Original);
+
+    /// <summary>界面语言 → 登记表的语言键：简 / 繁 → zh，其余取前两位；没有这门语言退回英文、再退回中文</summary>
+    private static T? Pick<T>(IReadOnlyDictionary<string, T> map, string language) where T : class =>
+        (language.StartsWith("zh", StringComparison.Ordinal) ? map.GetValueOrDefault("zh") : map.GetValueOrDefault(language.Length >= 2 ? language[..2] : language))
+        ?? map.GetValueOrDefault("en") ?? map.GetValueOrDefault("zh");
+    public Copy? Text(string language) => Pick(Copies, language);
+    public string Why(string language) => Pick(Reason, language) ?? "";
+
+    /// <summary>缺 id / name 或不是对象 → null（这款没有下游方案）</summary>
+    public static DownstreamOffer? Parse(JsonElement e)
+    {
+        if (e.ValueKind != JsonValueKind.Object) return null;
+        static string S(JsonElement o, string k) => o.TryGetProperty(k, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() ?? "" : "";
+        var id = S(e, "id"); var name = S(e, "name");
+        if (id.Length == 0 || name.Length == 0) return null;
+        var reason = new Dictionary<string, string>();
+        if (e.TryGetProperty("reason", out var r) && r.ValueKind == JsonValueKind.Object)
+            foreach (var p in r.EnumerateObject()) if (p.Value.ValueKind == JsonValueKind.String) reason[p.Name] = p.Value.GetString() ?? "";
+        var copies = new Dictionary<string, Copy>();
+        if (e.TryGetProperty("copy", out var c) && c.ValueKind == JsonValueKind.Object)
+            foreach (var p in c.EnumerateObject())
+                if (p.Value.ValueKind == JsonValueKind.Object)
+                    copies[p.Name] = new(S(p.Value, "title"), S(p.Value, "body"),
+                        p.Value.TryGetProperty("points", out var pts) && pts.ValueKind == JsonValueKind.Array
+                            ? pts.EnumerateArray().Where(x => x.ValueKind == JsonValueKind.String).Select(x => x.GetString() ?? "").ToList() : [],
+                        S(p.Value, "recommend"), S(p.Value, "original"));
+        string? choice = e.TryGetProperty("choice", out var ch) && ch.ValueKind == JsonValueKind.String ? ch.GetString() ?? "" : null;
+        return new(id, name, e.TryGetProperty("eligible", out var el) && el.ValueKind == JsonValueKind.True, reason, copies, choice);
+    }
+}
 
 /// <summary>catalog phoneUpdates 的一项（pack/jobs/install.py phone_updates）：按本机装机记录，这台手机上的 S2Arm 壳比本版旧。
 /// Games = 记录里的各款，Stale = 新壳认不得、要按新版重新出包的款（都是 {gameId, name}）。</summary>
@@ -156,6 +184,8 @@ public sealed record LibraryCatalog(IReadOnlyList<LibraryGame> Games, bool KeysR
 {
     /// <summary>壳比本版旧的手机（游戏库顶栏「更新 iPhone 上的 S2Arm」按钮）；旧后端没有这个字段时为空。</summary>
     public IReadOnlyList<PhoneUpdate> PhoneUpdates { get; init; } = [];
+    /// <summary>这台电脑往几台手机装过游戏（catalog phoneDevices）：更新弹窗据此写「更新启动器和 iPhone App」；旧后端没有时为 0。</summary>
+    public int PhoneDevices { get; init; }
 
     public static LibraryCatalog Parse(JsonElement result)
     {
@@ -184,14 +214,16 @@ public sealed record LibraryCatalog(IReadOnlyList<LibraryGame> Games, bool KeysR
                         var format = p.TryGetProperty("format", out var f) && f.ValueKind == JsonValueKind.String ? f.GetString() ?? "" : "";
                         var sha = p.TryGetProperty("sha256", out var sh) && sh.ValueKind == JsonValueKind.String ? sh.GetString() ?? "" : "";
                         var content = p.TryGetProperty("contentBytes", out var cb) && cb.ValueKind == JsonValueKind.Number ? cb.GetInt64() : 0;
-                        packages.Add(new(ptype, titleId, version, display, size, format, sha, content));
+                        var skipped = p.TryGetProperty("integritySkipped", out var isk) && isk.ValueKind == JsonValueKind.Array && isk.GetArrayLength() > 0;
+                        packages.Add(new(ptype, titleId, version, display, size, format, sha, content, skipped));
                     }
-                // iphoneInstall: { at, free } — matches the Mac adapter's LibraryProvider
-                double? iphoneAt = null; var iphoneFree = false;
+                // iphoneInstall: { at, free, deviceKey } — matches the Mac adapter's LibraryProvider；deviceKey = 当初装的那台（续签装回它，不换别的）
+                double? iphoneAt = null; var iphoneFree = false; var iphoneDevice = "";
                 if (game.TryGetProperty("iphoneInstall", out var inst) && inst.ValueKind == JsonValueKind.Object)
                 {
                     if (inst.TryGetProperty("at", out var at) && at.ValueKind == JsonValueKind.Number) iphoneAt = at.GetDouble();
                     if (inst.TryGetProperty("free", out var fr) && fr.GetBoolean()) iphoneFree = true;
+                    if (inst.TryGetProperty("deviceKey", out var dk) && dk.ValueKind == JsonValueKind.String) iphoneDevice = dk.GetString() ?? "";
                 }
                 var iphoneReady = game.TryGetProperty("iphoneReady", out var ir) && ir.GetBoolean();
                 games.Add(new(id, LibraryJobResult.Text(game, "name"),
@@ -201,11 +233,21 @@ public sealed record LibraryCatalog(IReadOnlyList<LibraryGame> Games, bool KeysR
                     game.TryGetProperty("customCover", out var customCover) && customCover.ValueKind == JsonValueKind.True,
                     game.TryGetProperty("location", out var location) && location.ValueKind == JsonValueKind.Object ? GameLocation.Parse(location) : null,
                     game.TryGetProperty("iphoneRestorable", out var restorable) && restorable.ValueKind == JsonValueKind.True,
-                    game.TryGetProperty("sizes", out var sizes) && sizes.ValueKind == JsonValueKind.Object ? GameSizes.Parse(sizes) : null));
+                    game.TryGetProperty("sizes", out var sizes) && sizes.ValueKind == JsonValueKind.Object ? GameSizes.Parse(sizes) : null,
+                    game.TryGetProperty("needsKeys", out var needsKeys) && needsKeys.ValueKind == JsonValueKind.True, iphoneDevice,
+                    game.TryGetProperty("onPhone", out var onPhone) && onPhone.ValueKind == JsonValueKind.True,
+                    game.TryGetProperty("banner", out var banner) && banner.ValueKind == JsonValueKind.String ? banner.GetString() ?? "" : "",   // 设备记录里装在手机上：删除确认多写一句
+                    game.TryGetProperty("sgrade", out var sgr) && sgr.ValueKind == JsonValueKind.True,
+                    game.TryGetProperty("iphoneExportable", out var iex) && iex.ValueKind == JsonValueKind.True,
+                    game.TryGetProperty("downstream", out var ds) ? DownstreamOffer.Parse(ds) : null));
             }
             var keys = result.GetProperty("keys");
             return new(games.AsReadOnly(), keys.GetProperty("ready").GetBoolean(),
-                LibraryJobResult.Text(keys, "message", true)) { PhoneUpdates = PhoneUpdate.ParseList(result) };
+                LibraryJobResult.Text(keys, "message", true))
+            {
+                PhoneUpdates = PhoneUpdate.ParseList(result),
+                PhoneDevices = result.TryGetProperty("phoneDevices", out var pd) && pd.ValueKind == JsonValueKind.Number && pd.TryGetInt32(out var n) ? n : 0
+            };
         }
         catch (Exception error) when (error is InvalidOperationException or KeyNotFoundException)
         {

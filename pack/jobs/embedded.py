@@ -1,23 +1,14 @@
 """Install the app's immutable engine snapshot into a writable cache (the default location's hosts/engine, see engines_root).
 
-The snapshot contains a fresh, local-only Git object database for the existing
-pipeline's HEAD-based stage keys. It contains no developer history or remotes.
+The snapshot carries no Git repository: the HEAD-based stage keys were computed when
+the app was packaged and are stored in engine.json (launchers/macos/bundle_engine.py).
 """
 import contextlib
 from pathlib import Path
 import os
 import shutil
 import uuid
-from core import Failure, atomic, contained, read
-
-
-def check_git(engine):
-    """内置引擎的 Git 快照必须自成一库：Git 认出的仓库目录就是引擎自己的 .git，不许往上认到外层仓库"""
-    import subprocess
-    env = dict(os.environ, GIT_CEILING_DIRECTORIES=str(Path(engine).resolve().parent))
-    p = subprocess.run(["git", "-C", str(engine), "rev-parse", "--absolute-git-dir"], capture_output=True, text=True, env=env)
-    if p.returncode or Path(p.stdout.strip()).resolve() != (Path(engine) / ".git").resolve():
-        raise Failure("应用内置引擎的版本快照无效，请重新安装完整应用。")
+from core import PROBES, Failure, atomic, contained, read
 
 
 def install(c):
@@ -34,9 +25,11 @@ def install(c):
     _adopt_private_copy(c, root, identity)
     # 已装的副本每次用前按大小快速复核（#304：玩家机上已装副本里宿主的 Info.plist 被外部改过，0.1.7 只看安装标记、之后每次出包都报 runtime_invalid、
     #   重新打包也好不了）；对不上就挪开、从 App 包重解。逐文件 lstat，约 8500 个文件几十毫秒；摘要级核对仍在用到具体产物时（artifact）。
-    #   不核 .git/（_stable_files：快照自带的 Git 仓库元数据，正常使用就可能变）。
     #   完好的副本直接用、不拿锁；要挪开 / 重解时拿跨进程锁（_install_lock），拿到后重读标记、再核一次（别的作业可能刚装好）才动手——
     #   v0.2.0 前回归：启动时 preflight 与 setup 同时初始化同一份副本，一个读到另一个装到一半 / 正被收走的副本，误判「被改过」、挪走对方的
+    if getattr(c, "operation", None) in PROBES and read(destination / ".installed.json", {}).get("schema") == 2:   # 非作业的调用方（tools 里的假上下文）没有 operation：按非探测、照常复核
+        c.engine = destination   # 只读探测（剃刀 H4）：装过就直接用，不逐文件复核、不清旧副本；出包 / 起局这类真用引擎产物的作业照旧每次复核（#304）
+        return
     if not _ready(c, destination, manifest):
         with _install_lock(root):
             if not _ready(c, destination, manifest):
@@ -47,48 +40,67 @@ def install(c):
 
 
 def _ready(c, destination, manifest):
-    """有安装标记且清单里稳定的文件都在、大小对"""
-    return read(destination / ".installed.json", {}).get("schema") == 2 and _intact(c, destination, manifest, _stable_files(manifest), full=False)
+    """有安装标记且清单里的文件都在、大小对（装的时候 App 包里就对不上、已提示过的那几个不再核，见 _reinstall）"""
+    mark = read(destination / ".installed.json", {})
+    return mark.get("schema") == 2 and _intact(c, destination, manifest, _skip(manifest.get("files"), mark), full=False)
+
+
+def _skip(files, mark):
+    """清单去掉安装标记里 bundleMismatch 记的文件（App 包里本来就对不上、装时已提示照常继续的）；没记就原样"""
+    accepted = set(mark.get("bundleMismatch") or [])
+    return {k: v for k, v in (files or {}).items() if k not in accepted} if accepted and isinstance(files, dict) else files
+
+
+def _bundle_mismatch(c, source, files):
+    """App 包里和清单对不上（缺失 / 不是普通文件 / 大小不同）的文件名，逐个核（只在整份校验没过时走这里）"""
+    from build import validate_files
+    bad = []
+    for name, expected in (files or {}).items():
+        try:
+            validate_files(c, source, {name: expected})
+        except Failure as e:
+            if e.code != "runtime_invalid":
+                raise
+            bad.append(name)
+    return bad
 
 
 @contextlib.contextmanager
 def _install_lock(root, timeout=1800):
-    """同一引擎目录的挪开 / 重解只许一个作业做（跨进程：flock / msvcrt，同 filelock）。等别的作业解完最多 timeout 秒（解一份几秒到一两分钟）"""
+    """同一引擎目录的挪开 / 重解只许一个作业做（跨进程：filelock.held，与库锁同一实现）。等别的作业解完最多 timeout 秒（解一份几秒到一两分钟）"""
+    import os
     import time
     import filelock
     root.mkdir(parents=True, exist_ok=True)
-    with (root / ".install.lock").open("a") as f:
-        t0 = time.time()
-        while True:
-            try:
-                filelock.try_lock(f)
-                break
-            except BlockingIOError:
-                if time.time() - t0 > timeout:
-                    raise Failure("另一个任务正在初始化内置 S2Arm 引擎，等了太久，请稍后重试。") from None
-                time.sleep(0.5)
-        try:
+    try:
+        with filelock.held(root / ".install.lock", wait_s=timeout, holder=dict(operation="prepareEngine", pid=os.getpid(), startedAt=round(time.time(), 3))):
             yield
-        finally:
-            filelock.unlock(f)
+    except filelock.Busy as busy:
+        raise Failure("另一个任务正在初始化内置 S2Arm 引擎，等了太久，请稍后重试。", internal=f"引擎安装锁占锁者：{busy.holder}") from None  # 非玩家句
 
 
 def _reinstall(c, source, manifest, root, destination, identity):
-    """持 _install_lock 调：坏副本（或没装完的）挪开，从 App 包解一份新的。App 包本身的文件不对 → engine_incomplete（只能重装 App）"""
+    """持 _install_lock 调：坏副本（或没装完的）挪开，从 App 包解一份新的。
+    App 包本身的文件和清单对不上（11-17 维护者：校验不过不整个拒绝，提示后照常继续）：黄字提示是哪几个、建议重装 S2Arm，照样解出来用；
+    对不上的文件名记进安装标记 bundleMismatch，之后复核跳过它们（不然每次用都判「被改过」、反复重解）。真用到时缺东西由那一步照实报"""
     from build import clone_tree, validate_files
     if destination.exists():
-        _set_aside(c, root, destination, "已装的内置引擎文件被改过" if read(destination / ".installed.json", {}).get("schema") == 2 else "上次没装完的内置引擎")
+        _set_aside(c, root, destination, "已装的内置引擎文件被改过" if read(destination / ".installed.json", {}).get("schema") == 2 else "上次没装完的内置引擎")  # 非玩家句
     c.begin("初始化内置 S2Arm 引擎")
+    mismatch = []
     try:
         validate_files(c, source, manifest.get("files"))
     except Failure as e:
-        raise Failure("S2Arm 应用里的内置引擎文件不完整（" + str(e).rsplit("：", 1)[-1] + "），请重新安装完整的 S2Arm。", code="engine_incomplete") from e
+        if e.code != "runtime_invalid":
+            raise
+        mismatch = _bundle_mismatch(c, source, manifest.get("files"))
+        note = f"S2Arm 应用里的内置引擎有 {len(mismatch)} 个文件和清单对不上（如 {'、'.join(mismatch[:3])}），照常继续；后面出包或开游戏要是出错，重新安装完整的 S2Arm 一般就好。"  # 非玩家句
+        c.diagnostic(note, "engine_incomplete", severity="warning", internal="；".join(mismatch[:50]))
     temporary = destination.with_name(identity + "." + uuid.uuid4().hex + ".partial")
     temporary.mkdir(parents=True)
     try:
         clone_tree(c, source, temporary)   # v0.2.3 清理：不再对刚拷出的副本再核一遍——源刚核过，clone_tree 拷错会自己报
-        check_git(temporary)
-        atomic(temporary / ".installed.json", dict(schema=2, id=identity))
+        atomic(temporary / ".installed.json", dict(schema=2, id=identity, **({"bundleMismatch": mismatch} if mismatch else {})))
         c.check()
         os.rename(temporary, destination)
     finally:
@@ -160,11 +172,6 @@ def _retain(c, root, identity):
         shutil.rmtree(d, ignore_errors=True)
 
 
-def _stable_files(manifest):
-    """清单里不会被正常使用改动的文件：去掉 Git 仓库元数据 .git/"""
-    return {p: v for p, v in (manifest.get("files") or {}).items() if not (p == ".git" or p.startswith(".git/"))}
-
-
 def _intact(c, root, manifest, files=None, full=False):
     """副本里这些文件（缺省清单全部）在、是普通文件、大小对（full 再核摘要）"""
     from build import validate_files
@@ -174,13 +181,13 @@ def _intact(c, root, manifest, files=None, full=False):
     except Failure as e:
         if e.code != "runtime_invalid":
             raise
-        c.emit("message", "内置引擎副本校验没过：" + str(e).rsplit("：", 1)[-1])
+        c.emit("message", "内置引擎副本校验没过：" + str(e).rsplit("：", 1)[-1])  # 非玩家句
         return False
 
 
 def _set_aside(c, root, destination, why):
     """坏副本改名挪开（同卷改名；正在用它的别的作业照常读完），随后删掉；install 接着从 App 包重解"""
-    c.emit("message", why + "，从 S2Arm 应用里重新解出一份")
+    c.emit("message", why + "，从 S2Arm 应用里重新解出一份")  # 非玩家句
     broken = destination.with_name(destination.name + "." + uuid.uuid4().hex + ".broken")
     try:
         os.rename(destination, broken)
@@ -201,7 +208,8 @@ def artifact(c, name):
     files = {p: v for p, v in manifest.get("files", {}).items() if p.startswith(prefix + "/")}
     if not files:
         raise Failure("应用内置引擎产物缺失，请重新安装完整应用。")
-    if not _intact(c, c.engine, manifest, files):
+    files = _skip(files, read(c.engine / ".installed.json", {}))   # App 包里本来就对不上、装时已提示过的不再核（_reinstall）
+    if files and not _intact(c, c.engine, manifest, files):
         if not c.r.get("engineBundle"):   # 源码树开发：没有 App 包可重解，照原样报
             from build import validate_files
             validate_files(c, c.engine, files)
@@ -211,8 +219,10 @@ def artifact(c, name):
         bundle = read(source / "engine.json", {})
         with _install_lock(c.engine.parent):
             if not _intact(c, c.engine, manifest, files):
-                c.emit("message", "内置引擎里的 " + name + " 被改过")
+                c.emit("message", "内置引擎里的 " + name + " 被改过")  # 非玩家句
                 _reinstall(c, source, bundle, c.engine.parent, c.engine, bundle.get("id", c.engine.name))
         from build import validate_files
-        validate_files(c, c.engine, files)
+        left = _skip(files, read(c.engine / ".installed.json", {}))
+        if left:
+            validate_files(c, c.engine, left)
     return c.engine / prefix

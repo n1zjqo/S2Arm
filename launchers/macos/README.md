@@ -100,6 +100,67 @@ planned runtime log protocol in `docs/standards/logging.md`. Runtime markers and
 measurement logs retain their existing contract. Full gate/train/merge remain
 with the owning maintainer lines.
 
+## 不接实体手柄测试交互
+
+```sh
+bash launchers/macos/test_controller.sh
+```
+
+测试使用 Apple 的可写入 [GCController 快照](https://developer.apple.com/documentation/gamecontroller/gccontroller/withextendedgamepad())，
+把按键、方向键和摇杆样本交给启动器原有的输入采样、重复节奏、焦点导航与按钮动作链。
+不需要连接手柄、辅助功能授权、游戏文件或玩家游戏库；不会往系统注册虚拟硬件。
+真实 SwiftUI 设置页、弹窗、下拉框、屏幕键盘和原生确认框使用原创夹具，
+中英文截图写入 `build/controller-qa/`。完整 Mac 回归仍用 `bash launchers/macos/test.sh`。
+专项还覆盖提示图标随连接状态显隐、单按钮单图标、失焦期间断开及出包页底栏操作；连接状态切换后原控件仍须可导航和激活。
+标题回归检查主副标题基线、长版本与路径的单行省略，以及后台任务出现和消失时原生顶栏的宽度避让。
+此检查覆盖应用内交互；蓝牙配对、射频断连、震动和实体按键手感须另用真手柄验证。
+
+四键映射在顶栏手柄弹窗编辑，所有非 Switch Pro / Joy-Con 手柄共用一份设置，不区分玩家或品牌。
+点击玩家行切换实体按键外观，Switch 一侧的映射保持一致；实体键帽和下拉框里的 Switch 键帽按平台绘制颜色、轮廓与反光。
+Switch Pro、各代 Joy-Con 使用原生布局，选中时隐藏四键设置。其他手柄未设置时按键帽语义处理
+（PS × / Xbox A 确认，PS ○ / Xbox B 返回）；可选 Switch 位置布局或逐键修改，已占用的目标自动互换。
+首页、弹窗提示固定跟随玩家分配中的主手柄，实际输入与显示使用同一份映射。
+确认键操作当前焦点组件，确认、完成、保存、准备和启动等提交动作统一用右扳机（PS R2 / Xbox RT / Switch ZR），可登记的原生确认框同样适用；Menu 不再提交。系统文件选择器仍使用 macOS 原有操作。
+多个任务同页时，先聚焦行内的启动按钮，再按右扳机执行该任务。四键的逐游戏手柄绑定下拉框隐藏；其他按键列表也对所有玩家排除实体四键，统一在顶栏手柄弹窗管理。
+Mac 游戏读取同目录的 `pad-order.face.json`，保存后即时通知刷新，并保留轮询同步；所有玩家读取同一份四键排列，
+键鼠和背键配置仍按原路径处理。文件 schema 2 的 `mapping` 保存统一排列；旧版 schema 1 按 PS、Xbox、其他的顺序取首份已保存配置。
+游戏内长按主手柄 L3 + R3 一秒显示或收起其四键小浮窗。
+专项测试覆盖默认 / Switch 位置布局、逐键修改、保存恢复、按住时切换、玩家切换及真实 SwiftUI 下拉操作；
+游戏输入与小浮窗的无资产检查运行 `bash tests/macos_native_input_test.sh`。
+
+## DMG installation window / 拖拽安装窗口
+
+安装窗口沿用 [GitHub Pages 下载页](../../docs/site/index.html) 的近黑底、奶油白、
+细描边卡片，以及现有玻璃 S 图标与字标。中英文安装说明常驻；两个图标由
+Finder 显示，S2Arm.app 可以实际拖入指向 `/Applications` 的快捷方式。
+背景以 1× / 2× TIFF 输出，布局尺寸与图标位置统一读取
+[`Branding/dmg-layout.json`](Branding/dmg-layout.json)。
+
+只预览设计（需要 macOS 和 Swift，无需打包依赖或完整 App）：
+
+```sh
+python3 launchers/macos/build_dmg.py --preview build/macos/dmg-preview
+```
+
+预览图为 `build/macos/dmg-preview/preview.png`，其中图标仅用于示意；
+实际背景 `background.tiff` 不含图标。传入 `--app <路径>/S2Arm.app` 可用该 App 的图标预览。
+
+正式打包使用已经完成签名、公证和钉票据的完整 App；这是 `sign_release.sh` 之后
+单独执行的发行步骤，不会自动发布或上传文件：
+
+```sh
+python3 -m venv build/dmg-venv
+build/dmg-venv/bin/python -m pip install -r launchers/macos/requirements-dmg.txt
+build/dmg-venv/bin/python launchers/macos/build_dmg.py \
+  --app build/macos/S2Arm.app --output build/macos/S2Arm-mac-arm64.dmg
+```
+
+打包不调用 Finder 或 AppleScript，不需要桌面自动化权限；严格校验输入和复制后
+App 的签名，再校验 DMG，成功后才替换目标文件。签名校验也接受本地 ad-hoc
+构建；脚本不会把它当作已公证发布包。安装说明不嵌入版本号，
+图标不隐藏 `.app` 扩展名，避免改写已签名应用的 FinderInfo。
+依赖仅供维护者打包使用，不随玩家运行环境分发。
+
 ## Build and run
 
 Apple Silicon and macOS 15+ are needed for the S2Arm app and direct-mode play on the Mac (games execute natively as arm64).
@@ -126,10 +187,12 @@ python3 launchers/macos/prepare_build.py            # add --check to only inspec
 | Apple Silicon Mac | The runtime keeps arm64 slices only | Checked |
 | Full Xcode with iOS platform and Metal Toolchain | Resolved like packaging (`tools/toolchain.sh`): `S2A_DEVELOPER_DIR` or `tools/machine.local`, then `xcode-select`. A Metal compiler version different from `translator/dmsh_chain.lock` prints a `note` only (`dmsh_chain.py --build-env` lets it through; the shader cache is keyed by compiler, so a different Xcode just recompiles) | Checked |
 | .NET SDK | Whatever `compat/tree/global.json` accepts: `version` plus `rollForward: latestFeature` (currently 10.0.403 or a later 10.0 feature band / patch). The command runs `dotnet --version` inside `compat/tree`, so .NET itself applies the rule. Install with `python3 pack/jobs/applenv.py --install dotnet` (the same path the launcher uses) | Checked |
-| Homebrew `python@3.12 spirv-tools spirv-cross glslang zstd bash cmake meson ninja` | Runtime collection (`bundle_runtime.py`), C rewriter (CMake 3.18+), dav1d (meson / ninja) | Checked; prints the `brew install` line |
+| Homebrew `python@3.12 spirv-tools spirv-cross glslang zstd bash cmake meson ninja` | Runtime collection (`bundle_runtime.py`), C rewriter (CMake 3.18+), dav1d (meson / ninja; skipped with `S2A_DAV1D=0`) | Checked; prints the `brew install` line |
 | Rust (`cargo`) | `pack/devpush` | Checked |
 | Build Python venv (default `build/venv`) | Pinned `tools/rewriter-requirements.txt`, `pack/fonts/requirements.txt` (fonttools / skia-pathops for the bundled fonts) and `launchers/macos/requirements-runtime.txt` | Created and installed |
 | C rewriter sources | Pinned Capstone / LZ4 from `runtime/rewriter/prepare_deps.py`; looked up in `S2A_REWRITER_DEPS`, then `build/rewriter-deps`, then `<S2A_RUN_ROOT>/s2arm/deps/rewriter-deps` | Downloaded to `build/rewriter-deps` when none is complete |
+
+Set `S2A_DAV1D=0` when every target Mac/iPhone has hardware AV1 decode. It skips the dav1d static library, the meson / ninja check, and the prebuilt dav1d bundle; default builds keep the software fallback for M1/M2, A16, and older devices. Do not use it for packages that may run on those devices.
 
 Then build with the interpreter the command printed:
 

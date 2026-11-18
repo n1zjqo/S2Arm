@@ -9,14 +9,24 @@ set -u
 H=$(cd "$(dirname "$0")/.." && pwd); T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 # 真 ZBIC 用例要真 nx_unpack（--nso-normalize）与真 ZBIC 样本；构建产物放 <仓库根>/build/ns2_dump_test
 OUT=$H/build/ns2_dump_test; mkdir -p "$OUT"
+export DOTNET_ROOT=${DOTNET_ROOT:-$HOME/.dotnet}; export PATH=$DOTNET_ROOT:$PATH
 timeout 500 dotnet build "$H/pack/nx_unpack/nx_unpack.csproj" -c Release --artifacts-path "$OUT/art" -v quiet -nologo > "$OUT/build.log" 2>&1 || { tail -20 "$OUT/build.log"; echo "不通 nx_unpack 编译（期望编过）"; exit 1; }
 timeout 500 dotnet build "$H/tests/nx_unpack_zbic/ZbicTest.csproj" -c Release --artifacts-path "$OUT/artz" -v quiet -nologo >> "$OUT/build.log" 2>&1 || { tail -20 "$OUT/build.log"; echo "不通 ZbicTest 编译（期望编过）"; exit 1; }
 NXD=$(find "$OUT/art/bin" -name nx_unpack.dll | head -1); ZB=$(find "$OUT/artz/bin" -name ZbicTest.dll | head -1); [ -n "$NXD" ] && [ -n "$ZB" ] || { echo "不通 没找到构建产物"; exit 1; }
+# ⑩ 的参照只用 romfs_index 的产物，不需要每个用例都经 services/romfs_index.sh 重新 build 一次（脚本每次 build 同一个工程，门禁并行时会互等构建锁）。
+# 这里构建一次到本测试自己的 artifacts，再给 wrapper；构建覆盖仍由 services/ 自己的门禁负责。
+RIOUT=$OUT/ri
+RIB=(dotnet build "$H/services/romfs_index" -c Release -o "$RIOUT" -v quiet -nologo)
+[ -f "$H/services/romfs_index/obj/project.assets.json" ] && RIB+=(--no-restore)   # 有本地 assets 就不走 restore（门禁/本机离线时 restore 会等源）
+timeout 500 "${RIB[@]}" >> "$OUT/build.log" 2>&1 || { tail -20 "$OUT/build.log"; echo "不通 romfs_index 编译（期望编过）"; exit 1; }
+RID=$RIOUT/romfs_index.dll; [ -s "$RID" ] || { echo "不通 没找到 romfs_index.dll"; exit 1; }
+printf '#!/bin/bash\nexec dotnet "%s" "$@"\n' "$RID" > "$T/ri"; chmod +x "$T/ri"
 printf '#!/bin/bash\nexec dotnet "%s" "$@"\n' "$NXD" > "$T/nxu"; chmod +x "$T/nxu"
 printf '#!/bin/bash\n# 另一份程序（字节不同、行为相同）：验键里带 nx_unpack 程序哈希、换了重做\nexec dotnet "%s" "$@"\n' "$NXD" > "$T/nxu2"; chmod +x "$T/nxu2"
 dotnet "$ZB" --emit "$T/zbic.nso" "$T/zbic-exp.nso" > /dev/null || { echo "不通 --emit 0xBF 样本"; exit 1; }
 dotnet "$ZB" --emit "$T/zbicff.nso" "$T/zbicff-exp.nso" FF > /dev/null || { echo "不通 --emit 0xFF 样本"; exit 1; }
-export NXU="$T/nxu" NXU2="$T/nxu2"
+export NXU="$T/nxu" NXU2="$T/nxu2" RIDX="$T/ri"   # RIDX：⑩ 镜像形态的参照（预编 romfs_index，不再每个用例 build）
+export S2A_ROMFS_IMAGE=0   # ①–⑨ 按目录形态（romfs/ 散文件）写期望；缺省是镜像形态（romfs.std），见 ⑩
 PY=${S2A_PY:-$HOME/.s2arm/venv/bin/python3}   # 钉版解释器（lz4，同 pack_rewrite_test.sh）：被测 ns2_dump 解 LZ4 段用出包 Python 的 lz4，gate-host 的系统 python3 没有
 "$PY" - "$H/pack/ns2_dump.py" "$T" <<'PY'
 import os, struct, subprocess, sys
@@ -158,11 +168,49 @@ chk('⑧ 原件 nacp', rc == 0 and open(f'{o8}/ctl/control.nacp', 'rb').read() =
 chk('⑧ 标题 / 版本取原件', u8['name'] == 'DK Ban' and u8['display_version'] == '1.2.0' and u8['name_zh'] == '大金', u8)
 chk('⑧ 图标', open(f'{o8}/icon.jpg', 'rb').read() == b'JPG')
 chk('⑧ 无 README.synth', not os.path.exists(f'{o8}/ctl/README.synth'))
+# ⑨ 原件只有标题、0x3000 起全 0（某款 Switch 2 更新包元数据带的控制数据）：标题照原件，补启动账号 1、归属号 = 程序号、账号存档 128 / 64 MB；语言位仍 0（#465 按宿主语言）
+d9 = f'{T}/TitleOnly'; mk(d9); n9 = bytearray(0x4000); n9[0:6] = b'Pokoti'; n9[0x200:0x206] = b'Publsh'
+w(f'{d9}/updates/458752/control/control.nacp', bytes(n9)); o9 = f'{T}/x9'
+rc, out = run(d9, o9); g9 = open(f'{o9}/ctl/control.nacp', 'rb').read()
+chk('⑨ 标题照原件', rc == 0 and g9[0:6] == b'Pokoti' and g9[0x200:0x206] == b'Publsh', out)
+chk('⑨ 补存档字段、语言位 0', g9[0x3025] == 1 and struct.unpack_from('<Q', g9, 0x3078)[0] == 0x040074A01BF12000 and struct.unpack_from('<q', g9, 0x3080)[0] == 0x08000000
+    and struct.unpack_from('<q', g9, 0x3088)[0] == 0x04000000 and struct.unpack_from('<I', g9, 0x302C)[0] == 0, g9[0x3020:0x3090].hex())
 # ⑥ 识别：本身 / 下一层；不是导出目录退出 1
 rc, out = run('--detect', d); chk('⑥ 本身', rc == 0 and out.startswith('040074A01BF12000\t'), out)
 os.makedirs(f'{T}/lib/040074A01BF12000'); os.rename(d, f'{T}/lib/040074A01BF12000/Game')
 rc, out = run('--detect', f'{T}/lib/040074A01BF12000'); chk('⑥ 下一层', rc == 0 and out.strip().endswith('/Game'), out)
 rc, out = run('--detect', f'{T}/x1'); chk('⑥ 非导出目录退出 1', rc == 1, out)
+# ⑩ 镜像形态（缺省；S2A_ROMFS_IMAGE=1 同）：不出 romfs/ 散文件，出 romfs.std。期望 = 目录形态（S2A_ROMFS_IMAGE=0）出的 romfs/ 交 services/romfs_index.sh --std（旧路径建镜像）建的镜像，逐字节相同；
+#   其余产物（.ns2_dump_key 按设计带形态，除外）逐字节相同；全量 / 差量各一；没给 nx_unpack 报红、不留产物
+import hashlib
+def files_of(root, skip):
+    out = {}
+    for dp, _, fs in os.walk(root):
+        for f in fs:
+            rel = os.path.relpath(os.path.join(dp, f), root)
+            if not rel.startswith(skip) and rel != '.ns2_dump_key': out[rel] = hashlib.sha256(open(os.path.join(dp, f), 'rb').read()).hexdigest()[:16]
+    return out
+def run_env(*a, **env):
+    e = {k: v for k, v in os.environ.items() if k not in ('S2A_ROMFS_IMAGE', 'S2A_NX_UNPACK')}; e.update(env)
+    r = subprocess.run([sys.executable, tool, *a], capture_output=True, text=True, env=e); return r.returncode, r.stdout + r.stderr
+for name, full in (('全量', True), ('差量', False)):
+    d10 = f'{T}/Img{name}'; mk(d10, full=full); w(f'{d10}/base/romfs/._junk', b'J'); w(f'{d10}/base/romfs/Z/empty.bin', b'')
+    a, b, ref = f'{T}/x10a{name}', f'{T}/x10b{name}', f'{T}/x10{name}.std'
+    ra, oa = run_env(d10, a, S2A_ROMFS_IMAGE='0'); rb, ob = run_env(d10, b, S2A_ROMFS_IMAGE='1', S2A_NX_UNPACK=os.environ['NXU'])
+    open(ref, 'wb').close(); rr = subprocess.run(['bash', os.environ['RIDX'], '--std', f'{a}/romfs', '-', ref, '0'], capture_output=True, text=True)
+    chk(f'⑩ {name}：两种形态退出 0、参照镜像建得出', (ra, rb, rr.returncode) == (0, 0, 0), oa + ob + rr.stderr)
+    if (ra, rb, rr.returncode) == (0, 0, 0):
+        chk(f'⑩ {name}：romfs.std 与「romfs/ + romfs_index --std」逐字节相同', os.path.isfile(f'{b}/romfs.std') and open(f'{b}/romfs.std', 'rb').read() == open(ref, 'rb').read())
+        chk(f'⑩ {name}：镜像形态没有 romfs/ 散文件', not os.path.exists(f'{b}/romfs'))
+        fa, fb = files_of(a, 'romfs' + os.sep), files_of(b, 'romfs.std')
+        chk(f'⑩ {name}：其余产物逐字节相同', fa == fb, (fa, fb))
+# 缺省（不设 S2A_ROMFS_IMAGE）= 镜像形态：出 romfs.std、没有 romfs/，镜像与显式 =1 那份逐字节相同；负对照 =0 照旧出 romfs/、没有 romfs.std
+rd_, od_ = run_env(f'{T}/Img全量', f'{T}/x10d', S2A_NX_UNPACK=os.environ['NXU'])
+chk('⑩ 缺省是镜像形态：出 romfs.std、没有 romfs/，与 =1 逐字节相同', rd_ == 0 and os.path.isfile(f'{T}/x10d/romfs.std') and not os.path.exists(f'{T}/x10d/romfs')
+    and open(f'{T}/x10d/romfs.std', 'rb').read() == open(f'{T}/x10b全量/romfs.std', 'rb').read(), od_)
+chk('⑩ 负对照 S2A_ROMFS_IMAGE=0：出 romfs/、没有 romfs.std', os.path.isdir(f'{T}/x10a全量/romfs') and not os.path.exists(f'{T}/x10a全量/romfs.std'))
+rc, out = run_env(f'{T}/Img全量', f'{T}/x10c', S2A_ROMFS_IMAGE='1')
+chk('⑩ 镜像形态没给 nx_unpack：报红、不留产物', rc != 0 and 'S2A_NX_UNPACK' in out and not os.path.exists(f'{T}/x10c'), out)
 print(f'ns2_dump：{ok} 过 / {bad} 红'); sys.exit(1 if bad else 0)
 PY
 r=$?

@@ -77,14 +77,8 @@ class ControlPlaneTests(unittest.TestCase):
 
     # ---- helpers ----
     def jobs_dir(self, task=None):
-        """任务记录目录（游戏库结构 P3）：任务起跑时库已建好（有库标识）→ <库>/logs/jobs，否则 <私有目录>/logs/jobs。
-        setup 起跑时库还没建好，它的记录留在私有目录，等下一个作业收进库：给了 task 就看它在哪一边"""
-        built = self.library / "logs" / "jobs"
-        fallback = self.private / "logs" / "jobs"
-        name = (task or self.task) + ".json"
-        if (built / name).exists() or not (fallback / name).exists() and (self.library / ".s2arm-library.json").is_file():
-            return built
-        return fallback
+        """任务记录目录：固定 <私有目录>/logs/jobs（剃刀 H6；库建没建好都一样）"""
+        return self.private / "logs" / "jobs"
 
     def request(self, task=None, **extra):
         body = dict(schema=1, taskId=task or self.task, operation="setup", engineDir=str(ROOT),
@@ -264,7 +258,6 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(self.cli("--request", self.request()).returncode, 0)
         stored = self.jobs_dir() / (self.task + ".request.json")
         self.assertTrue(stored.is_file())
-        self.assertEqual(stored.stat().st_mode & 0o077, 0)
         self.assertEqual(json.loads(stored.read_text())["taskId"], self.task)
 
     # ---- job store pruning ----
@@ -308,6 +301,43 @@ class ControlPlaneTests(unittest.TestCase):
         finally:
             child.kill()
             child.wait(timeout=10)
+
+    def test_prune_keeps_request_only_task_as_running(self):
+        jobs = self.jobs_dir("queued")
+        jobs.mkdir(parents=True)
+        request = jobs / "queued.request.json"
+        request.write_text('{"schema":1,"operation":"setup"}')
+        before = request.read_bytes()
+        for dry_run in (True, False):
+            with self.subTest(dry_run=dry_run):
+                options = ["--dry-run"] if dry_run else []
+                result = self.cli("prune", "--private-root", self.private,
+                                  "--keep-count", 0, "--keep-days", 0, *options)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                report = json.loads(result.stdout)
+                self.assertEqual(report["skippedRunning"], 1)
+                self.assertEqual(report["invalidRecords"], [])
+                self.assertEqual(report["kept"], 1)
+                self.assertEqual(report["removed"], [])
+                self.assertEqual(request.read_bytes(), before)
+
+    def test_status_ignores_a_record_removed_during_the_scan(self):
+        from unittest.mock import patch
+        import core
+        self.finish_task("healthy")
+        vanished = self.finish_task("vanished").resolve()
+        original_read = core.read
+
+        def remove_before_read(path, default=None):
+            if path == vanished:
+                vanished.unlink(missing_ok=True)
+            return original_read(path, default)
+
+        with patch.object(core, "read", side_effect=remove_before_read):
+            report = core.status(self.private)
+        self.assertEqual(report["finished"], 1)
+        self.assertEqual(report["interrupted"], 0)
+        self.assertEqual(report["invalidRecords"], [])
 
     def test_prune_leaves_a_job_that_is_finishing_right_now_alone(self):
         """一个刚写完终态、worker 还没退出的任务不能被清掉：它在 journal 里已经是终态，但文件还在被追加。"""
@@ -355,6 +385,46 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertTrue((jobs / "linked.json").is_symlink())
         self.assertTrue(outside.is_file())
 
+    def test_status_reports_bad_journals_and_still_counts_healthy_jobs(self):
+        self.finish_task("healthy")
+        jobs = self.jobs_dir("healthy")
+        broken = {"truncated": b"{", "encoding": b"\xff", "array": b"[]", "null": b"null",
+                  "foreign": b'{"id":"another-task","state":"completed"}'}
+        for name, content in broken.items():
+            (jobs / (name + ".json")).write_bytes(content)
+        result = self.cli("status", "--private-root", self.private)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["finished"], 1)
+        self.assertEqual({row["taskId"] for row in report["invalidRecords"]}, set(broken))
+        self.assertTrue(all(row["reason"] for row in report["invalidRecords"]))
+
+    def test_prune_preserves_bad_journals_and_their_companions(self):
+        self.finish_task("healthy", age=30 * 86400)
+        broken = {"truncated": b"{", "encoding": b"\xff", "array": b"[]", "null": b"null",
+                  "foreign": b'{"id":"another-task","state":"completed"}'}
+        snapshots = {}
+        for name, content in broken.items():
+            path = self.finish_task(name, age=30 * 86400)
+            path.write_bytes(content)
+            for file in path.parent.glob(name + ".*"):
+                snapshots[file] = file.read_bytes()
+        result = self.cli("prune", "--private-root", self.private, "--keep-count", 0, "--keep-days", 0, *NO_FLOOR)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["removed"], ["healthy"])
+        self.assertEqual(report["kept"], len(broken))
+        self.assertEqual({row["taskId"] for row in report["invalidRecords"]}, set(broken))
+        for path, content in snapshots.items():
+            self.assertEqual(path.read_bytes(), content)
+
+    def test_generic_json_read_still_rejects_corruption(self):
+        from core import read
+        path = self.root / "essential.json"
+        path.write_text("{")
+        with self.assertRaises(json.JSONDecodeError):
+            read(path, {})
+
     # ---- 记录写不进磁盘时不能假装成功 ----
     def stub_request(self, task=None):
         body = dict(schema=1, taskId=task or self.task, operation="stub", engineDir=str(ROOT),
@@ -382,6 +452,59 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(json.loads((self.jobs_dir() / (self.task + ".json")).read_text())["state"], "completed")
 
+    # ---- 取消把工具一起停掉、工具因此报错：照取消收尾，不在写错误摘要时再抛 Cancelled 带着回溯退出（11-12 Mac 设备探测「工作进程已退出」） ----
+    def terminal_event(self):
+        events = (self.jobs_dir() / (self.task + ".events.jsonl")).read_text().splitlines()
+        return json.loads(events[-1])
+
+    def test_a_failure_caused_by_the_cancel_ends_as_cancelled(self):
+        import main as worker
+        from core import Failure
+        def stub(c):
+            c.stop()   # SIGTERM 到了：作业标志已置，xcrun 也被同一信号停掉、退出码 -15
+            raise Failure("读取 iOS SDK 失败；命令：xcrun --sdk iphoneos --show-sdk-version；退出码：-15", code="tool_exit")
+        code = worker.run_request(self.stub_request(), operation_overrides={"stub": stub})
+        self.assertEqual(code, 130, "取消后工具报的错把作业变成了失败或回溯退出")
+        self.assertEqual(self.journal()["state"], "cancelled")
+        self.assertEqual(self.terminal_event()["state"], "cancelled")
+
+    def test_an_unexpected_error_after_the_cancel_also_ends_as_cancelled(self):
+        import main as worker
+        def stub(c):
+            c.stop()
+            raise RuntimeError("工具输出被截断")
+        code = worker.run_request(self.stub_request(), operation_overrides={"stub": stub})
+        self.assertEqual(code, 130)
+        self.assertEqual(self.journal()["state"], "cancelled")
+        self.assertTrue((self.private / "logs" / (self.task + "-exception.log")).is_file(), "原错误没留进日志")
+
+    def test_a_cancel_that_lands_while_the_failure_is_reported_ends_as_cancelled(self):
+        from unittest.mock import patch
+        import core
+        import main as worker
+        from core import Failure
+        describe = core.Context.describe_failure
+        def cancel_then_describe(self, *args, **kwargs):
+            self.stop()   # 取消正好落在写错误摘要的当口：下一步 emit 查标志
+            return describe(self, *args, **kwargs)
+        def stub(c):
+            raise Failure("这一步失败（退出码 1）", code="tool_exit")
+        with patch.object(core.Context, "describe_failure", cancel_then_describe):
+            code = worker.run_request(self.stub_request(), operation_overrides={"stub": stub})
+        self.assertEqual(code, 130)
+        self.assertEqual(self.journal()["state"], "cancelled")
+        self.assertEqual(self.journal()["diagnostics"], [], "没发出去的错误摘要被带进了取消的终态")
+
+    def test_a_failure_without_a_cancel_still_fails(self):
+        import main as worker
+        from core import Failure
+        def stub(c):
+            raise Failure("这一步失败（退出码 1）", code="tool_exit")
+        code = worker.run_request(self.stub_request(), operation_overrides={"stub": stub})
+        self.assertEqual(code, 1)
+        self.assertEqual(self.journal()["state"], "failed")
+        self.assertEqual(self.terminal_event()["state"], "failed")
+
     def test_a_stage_that_cannot_write_its_events_fails_with_a_named_code(self):
         import errno
         from unittest.mock import patch
@@ -393,6 +516,19 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "journal_write_failed")
         self.assertTrue(c.journal_broken)
 
+    def test_events_file_is_never_chmodded(self):
+        # #561：每条事件都按路径 os.chmod 一次，Windows 上又多一个撞占用报「拒绝访问」的点；11-16 起权限用系统缺省、一次都不改
+        from unittest.mock import patch
+        c = self.context()
+        real, chmods = os.chmod, []
+        def chmod(path, mode, *a, **k):
+            chmods.append(str(path)); return real(path, mode, *a, **k)
+        with patch("os.chmod", chmod):
+            for i in range(5):
+                c.begin(f"导出 {i + 1}/5")
+        self.assertEqual(sum(p.endswith(".events.jsonl") for p in chmods), 0)
+        self.assertGreaterEqual(len(c.events.read_text(encoding="utf-8").splitlines()), 5)
+
     # ---- 阶段完成记录：按维护方口径，job 层不记这份（只有一个判据 = 产物根的阶段键） ----
     def test_job_layer_keeps_no_completed_stage_list(self):
         import main as worker
@@ -403,6 +539,22 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(record["attempts"], {"导出 1/3": 1, "导出 2/3": 1})   # 只留展示用的次数
         described = json.loads(self.cli("get", "--private-root", self.private, "--task", self.task).stdout)
         self.assertNotIn("completedStages", described)
+
+    def test_stage_key_and_keychain_flag_ride_every_event_of_the_stage(self):
+        """前端认 stageKey / keychainPrompt（M9 / M10），不按中文阶段名、写死的步骤号猜；标记只在本阶段，下一次 begin 重置"""
+        import main as worker
+        def stub(c):
+            c.begin("用你的 Apple ID 签名", 4, 6, keychain=True); c.emit("progress", "签名中", done=1, total=2)
+            c.begin("游戏运行中", key="game_running")
+            c.begin("装到 iPhone", 5, 6)
+            return {}
+        self.assertEqual(worker.run_request(self.stub_request(), operation_overrides={"stub": stub}), 0)
+        events = [json.loads(x) for x in self.cli("events", "--private-root", self.private, "--task", self.task).stdout.splitlines() if x.strip()]
+        seen = [(e["stage"], e["stageKey"], e["keychainPrompt"]) for e in events if e["type"] in ("stage", "progress")]
+        self.assertIn(("用你的 Apple ID 签名", None, True), seen)
+        self.assertEqual([x for x in seen if x[0] == "用你的 Apple ID 签名"], [("用你的 Apple ID 签名", None, True)] * 2)   # 阶段事件 + 进度事件都带
+        self.assertIn(("游戏运行中", "game_running", False), seen)
+        self.assertIn(("装到 iPhone", None, False), seen)
 
     def test_a_killed_task_reports_only_the_stages_it_left_behind(self):
         child = self.start_worker(operation="build")
@@ -532,6 +684,23 @@ class ControlPlaneTests(unittest.TestCase):
         record = self.journal()
         self.assertEqual(record["diagnostics"][-1]["code"], "stage_timeout")
         self.assertIn("导出 2/3", record["diagnostics"][-1]["summary"])
+
+    def test_unkillable_stage_keeps_original_failure_and_records_why(self):
+        # #837：进程卡在系统内核里（换页）时 KILL 也要等它回来才生效；原先第二次等待超时抛 TimeoutExpired，盖掉超时 / 取消本身，也不记诊断
+        from core import Failure
+        from unittest.mock import patch
+        c = self.context()
+        c.stage = "运行游戏"
+        sent, procs = [], []
+        with patch.object(type(c), "signal_child", lambda self, p, sig: (sent.append(sig), procs.append(p))):   # 信号「发了却不生效」
+            with self.assertRaises(Failure) as caught:
+                c.run([sys.executable, str(self.group), str(self.pidfile)], timeout=1)
+        self.assertEqual(caught.exception.code, "stage_timeout")
+        self.assertEqual(sent, ["TERM", "KILL"])
+        codes = [d["code"] for d in self.journal()["diagnostics"]]
+        self.assertEqual(codes, ["stage_timeout", "child_unkillable"])
+        procs[0].kill(); procs[0].wait(timeout=10)   # 收尾：测试自己结束这个「收不掉」的阶段工具
+        self.assert_dead(self.grandchild())
 
     def test_cancel_stops_the_whole_process_group(self):
         from core import Cancelled, Failure

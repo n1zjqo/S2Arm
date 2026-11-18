@@ -5,6 +5,10 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <!-- 原地使用游戏文件（游戏库「原地使用游戏文件夹…」、deploy_game.py 的原地模式）：直接读共享存储上的资源目录，
+         不再拷一份进私有目录。安卓 11+ 要「所有文件访问」；安卓 10 用旧的读存储权限 + requestLegacyExternalStorage。 -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" tools:ignore="ScopedStorage" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
     <!-- Optional so the shell can explain unsupported hardware. -->
     <uses-feature android:name="android.hardware.vulkan.version"
         android:version="0x00401000" android:required="false" />
@@ -13,7 +17,7 @@
         android:isGame="true" android:resizeableActivity="false"
         android:icon="${appIcon}" android:allowBackup="false" android:fullBackupContent="false"
         android:dataExtractionRules="@xml/data_extraction_rules" android:supportsRtl="true"
-        android:pageSizeCompat="disabled">
+        android:pageSizeCompat="disabled" android:requestLegacyExternalStorage="true">
         <!-- #48 A4：两个 supports 都 false = 不接管 Game Mode 优化，保留 OEM 厂商干预；
              系统省电档由应用内轮询 getGameMode() 读到后限直连 present 周期。 -->
         <meta-data android:name="android.game_mode_config" android:resource="@xml/game_mode_config" />
@@ -32,7 +36,8 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
-        <activity android:name=".LibraryActivity" android:exported="true" android:launchMode="singleTop">
+        <activity android:name=".LibraryActivity" android:exported="true" android:launchMode="singleTop"
+            android:screenOrientation="sensorLandscape" tools:ignore="DiscouragedApi">
         </activity>
         <activity android:name=".MainActivity" android:exported="true" android:launchMode="singleTop"
             android:screenOrientation="${screenOrientation}" tools:ignore="DiscouragedApi"
@@ -40,9 +45,12 @@
         </activity>
         <activity android:name=".GameActivity" android:exported="false" android:process=":game"
             android:launchMode="singleTask" android:taskAffinity="${applicationId}.game"
-            android:excludeFromRecents="true" android:screenOrientation="${screenOrientation}"
+            android:excludeFromRecents="true" android:screenOrientation="sensorLandscape"
             tools:ignore="DiscouragedApi"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|density|uiMode" />
+        <!-- #528 item 15: the diagnostic bundle reaches the chosen app only through the share intent's one-off grant -->
+        <provider android:name=".DiagnosticShareProvider" android:authorities="${applicationId}.diag"
+            android:exported="false" android:grantUriPermissions="true" />
     </application>
 </manifest>
 

@@ -104,15 +104,329 @@ static id<MTLRenderPipelineState> geo_capture_pso(NvShader *vs) {
 // The mesh stage shares the vertex stage's argument table (it has no vertex fetch: vertex-table slot 29 is vertex stream 13's, VB_SLOT, rebound through the enc_r_vbuf cache by the
 // next vertex draw), a task shader has the object table g_ot; both read the draw's first workgroup at buffer MESH_FIRST_SLOT (interface contract item 3). Indirect: the GPU-written
 // {count, first} become MTLDispatchThreadgroupsIndirectArguments {count, 1, 1} with first at word 4 on the GPU (ixc_run), so neither is read on the CPU.
-// A pipeline is built in the background (g_mtk_q); until it is ready the draw is skipped and counted (g_mtk_wait), a refused one is reported red once and its draws skipped.
+// A pipeline is built in the background (g_mtk_q, mtk_kick); until it is ready the draw is skipped and counted (g_mtk_wait) when skip_safe's rules allow it, otherwise the draw waits
+//   for the build within a per-frame budget (mtk_sync_why, mtk_wait); a refused one is reported red once and its draws skipped.
 // After the upstream reference (MIT) 1d4b8e82b / #1312 (MIT): mesh_tasks_draw / mtk_pso / mtk_encode, written for this host's two backends, recording and binding state
 enum { MESH_FIRST_SLOT = 29 };
 _Static_assert(VB_SLOT(13) == MESH_FIRST_SLOT, "slot 29 of the vertex table is vertex stream 13's: a mesh draw writes it through enc_r_vbuf so the next vertex draw rebinds the stream (see above)");
-static struct { int on, miss; NvShader *ts, *ms; uint32_t first, count; uint64_t ind; } g_mtk;   // the draw being encoded (on: draw() is drawing it)
-typedef struct { pso_key k; const void *ts; } mtk_key;   // pso_key with the mesh shader in its vertex place, and the task shader (the pipeline's third function)
+static struct { int on, miss; NvShader *ts, *ms; uint32_t first, count; uint64_t ind, emu; __unsafe_unretained id<MTLFunction> emu_fn; uint32_t emu_vbo, emu_ibo, emu_iblen; } g_mtk;   // emu: #770 the exchange buffer of a draw whose task / mesh stages the host ran (mtk_emu_run), the vertex function that draws its records   // the draw being encoded (on: draw() is drawing it)
+typedef struct { pso_key k; const void *ts; uint32_t pad, emu; } mtk_key;   // pso_key with the mesh shader in its vertex place, the task shader (the pipeline's third function), and the user(locn) mask of the padded mesh variant used (0 = none)
 static nvn_hmap g_pso_mtk = {.klen = sizeof(mtk_key)}; static os_unfair_lock g_pso_mtk_lock = OS_UNFAIR_LOCK_INIT;
 static NSObject *g_pso_mtk_building; static dispatch_queue_t g_mtk_q; static dispatch_group_t g_mtk_group;
 static uint64_t g_mtk_n, g_mtk_ind_n, g_mtk_wait, g_mtk_skip;   // drawn (of them indirect), skipped while the pipeline was built, skipped as not drawable (red)
+// #770 实验开关 S2A_MESH_PACE（缺省 0 = 关，照旧建好即交付）：M1 Max（没有硬件网格着色，驱动走软件网格）换图时 GPU 挂死，都紧跟某条网格管线交付、
+//   且发生在多条网格管线排队待交付时；跳过网格绘制不挂；清掉系统缓存全部现编照样挂（作者 11-12 反例，所以不是缓存）。两档各验一个假设：
+//   1 = 建好的先攒着，后台一条都不在编了才一起交付（假设：新管线首次上 GPU 时编译服务还在编下一条软件网格管线 → 挂）；
+//   2 = 每帧最多交付一条（假设：同一帧里几条新管线首次上 GPU → 挂）。交付和每条管线第一次被画都记帧号与还在编的条数，挂死前最后几行能对上是哪种
+static int mtk_pace(void) {
+    static int v = -1; if (v >= 0) return v;
+    const char *e = getenv("S2A_MESH_PACE"); v = e && (*e == '1' || *e == '2') && !e[1] ? *e - '0' : 0;
+    if (v) MLOG("task / mesh pipelines: pace %d (S2A_MESH_PACE: %s)", v, v == 1 ? "deliver only when no mesh pipeline is still building" : "deliver at most one per frame");
+    return v;
+}
+static _Atomic int g_mtk_inflight;   // mesh pipelines queued or building in the background
+static NSMutableArray *g_mtk_ready;   // pace on: built, not delivered yet (each @[NSData key, pipeline or NSNull]); under g_pso_mtk_lock
+static uint64_t g_mtk_pub_frame = UINT64_MAX;
+static NSMutableSet *g_mtk_drawn;   // pipelines already drawn once (first-draw log)
+static NSMapTable *g_mtk_names;   // pipeline → "task … mesh … fragment …" for the #770 logs (not the pipeline's label: -label is also a Metal 4 encoder selector, t_nvn_rec_cover); under g_pso_mtk_lock
+static const char *mtk_name(id p) { if (!p || p == NSNull.null) return "(refused)"; os_unfair_lock_lock(&g_pso_mtk_lock); NSString *n = [g_mtk_names objectForKey:p]; os_unfair_lock_unlock(&g_pso_mtk_lock); return n ? n.UTF8String : "?"; }
+static void mtk_publish(void) {   // pace on, submit thread, before a mesh draw looks its pipeline up
+    int pace = mtk_pace(); if (!pace || !g_mtk_ready.count) return;
+    uint64_t f = atomic_load_explicit(&g_cur_frame, memory_order_relaxed); int fly = atomic_load(&g_mtk_inflight);
+    if (pace == 1 && fly) return;
+    if (pace == 2 && f == g_mtk_pub_frame) return;
+    os_unfair_lock_lock(&g_pso_mtk_lock);
+    NSUInteger n = pace == 2 ? 1 : g_mtk_ready.count;
+    for (NSUInteger i = 0; i < n; i++) { NSArray *r = g_mtk_ready[i]; mtk_key kk; [(NSData *)r[0] getBytes:&kk length:sizeof kk]; hm_put_id(&g_pso_mtk, &kk, r[1]); }
+    NSArray *done = [g_mtk_ready subarrayWithRange:NSMakeRange(0, n)]; [g_mtk_ready removeObjectsInRange:NSMakeRange(0, n)]; NSUInteger left = g_mtk_ready.count;
+    os_unfair_lock_unlock(&g_pso_mtk_lock);
+    g_mtk_pub_frame = f;
+    for (NSArray *r in done) MLOG("task / mesh pipeline delivered (pace %d) at frame %llu: %s; still building %d, built and held %lu", pace, (unsigned long long)f,
+                                  mtk_name(r[1]), fly, (unsigned long)left);
+}
+// ---------- #770 宿主自跑任务 / 网格阶段（S2A_MESH_EMU） ----------
+// M1 / M2（没有硬件网格着色，不支持 MTLGPUFamilyApple9）上驱动的软件网格在带任务的网格绘制上挂死（M1 Pro 11-17 二分：只留任务 de3befe4936cac83 / 网格
+//   e6759f45b660ec01 那对就挂；网格输出 0 个图元不挂；任务交宿主、网格仍交驱动照挂；苹果论坛 708654 / FB10367407 同类）。这些 GPU 上两段都由宿主跑：
+//   任务计算核 main0_tc 把每个任务组的载荷与派生数写进交换缓冲（S2A.Dsh MeshStage EMU_SLOT），排表核 mxe_scan 前缀和出「第几个网格组属于哪个任务组的第几组」，
+//   网格计算核 main0_mc 把顶点记录与紧排的索引写进交换缓冲，再用顶点函数 main0_mv 普通索引间接画。都在同一个命令缓冲里、GPU 上排好，CPU 不回读。
+//   入口只在宿主现编时定义 S2A_MESH_EMU 才有（dm_shader_base_cached：本机翻译器出的基础源码），其中的循环有圈数上限（MeshStage.GuardLoops）。
+//   缺省：macOS 且 GPU 不支持 Apple9 时开；S2A_MESH_EMU=1 / 0 两头强制。做不了的（载荷中转、逐图元输出、源码拿不到、参数缓冲对不上）照旧走驱动
+enum { MXE_SLOT = 28, MXE_HEAD = 32, MXE_TASK_CAP = 4096 };
+_Static_assert(VB_SLOT(12) == MXE_SLOT, "slot 28 of the vertex table is vertex stream 12's: the host-stage draw writes it through enc_r_vbuf so the next vertex draw rebinds the stream");
+static int mtk_emu_on(void) {
+    static int v = -1; if (v >= 0) return v;
+    const char *e = getenv("S2A_MESH_EMU");
+#if TARGET_OS_OSX
+    int dflt = ![g_dev supportsFamily:MTLGPUFamilyApple9];
+#else
+    int dflt = 0;
+#endif
+    v = e && *e ? *e == '1' : dflt;
+    MLOG("task / mesh draws: the task and mesh stages run %s (S2A_MESH_EMU %s)", v ? "on the host as compute kernels, drawn as an indexed draw of their vertex records (#770)" : "in the driver's object stage", e && *e ? e : "unset");
+    return v;
+}
+static const char k_mxe_msl[] =
+"#include <metal_stdlib>\nusing namespace metal;\n"
+"kernel void mxe_scan(device uint* h [[buffer(0)]], device const uint* ind [[buffer(1)]], uint l [[thread_position_in_threadgroup]], uint nt [[threads_per_threadgroup]]) {\n"
+"  threadgroup uint part[1024];\n"
+"  uint n = min(h[6] ? h[6] : ind[0], h[3]);\n"
+"  uint per = (n + nt - 1) / nt, a = min(l * per, n), b = min(a + per, n), s = 0;\n"
+"  for (uint t = a; t < b; t++) s += h[h[0] + t];\n"
+"  part[l] = s; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"  if (l == 0) { uint acc = 0; for (uint i = 0; i < nt; i++) { uint v = part[i]; part[i] = acc; acc += v; } uint m = min(acc, h[4]); h[8] = m; h[9] = 1; h[10] = 1; h[13] = 0; h[14] = 1; h[15] = 0; h[16] = 0; h[17] = 0; h[18] = acc; h[19] = h[6] ? h[6] : ind[0]; }\n"
+"  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"  uint o = part[l];\n"
+"  for (uint t = a; t < b; t++) { uint c = h[h[0] + t]; for (uint j = 0; j < c && o + j < h[4]; j++) h[h[2] + o + j] = (t << 10) | j; o += c; }\n"
+"}\n";
+static id<MTLComputePipelineState> mxe_scan_pso(void) {
+    static id<MTLComputePipelineState> ps; static int failed; if (ps || failed) return ps;
+    NSError *e = nil; id<MTLLibrary> lib = [g_dev newLibraryWithSource:@(k_mxe_msl) options:nil error:&e];
+    ps = lib ? [g_dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mxe_scan"] error:&e] : nil;
+    if (!ps) { failed = 1; MLOG("【红】 task / mesh host stages: the scan kernel failed: %s", e.localizedDescription.UTF8String); }
+    return ps;
+}
+static NSMutableDictionary *g_mxe_vs;   // mesh shader key → its vertex record's bytes
+static NSMutableDictionary *g_mxe;   // shader key + entry → MTLFunction (task: its compute pipeline) or NSNull (cannot); submit thread
+static id mtk_emu_get(NvShader *sh, int st, NSString *entry) {
+    NSString *k = [NSString stringWithFormat:@"%s/%@", sh->key, entry];
+    if (!g_mxe) g_mxe = [NSMutableDictionary dictionary];
+    id got = g_mxe[k]; if (got) return got == NSNull.null ? nil : got;
+    uint8_t md[8] = {0}; for (int i = 0; i < 8; i++) { unsigned b = 0; if (sscanf(sh->key + 2 * i, "%2x", &b) != 1) break; md[i] = (uint8_t)b; }
+    char path[1200], why[300] = ""; id r = nil; uint64_t t0 = bp_now();
+    do {
+        if (dm_shader_base_cached(md, st, path, sizeof path)) { snprintf(why, sizeof why, "no translation of it on this device"); break; }
+        NSString *src = [NSString stringWithContentsOfFile:@(path) encoding:NSUTF8StringEncoding error:nil];
+        if (![src containsString:entry]) { snprintf(why, sizeof why, "its translation has no %s (a relayed payload, or the exchange slot is taken)", entry.UTF8String); break; }
+        MTLCompileOptions *co = dm_msl_opts(); co.preprocessorMacros = @{@"S2A_MESH_EMU": @1};
+        NSError *e = nil; id<MTLLibrary> lib = [g_dev newLibraryWithSource:src options:co error:&e];
+        if (!lib) { snprintf(why, sizeof why, "failed to build: %s", e.localizedDescription.UTF8String); break; }
+        id<MTLFunction> f = lib_entry(lib, entry);
+        NSUInteger al = f && sh->rf.nb && ![entry isEqualToString:@"main0_mv"] ? [f newArgumentEncoderWithBufferIndex:sh->rf.abi].encodedLength : sh->arg_len;   // main0_mv takes the vertex records alone
+        if (!f || al != sh->arg_len) { snprintf(why, sizeof why, "%s", f ? "it takes another argument buffer than the library's" : "no such entry"); break; }
+        if (st == 4 || [entry hasPrefix:@"main0_mc"]) { r = [g_dev newComputePipelineStateWithFunction:f error:&e]; if (!r) snprintf(why, sizeof why, "its compute pipeline failed: %s", e.localizedDescription.UTF8String); }
+        else r = f;
+        if (r && st == 5) {   // the vertex record's stride: the float4 members of dm_vertex_t (S2A.Dsh MeshStage)
+            NSRange a = [src rangeOfString:@"struct dm_vertex_t {"]; NSRange z = a.location == NSNotFound ? a : [src rangeOfString:@"};" options:0 range:NSMakeRange(a.location, src.length - a.location)];
+            NSUInteger nf = 0; if (z.location != NSNotFound) nf = [[src substringWithRange:NSMakeRange(a.location, z.location - a.location)] componentsSeparatedByString:@"float4 "].count - 1;
+            if (!g_mxe_vs) g_mxe_vs = [NSMutableDictionary dictionary]; g_mxe_vs[@(sh->key)] = @(nf * 16);
+        }
+    } while (0);
+    g_mxe[k] = r ?: NSNull.null;
+    if (r) MLOG("task / mesh host stages: %s %s %s ready in %.1f ms", st == 4 ? "task" : "mesh", sh->key, entry.UTF8String, (bp_now() - t0) / 1e6);
+    else MLOG("【黄】 task / mesh host stages: %s %s %s: %s; its draws stay on the driver's mesh pipeline (#770)", st == 4 ? "task" : "mesh", sh->key, entry.UTF8String, why);
+    return r;
+}
+static int mtk_emu_ready(NvShader *ts, NvShader *ms) {   // the stages' pipelines (first use: built here, on the submit thread)
+    if (!ts || ts->mesh_relay || !ms || !mtk_emu_on() || !mxe_scan_pso() || !mtk_emu_get(ts, 4, @"main0_tc")) return 0;
+    int z = [ms->ventry hasSuffix:@"_z"];
+    return mtk_emu_get(ms, 5, z ? @"main0_mc_z" : @"main0_mc") && mtk_emu_get(ms, 5, @"main0_mv");
+}
+typedef struct { __unsafe_unretained id<MTLComputePipelineState> tp, mp; uint64_t tg, mg, first, xg, ind; NSUInteger ta, ma; int tok, mok; uint32_t capT, tt, mt; } mxe_job;
+// Exchange buffer sizes from what this pair needed before (the scan's raw counts read back on completion): the buffer is frame scratch, and sizing every draw for the worst case
+//   (8 MB a draw, 155 mesh draws a frame in one busy scene) made the arena take ~1 GB a frame: 5 fps. Too small once = that draw loses its later mesh groups that frame (counted, not drawn),
+//   and the next draw of the pair is sized from it
+static NSMutableDictionary *g_mxe_need; static os_unfair_lock g_mxe_need_lock = OS_UNFAIR_LOCK_INIT; static _Atomic uint64_t g_mxe_short;
+static void mtk_emu_need(NSString *k, uint32_t *tasks, uint32_t *meshes) {
+    os_unfair_lock_lock(&g_mxe_need_lock); NSArray *v = g_mxe_need[k]; os_unfair_lock_unlock(&g_mxe_need_lock);
+    *tasks = v ? [v[0] unsignedIntValue] : 0; *meshes = v ? [v[1] unsignedIntValue] : 0;
+}
+static void mtk_emu_saw(NSString *k, uint32_t tasks, uint32_t meshes) {
+    os_unfair_lock_lock(&g_mxe_need_lock); if (!g_mxe_need) g_mxe_need = [NSMutableDictionary dictionary];
+    NSArray *v = g_mxe_need[k]; uint32_t t0 = v ? [v[0] unsignedIntValue] : 0, m0 = v ? [v[1] unsignedIntValue] : 0;
+    if (tasks > t0 || meshes > m0 || !v) g_mxe_need[k] = @[@(MAX(tasks, t0)), @(MAX(meshes, m0))];
+    os_unfair_lock_unlock(&g_mxe_need_lock);
+}
+// The exchange buffers come from a ring of their own (S2A_MESH_EMU_RING_MB, default 256), not the frame arena: one draw can need 20 MB of vertex records, and arena blocks that
+//   size were made anew every frame (footprint 4.4 → 10.8 GB, 5 fps). A region is reused once the submission that used it has completed (g_done); a request the ring cannot hold yet
+//   falls back to the arena
+static id<MTLBuffer> g_mxr; static uint64_t g_mxr_len, g_mxr_head; static struct { uint64_t lo, hi, fence; } g_mxr_q[512]; static int g_mxr_qh, g_mxr_qn; static uint64_t g_mxr_fallback;
+static size_t mxe_alloc(size_t n, __strong id<MTLBuffer> *buf) {
+    n = (n + 255) & ~(size_t)255;
+    if (!g_mxr) { const char *e = getenv("S2A_MESH_EMU_RING_MB"); g_mxr_len = (uint64_t)(e && atoi(e) > 0 ? atoi(e) : 256) << 20;
+        g_mxr = [g_dev newBufferWithLength:g_mxr_len options:MTLResourceStorageModeShared]; if (g_mxr) res_add(g_mxr); }
+    uint64_t done = rc_done();
+    while (g_mxr_qn && g_mxr_q[g_mxr_qh].fence <= done) { g_mxr_qh = (g_mxr_qh + 1) % 512; g_mxr_qn--; }
+    if (g_mxr && n <= g_mxr_len / 2 && g_mxr_qn < 511) {
+        uint64_t lo = g_mxr_head + n > g_mxr_len ? 0 : g_mxr_head, hi = lo + n; int clash = 0;
+        for (int i = 0, k = g_mxr_qh; i < g_mxr_qn && !clash; i++, k = (k + 1) % 512) clash = lo < g_mxr_q[k].hi && g_mxr_q[k].lo < hi;
+        if (!clash) { int k = (g_mxr_qh + g_mxr_qn++) % 512; g_mxr_q[k].lo = lo; g_mxr_q[k].hi = hi; g_mxr_q[k].fence = g_fence + 1; g_mxr_head = hi; *buf = g_mxr; return (size_t)lo; }
+    }
+    if (!(g_mxr_fallback++ & 1023)) MLOG("task / mesh host stages: exchange ring full (%llu MB), %llu requests went to the frame arena", (unsigned long long)(g_mxr_len >> 20), (unsigned long long)g_mxr_fallback);
+    return arena_alloc(n, buf);
+}
+static int mtk_emu_cap(NvShader *sh, int st, int vert, uint64_t *gpu, NSUInteger *ai) {   // the argument block this stage binds now, captured (bind_args)
+    g_args_cap_ok = 0; g_args_compute = 2; encode_args(nil, sh, st, vert); g_args_compute = 0;
+    *gpu = g_args_cap_gpu; *ai = g_args_cap_ai; return g_args_cap_ok;
+}
+// One draw's host task / mesh stages: its exchange buffer and its bindings now (j); what the draw then needs (e). 0 = not eligible (the draw goes the driver's way)
+static int mtk_emu_prep(const p_draw *dw, NvShader *ts, NvShader *ms, uint64_t ind, mxe_job *j) {
+    if (!mtk_emu_ready(ts, ms)) return 0;
+    int z = [ms->ventry hasSuffix:@"_z"];
+    id<MTLComputePipelineState> tp = mtk_emu_get(ts, 4, @"main0_tc"), mp = mtk_emu_get(ms, 5, z ? @"main0_mc_z" : @"main0_mc");
+    id<MTLFunction> vf = mtk_emu_get(ms, 5, @"main0_mv");
+    uint32_t vs = [g_mxe_vs[@(ms->key)] unsignedIntValue], maxv = MAX(ms->mesh_maxv, 1u), maxp = MAX(ms->mesh_maxp, 1u);
+    if (!vs) return 0;
+    static uint64_t budget; if (!budget) { const char *ev = getenv("S2A_MESH_EMU_MB"); budget = (uint64_t)(ev && atoi(ev) > 0 ? atoi(ev) : 32) << 20; }   // the most one draw's exchange buffer may take
+    NSString *nk = [NSString stringWithFormat:@"%s/%s", ts->key, ms->key]; uint32_t sawT, sawM; mtk_emu_need(nk, &sawT, &sawM);
+    uint32_t capT = ind ? MIN(MAX(sawT + sawT / 4 + 16, 64u), MXE_TASK_CAP) : (uint32_t)MIN((uint32_t)dw->count, 65536u), pw = MAX(((uint32_t)ts->mesh_payload + 3) / 4, 1u);
+    uint32_t capM = MIN(capT * 32u, MAX(sawM + sawM / 4 + 32, 64u));   // a task workgroup derives at most its thread count of mesh workgroups in these games (ballot + popcount); more were seen: sawM says
+    uint64_t per = (uint64_t)maxv * vs + (uint64_t)maxp * 12; capM = (uint32_t)MAX(1, MIN((uint64_t)capM, budget / per));
+    uint64_t w0 = MXE_HEAD + capT + (uint64_t)capT * pw + capM, vbo = (w0 + 3) & ~3ull, ibo = vbo + (uint64_t)capM * maxv * (vs / 4), words = ibo + (uint64_t)capM * maxp * 3;
+    id<MTLBuffer> xb; size_t xo = mxe_alloc((size_t)words * 4, &xb); uint32_t *h = (uint32_t *)((uint8_t *)xb.contents + xo); uint64_t xg = xb.gpuAddress + xo;
+    memset(h, 0, MXE_HEAD * 4); h[0] = MXE_HEAD; h[1] = MXE_HEAD + capT; h[2] = MXE_HEAD + capT + capT * pw; h[3] = capT; h[4] = capM; h[5] = pw; h[6] = ind ? 0 : (uint32_t)dw->count;
+    h[7] = maxp * 3; h[11] = (uint32_t)vbo; h[12] = (uint32_t)ibo;
+    uint64_t first = ind ? ind + 16 : 0;
+    if (!first) { id<MTLBuffer> b; size_t o = arena_alloc(16, &b); uint32_t f0 = (uint32_t)dw->first; memcpy((uint8_t *)b.contents + o, &f0, 4); first = b.gpuAddress + o; }
+    *j = (mxe_job){.tp = tp, .mp = mp, .first = first, .xg = xg, .ind = ind, .capT = capT, .tt = ts->mesh_threads, .mt = ms->mesh_threads};
+    j->tok = mtk_emu_cap(ts, 3, 0, &j->tg, &j->ta);
+    j->mok = mtk_emu_cap(ms, 4, 1, &j->mg, &j->ma);
+    if ((ts->arg_len && !j->tok) || (ms->arg_len && !j->mok)) return 0;   // no argument block captured: a stale one would stay bound
+    memset(h + MXE_HEAD, 0, (size_t)capT * 4);   // counts of task workgroups that write none (past the cap) read 0
+    { id<MTLBuffer> keep = xb; const uint32_t *hh = h; uint32_t ct = capT, cm = capM;   // learn the sizes once the GPU has run it
+      [g_commit_blocks addObject:^{ (void)keep; mtk_emu_saw(nk, hh[19], hh[18]); if (hh[18] > cm || hh[19] > ct) { uint64_t n = atomic_fetch_add(&g_mxe_short, 1) + 1;
+          if (!(n & (n - 1))) MLOG("task / mesh host stages: %s needed %u task / %u mesh workgroups, the exchange held %u / %u (%llu such draws so far; the next draw of the pair is sized for it)", nk.UTF8String, hh[19], hh[18], ct, cm, (unsigned long long)n); } }]; }
+    g_mtk.emu = xg; g_mtk.emu_fn = vf; g_mtk.emu_vbo = (uint32_t)(vbo * 4); g_mtk.emu_ibo = (uint32_t)(ibo * 4); g_mtk.emu_iblen = (uint32_t)((words - ibo) * 4);
+    return 1;
+}
+// The prepared draws' stages in one compute pass, three phases with one barrier between them (not one per dispatch): all task stages, all scans, all mesh stages
+static void mtk_emu_flush(id ce, const mxe_job *jb, int n) {
+    id<MTLComputePipelineState> sp = mxe_scan_pso(); NSUInteger nt = MIN((NSUInteger)1024, sp.maxTotalThreadsPerThreadgroup);
+    for (int i = 0; i < n; i++) { const mxe_job *j = &jb[i];
+        enc_c_pso(ce, j->tp); if (j->tok) enc_c_args(ce, j->tg, j->ta); enc_c_args(ce, j->first, MESH_FIRST_SLOT); enc_c_args(ce, j->xg, MXE_SLOT);
+        if (j->ind) enc_c_dispatch_indirect(ce, j->ind, MTLSizeMake(j->tt, 1, 1)); else enc_c_dispatch(ce, MTLSizeMake(j->capT, 1, 1), MTLSizeMake(j->tt, 1, 1)); }
+    enc_c_dep(ce); enc_c_pso(ce, sp);
+    for (int i = 0; i < n; i++) { const mxe_job *j = &jb[i]; enc_c_args(ce, j->xg, 0); enc_c_args(ce, j->ind ? j->ind : j->xg, 1); enc_c_dispatch(ce, MTLSizeMake(1, 1, 1), MTLSizeMake(nt, 1, 1)); }
+    enc_c_dep(ce);
+    for (int i = 0; i < n; i++) { const mxe_job *j = &jb[i];
+        enc_c_pso(ce, j->mp); if (j->mok) enc_c_args(ce, j->mg, j->ma); enc_c_args(ce, j->xg, MXE_SLOT); enc_c_dispatch_indirect(ce, j->xg + 32, MTLSizeMake(j->mt, 1, 1)); }
+}
+// Before the draw, outside the render pass: run the draw's task and mesh stages. 0 = not done (the draw goes the driver's way). One compute pass a draw: running the stages of the
+//   later draws of a pass in it too (replaying the state ops up to them on a copy of the replay state) made frames wait on cross-queue events, 2-5 fps (11-17 M1 Pro); left out
+static int mtk_emu_run(const p_draw *dw, NvShader *ts, NvShader *ms, uint64_t ind) {
+    if (!ts || ts->mesh_relay || !mtk_emu_on() || !mtk_emu_ready(ts, ms)) return 0;
+    if (defer_has_active()) defer_fallback();   // as tfd_args: a deferred merged pass and lazy clears land before a compute pass outside the render pass
+    lc_land(); rp_flush(); rp_end(); ubd_land();
+    mxe_job j; if (!mtk_emu_prep(dw, ts, ms, ind, &j)) { g_mtk.emu = 0; args_dirty_all(); return 0; }
+    id ce = enc_c_begin(NULL); mtk_emu_flush(ce, &j, 1); enc_c_end(ce);
+    args_dirty_all();
+    static uint64_t n; if (!n++) MLOG("task / mesh host stages: first draw (task %s mesh %s, %s)", ts->key, ms->key, ind ? "indirect" : "direct");
+    return 1;
+}
+// The pipeline descriptor of a task / mesh draw: the fragment function variant and the attachments as a vertex draw's (pso_desc, no vertex stage); pf: the padded mesh variant (#674) or nil.
+//   Shared by the draw (mtk_pso) and the prewarm (mtk_warm), so a pipeline the prewarm built is the one the draw would build
+static MTLMeshRenderPipelineDescriptor *mtk_desc(pso_key *k, NvShader *ts, NvShader *ms, NvShader *fs, id<MTLFunction> pf, int merged, id<MTLFunction> fsfn) {
+    MTLRenderPipelineDescriptor *d = pso_desc(k, nil, fs, fsfn, merged);
+    MTLMeshRenderPipelineDescriptor *m = [MTLMeshRenderPipelineDescriptor new];
+    m.meshFunction = pf ?: ms->fn; m.fragmentFunction = d.fragmentFunction; m.maxTotalThreadsPerMeshThreadgroup = ms->mesh_threads;
+    if (ts) { m.objectFunction = ts->fn; m.payloadMemoryLength = ts->mesh_relay ? 16 : ((NSUInteger)ts->mesh_payload + 15) & ~(NSUInteger)15; m.maxTotalThreadsPerObjectThreadgroup = ts->mesh_threads; }   // relayed: object_data carries the task workgroup alone
+    m.rasterSampleCount = d.rasterSampleCount; m.alphaToCoverageEnabled = d.alphaToCoverageEnabled;
+    for (int i = 0; i < 8; i++) m.colorAttachments[i] = d.colorAttachments[i];
+    m.depthAttachmentPixelFormat = d.depthAttachmentPixelFormat; m.stencilAttachmentPixelFormat = d.stencilAttachmentPixelFormat;
+    return m;
+}
+// A task / mesh pipeline goes into pso_user.tsv as an M row: M<TAB>pso_skey hex (the mesh shader in the vertex place)<TAB>task shader key ("-": none)<TAB>padded variant mask (hex), so the next start's
+//   prewarm (warm_parse / mtk_warm) builds it before the scene, and the next package's seed (pso_seed.py) carries it. A merged pass's pipeline (a specialized fragment) is not recorded,
+//   as R rows of one are not (pso_record). Submit thread
+static void mtk_record(const mtk_key *mk, NvShader *ts, NvShader *ms, NvShader *fs, int merged) {
+    if (merged || mk->k.fsfn) return;
+    pso_skey sk; pso_skey_from(&mk->k, ms, fs, 0, NULL, &sk); char hx[sizeof sk * 2 + 1]; pso_skey_hex(&sk, hx);
+    pso_user_record("M\t%s\t%s\t%x\n", hx, ts ? ts->key : "-", mk->pad);
+}
+// The key a draw of these shaders looks its pipeline up with, from an M row (the shader pointers are the shared objects, shader_load)
+static void mtk_warm_key(const pso_skey *sk, NvShader *ts, NvShader *ms, NvShader *fs, uint32_t pad, mtk_key *mk) {
+    memset(mk, 0, sizeof *mk); mk->k = sk->k; mk->k.vs = (__bridge void *)ms; mk->k.fs = (__bridge void *)fs; mk->k.fsfn = NULL; mk->ts = (__bridge void *)ts; mk->pad = pad;
+}
+// The prewarm's build of an M row (a background worker): the shared shader objects (warm_shader → shader_load), the key the draw looks up with, the pipeline; nil when it cannot be built
+static id mtk_warm(const pso_skey *sk, NSString *mkey, NSString *fkey, NSString *tkey, uint32_t pad, NSData **key) {
+    if (!g_mesh_ok) return nil;
+    NvShader *ms = warm_shader(mkey, sk->vs_stage), *fs = fkey.length ? warm_shader(fkey, sk->fs_stage) : nil, *ts = tkey.length ? warm_shader(tkey, 3) : nil;
+    if (!ms || ms->mesh_kind != 2 || (fkey.length && !fs) || (tkey.length && !ts)) return nil;
+    id<MTLFunction> pf = nil;
+    if (pad && !(pf = vp_fn(ms, pad))) return nil;   // the padded variant is made at its first use on this device (vp_ask); not yet: the draw builds it then
+    mtk_key mk; mtk_warm_key(sk, ts, ms, fs, pad, &mk);
+    if (mk.k.fc && fs && !se_warm(fs, mk.k.fc)) return nil;   // a sampler-emulation variant this device has not made yet (as R rows)
+    NSError *e = nil; uint64_t t0 = bp_now();
+    id<MTLRenderPipelineState> p = [g_dev newRenderPipelineStateWithMeshDescriptor:mtk_desc(&mk.k, ts, ms, fs, pf, 0, nil) options:MTLPipelineOptionNone reflection:nil error:&e];
+    if (!p) { MLOG("【红】 prewarm: task / mesh pipeline refused (task %s mesh %s fragment %s): %s", ts ? ts->key : "-", ms->key, fs ? fs->key : "-", e.localizedDescription.UTF8String); return nil; }
+    NSString *names = [NSString stringWithFormat:@"task %s mesh %s%s fragment %s", ts ? ts->key : "-", ms->key, pf ? " (padded)" : "", fs ? fs->key : "-"];
+    os_unfair_lock_lock(&g_pso_mtk_lock); if (!g_mtk_names) g_mtk_names = [NSMapTable strongToStrongObjectsMapTable]; [g_mtk_names setObject:names forKey:p]; os_unfair_lock_unlock(&g_pso_mtk_lock);
+    (void)t0; *key = [NSData dataWithBytes:&mk length:sizeof mk]; return p;
+}
+static uint64_t g_mtk_warm_claimed;
+static void mtk_warm_claim(NSData *key, id ps) {   // submit thread (warm_claim): a pipeline the prewarm built goes where the draw looks, unless the draw already has one
+    mtk_key mk; if (key.length != sizeof mk) return; [key getBytes:&mk length:sizeof mk];
+    os_unfair_lock_lock(&g_pso_mtk_lock); __unsafe_unretained id cur = hm_get_id(&g_pso_mtk, &mk); int put = !cur || cur == g_pso_mtk_building;
+    if (put) hm_put_id(&g_pso_mtk, &mk, ps); os_unfair_lock_unlock(&g_pso_mtk_lock);
+    if (put) { uint64_t n = ++g_mtk_warm_claimed; if (!(n & (n - 1))) MLOG("task / mesh pipelines from the prewarm taken by the draws' table: %llu so far", (unsigned long long)n); }
+}
+// The background build of a mesh pipeline: a concurrent queue, at most mtk_width() at a time (the system compiler service builds them in parallel; one serial queue left a draw that
+//   could not wait behind every other pipeline queued before it)
+static int mtk_width(void) { static int w; if (!w) { const char *e = getenv("DM_NVN_MESH_PAR"); int n = (int)NSProcessInfo.processInfo.activeProcessorCount; w = e && atoi(e) > 0 ? atoi(e) : n > 4 ? n - 2 : 2; MLOG("task / mesh pipelines: built in the background %d at a time (DM_NVN_MESH_PAR)", w); } return w; }
+static dispatch_semaphore_t g_mtk_sem;
+static void mtk_kick(id m, NSString *names, const mtk_key *key) {   // m: a mesh pipeline descriptor, or (#770 host stages) an ordinary one
+    mtk_key kk = *key;
+    atomic_fetch_add(&g_mtk_inflight, 1);
+    if (!g_mtk_q) { g_mtk_q = dispatch_queue_create("dm.nvn.mesh", s2a_qos_queue_attr(DISPATCH_QUEUE_CONCURRENT, S2A_QOS_SHADER_VARIANT)); g_mtk_group = dispatch_group_create(); g_mtk_sem = dispatch_semaphore_create(mtk_width()); }
+    dispatch_group_async(g_mtk_group, g_mtk_q, ^{ @autoreleasepool {
+        dispatch_semaphore_wait(g_mtk_sem, DISPATCH_TIME_FOREVER);
+        NSError *e = nil; uint64_t t0 = bp_now();
+        id<MTLRenderPipelineState> p = [m isKindOfClass:[MTLMeshRenderPipelineDescriptor class]] ? [g_dev newRenderPipelineStateWithMeshDescriptor:m options:MTLPipelineOptionNone reflection:nil error:&e]
+                                                                                                 : [g_dev newRenderPipelineStateWithDescriptor:m error:&e];
+        dispatch_semaphore_signal(g_mtk_sem);
+        int left = atomic_fetch_sub(&g_mtk_inflight, 1) - 1;
+        if (p) MLOG("task / mesh pipeline: %s, %.1f ms in the background (frame %llu, still building %d)", names.UTF8String, (bp_now() - t0) / 1e6,
+                    (unsigned long long)atomic_load_explicit(&g_cur_frame, memory_order_relaxed), left);
+        else MLOG("【红】 task / mesh pipeline refused (%s): %s; its draws are skipped", names.UTF8String, e.localizedDescription.UTF8String);
+        os_unfair_lock_lock(&g_pso_mtk_lock);
+        if (p) { if (!g_mtk_names) g_mtk_names = [NSMapTable strongToStrongObjectsMapTable]; [g_mtk_names setObject:names forKey:p]; }
+        if (mtk_pace()) { if (!g_mtk_ready) g_mtk_ready = [NSMutableArray array]; [g_mtk_ready addObject:@[[NSData dataWithBytes:&kk length:sizeof kk], p ? (id)p : NSNull.null]]; }   // held: mtk_publish delivers
+        else if (hm_get_id(&g_pso_mtk, &kk) == g_pso_mtk_building) hm_put_id(&g_pso_mtk, &kk, p ?: NSNull.null);   // the prewarm may have handed one over meanwhile: keep that one
+        os_unfair_lock_unlock(&g_pso_mtk_lock);
+    } });
+}
+// A draw that cannot be skipped waits on the submit thread for its pipeline's background build until it is ready, capped only by the stuck-compiler limit every other draw that cannot
+//   be skipped goes by (pso_unsafe_wait_ms, DM_NVN_PSO_UNSAFE_WAIT_MS, default 10 s; 0 = no cap); past that cap it is skipped with a red line. → the pipeline, nil (skipped)
+//   D-84J2（11-15，Mac M1 Max）：原先每帧共 250 ms 预算（DM_NVN_MESH_WAIT_MS），超了照跳——跳过的是「某阶段写存储」或「目标跨帧保留内容」的那笔，下游读到没写的数据，
+//   3 局 GPU 挂死 / 缺页都出在网格管线首用、紧挨着「没等到、本帧跳过」的那一帧。跳这种绘制在哪块芯片上都不对（老芯片更容易撞上）：不能跳过的就等到编好，
+//   只有可丢的（纯颜色输出、本帧新开的目标，mtk_sync_why 返回 NULL）才首用跳过、后台编。DM_NVN_MESH_WAIT_MS 只留作诊断对照：设了就回到每帧预算的旧做法
+static uint64_t g_mtk_waits, g_mtk_wait_ns, g_mtk_wait_max, g_mtk_wait_over, g_mtk_wait_frame = UINT64_MAX, g_mtk_wait_frame_ns;
+static int g_mtk_budget = -1;   // ms; -1: not read yet (t_nvn_mesh ④d sets it)
+static int mtk_budget_ms(void) { if (g_mtk_budget < 0) { const char *e = getenv("DM_NVN_MESH_WAIT_MS"); g_mtk_budget = e && *e ? atoi(e) : 0; } return g_mtk_budget; }   // 0 = no per-frame budget (wait per draw up to pso_unsafe_wait_ms)
+static id mtk_wait(const mtk_key *mk, const char *why) {
+    uint64_t f = atomic_load_explicit(&g_cur_frame, memory_order_relaxed); if (f != g_mtk_wait_frame) { g_mtk_wait_frame = f; g_mtk_wait_frame_ns = 0; }
+    uint64_t budget = (uint64_t)mtk_budget_ms() * 1000000ull, cap = (uint64_t)pso_unsafe_wait_ms() * 1000000ull, t0 = bp_now(); __unsafe_unretained id p = nil; int done = 0;
+    while (!mtk_pace()) {
+        os_unfair_lock_lock(&g_pso_mtk_lock); p = hm_get_id(&g_pso_mtk, mk); os_unfair_lock_unlock(&g_pso_mtk_lock);
+        if (p != g_pso_mtk_building) { done = 1; break; }
+        if (budget ? g_mtk_wait_frame_ns + (bp_now() - t0) >= budget : (cap && bp_now() - t0 >= cap)) break;
+        usleep(200);
+    }
+    uint64_t dt = bp_now() - t0; g_mtk_wait_frame_ns += dt; g_mtk_waits++; g_mtk_wait_ns += dt; if (dt > g_mtk_wait_max) g_mtk_wait_max = dt;
+    if (!done) g_mtk_wait_over++;
+    if (!(g_mtk_waits & (g_mtk_waits - 1)) || !done) MLOG("%stask / mesh draw that cannot be skipped (%s) waited for its background pipeline %.1f ms (%s); %llu waits so far, %.1f ms in all, longest %.1f ms, %llu not ready in time (skipped; %s %d ms)",
+        done ? "" : "【红】 ", why, dt / 1e6, done ? "ready" : "not ready: skipped this frame", (unsigned long long)g_mtk_waits, g_mtk_wait_ns / 1e6, g_mtk_wait_max / 1e6, (unsigned long long)g_mtk_wait_over,
+        mtk_budget_ms() ? "per-frame budget DM_NVN_MESH_WAIT_MS" : "stuck-compiler cap DM_NVN_PSO_UNSAFE_WAIT_MS", mtk_budget_ms() ? mtk_budget_ms() : pso_unsafe_wait_ms());
+    return done && p != NSNull.null ? p : nil;
+}
+// Why a mesh draw whose pipeline is not built yet may not be skipped (nil: it may, its pipeline builds in the background); the same rules as skip_safe / first_skip_ok
+static const char *mtk_sync_why(NvShader *ts, NvShader *ms, NvShader *fs) {
+    if (!first_skip_on()) return "first-use skip off (DM_NVN_FIRST_SKIP=0)";
+    if (shader_writes(ts) || shader_writes(ms) || shader_writes(fs)) return "a stage writes storage";
+    for (int i = 0; i < R.rt.n; i++) if (R.rt.color[i] && !rt_fresh_now(R.rt.color[i])) return "a target not started fresh this frame";
+    if (R.rt.depth && !rt_fresh_now(R.rt.depth)) return "a target not started fresh this frame";
+    for (int i = 0; i < R.rt.n; i++) if (R.rt.color[i] && !rt_seen_steady(R.rt.color[i])) return "a target not drawn in the last two frames";
+    if (R.rt.depth && !rt_seen_steady(R.rt.depth)) return "a target not drawn in the last two frames";
+    return NULL;
+}
+// 一条网格管线第一次画（两条路：已编好直接取 / 丢不起的那笔等后台编好）：记本机记录、打「first drawn」、进本提交的 GPU 出错嫌疑（quar_built）。
+//   #1208：网格管线多在后台编、晚几帧才第一次画，隔离原先只收「本提交当场新编的普通管线」，网格管线首画那次提交挂死时嫌疑为空、什么都不隔离，下一局挂在同一处；
+//   丢不起的那笔经 mtk_wait 画出时连「first drawn」都不打
+static uint64_t g_mtk_quar_skip;
+static void mtk_first_drawn(id p, const mtk_key *mk, NvShader *ts, NvShader *ms, NvShader *fs, int merged) {
+    [g_mtk_drawn addObject:p]; if (!mk->emu) mtk_record(mk, ts, ms, fs, merged); quar_built(ms, fs);
+    MLOG("task / mesh pipeline first drawn at frame %llu: %s; still building %d", (unsigned long long)atomic_load_explicit(&g_cur_frame, memory_order_relaxed),
+         mtk_name(p), atomic_load(&g_mtk_inflight));
+}
 static id<MTLRenderPipelineState> mtk_pso(NvProg *raster) {
     NvShader *ts = g_mtk.ts, *ms = g_mtk.ms, *fs = raster->sh[1]; int merged = g_pso_lmap != NULL;
     mtk_key mk; memset(&mk, 0, sizeof mk); pso_key *k = &mk.k;
@@ -121,37 +435,68 @@ static id<MTLRenderPipelineState> mtk_pso(NvProg *raster) {
     if (merged) { memcpy(k->lmap, g_pso_lmap, 8); k->fsfn = (__bridge void *)g_pso_fsfn; }   // as pso_get_vs keys a merged pass's pipeline
     if (g_pso_fc && !merged && !g_pso_fsfn && fs && !pso_fout_need(k, fs, 0)) k->fc = (uint8_t)g_pso_fc;
     g_pso_color_round = pso_color_round_mask(k, fs, merged);
-    mk.ts = (__bridge void *)ts;
+    mk.ts = (__bridge void *)ts; mk.emu = g_mtk.emu ? 1 : 0;   // #770: the host ran the stages, an ordinary pipeline of its vertex function draws them
+    // #674: a fragment shader the game pairs at run time with a mesh shader that does not write a user(locn) it reads (Metal refuses the pipeline). Mesh shaders carry no user_out in
+    //   their json, so the miss is known from the refusal: then the padded mesh variant for every location the fragment reads is asked for (vp_ask, dm_shader_vpad → dm_mesh_pad_src:
+    //   only the locations the mesh does not write get (0,0,0,1)); until it is ready the pair's draws are skipped as before, then the pipeline is built with it (its own cache entry)
+    uint32_t want = fs && (fs->rf.has_user & 2) && !mk.emu ? fs->rf.user_in : 0; id<MTLFunction> pf = want ? vp_fn(ms, want) : nil;
+    if (pf) mk.pad = want;
+    // GPU 挂死隔离（#1208）：先前让 GPU 出错的网格管线（网格 + 片元两键，同普通管线的 quar_name）这局起跳过，不再画
+    if (quar_has(ms, fs)) { g_mtk_quar_skip++; static int qn; if (qn++ < 4) MLOG("【红】 GPU error quarantine: task / mesh pipeline (task %s mesh %s fragment %s) skipped (it faulted the GPU before)",
+                                                                           ts ? ts->key : "-", ms->key, fs ? fs->key : "-"); return nil; }
     os_unfair_lock_lock(&g_pso_mtk_lock); __unsafe_unretained id ps = hm_get_id(&g_pso_mtk, &mk);
     if (!ps) { if (!g_pso_mtk_building) g_pso_mtk_building = [NSObject new]; hm_put_id(&g_pso_mtk, &mk, g_pso_mtk_building); }
     os_unfair_lock_unlock(&g_pso_mtk_lock);
-    if (ps) return ps == NSNull.null || ps == g_pso_mtk_building ? nil : ps;
-    MTLRenderPipelineDescriptor *d = pso_desc(k, ms, fs, g_pso_fsfn, merged);   // the fragment function variant and the attachments, as a vertex draw's
-    MTLMeshRenderPipelineDescriptor *m = [MTLMeshRenderPipelineDescriptor new];
-    m.meshFunction = ms->fn; m.fragmentFunction = d.fragmentFunction; m.maxTotalThreadsPerMeshThreadgroup = ms->mesh_threads;
-    if (ts) { m.objectFunction = ts->fn; m.payloadMemoryLength = ((NSUInteger)ts->mesh_payload + 15) & ~(NSUInteger)15; m.maxTotalThreadsPerObjectThreadgroup = ts->mesh_threads; }
-    m.rasterSampleCount = d.rasterSampleCount; m.alphaToCoverageEnabled = d.alphaToCoverageEnabled;
-    for (int i = 0; i < 8; i++) m.colorAttachments[i] = d.colorAttachments[i];
-    m.depthAttachmentPixelFormat = d.depthAttachmentPixelFormat; m.stencilAttachmentPixelFormat = d.stencilAttachmentPixelFormat;
-    NSString *names = [NSString stringWithFormat:@"task %s mesh %s fragment %s", ts ? ts->key : "-", ms->key, fs ? fs->key : "-"]; mtk_key kk = mk;
-    if (!g_mtk_q) { g_mtk_q = dispatch_queue_create("dm.nvn.mesh", s2a_qos_queue_attr(DISPATCH_QUEUE_SERIAL, S2A_QOS_SHADER_VARIANT)); g_mtk_group = dispatch_group_create(); }
-    dispatch_group_async(g_mtk_group, g_mtk_q, ^{ @autoreleasepool {
-        NSError *e = nil; uint64_t t0 = bp_now();
-        id<MTLRenderPipelineState> p = [g_dev newRenderPipelineStateWithMeshDescriptor:m options:MTLPipelineOptionNone reflection:nil error:&e];
-        if (p) MLOG("task / mesh pipeline: %s, %.1f ms in the background", names.UTF8String, (bp_now() - t0) / 1e6);
-        else MLOG("【红】 task / mesh pipeline refused (%s): %s; its draws are skipped", names.UTF8String, e.localizedDescription.UTF8String);
-        os_unfair_lock_lock(&g_pso_mtk_lock); hm_put_id(&g_pso_mtk, &kk, p ?: NSNull.null); os_unfair_lock_unlock(&g_pso_mtk_lock);
-    } });
-    return nil;
+    if (ps == NSNull.null && !mk.pad && want) vp_ask(S.prog, ms, want);   // refused unpadded: ask for the padded variant (once; a variant that cannot be made stays failed)
+    if (ps && ps != NSNull.null && ps != g_pso_mtk_building) {   // #770: the first draw of each pipeline, with the frame and how many are still building
+        if (!g_mtk_drawn) g_mtk_drawn = [NSMutableSet set];
+        if (![g_mtk_drawn containsObject:ps]) mtk_first_drawn(ps, &mk, ts, ms, fs, merged);
+    }
+    if (ps == NSNull.null) return nil;
+    if (ps && ps != g_pso_mtk_building) return ps;
+    // Not built yet: skipping this draw is only allowed under the rules every other first use goes by (skip_safe, first_skip_ok): no stage writes storage, every target is started
+    //   fresh this frame and was drawn in the last two. 11-13 0400486024DEC000 on Duo: the mesh draws of the opening scene were skipped for 10–20 s while 54 mesh pipelines built one
+    //   after another in the background, and the scene came out washed white until the last of them was ready. A draw that cannot be skipped waits for its background build, within
+    //   a per-frame budget (mtk_wait). Building it here instead held the submit thread 19 s in all (one pipeline 3.1 s) and a cross-queue GPU event wait timed out into a GPU hang
+    const char *why = mtk_sync_why(ts, ms, fs);
+    if (!ps) {
+        id m;
+        if (mk.emu) { MTLRenderPipelineDescriptor *d = pso_desc(k, nil, fs, g_pso_fsfn, merged); d.vertexFunction = g_mtk.emu_fn; d.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle; m = d; }
+        else m = mtk_desc(k, ts, ms, fs, pf, merged, g_pso_fsfn);
+        NSString *names = [NSString stringWithFormat:@"task %s mesh %s%s fragment %s", ts ? ts->key : "-", ms->key, mk.emu ? " (host stages)" : pf ? " (padded)" : "", fs ? fs->key : "-"];
+        mtk_kick(m, names, &mk);
+        if (!mk.emu) mtk_record(&mk, ts, ms, fs, merged);   // 请求编译时就记：只在一小段画面里用到、又编得慢的管线（0400486024DEC000 一段事件里那条 2 秒的），等它编好那笔已不再画，「第一次画出」时记就永远进不了种子
+    }
+    if (!why) return nil;   // building in the background, and this draw may wait for it
+    __unsafe_unretained id p = mtk_wait(&mk, why);
+    if (p) { if (!g_mtk_drawn) g_mtk_drawn = [NSMutableSet set];
+        if (![g_mtk_drawn containsObject:p]) mtk_first_drawn(p, &mk, ts, ms, fs, merged); }
+    return p;
 }
 static void mtk_encode(id en_) {
     id en = en_; NvShader *ts = g_mtk.ts, *ms = g_mtk.ms;
+    if (g_mtk.emu) {   // #770: the host ran the stages (mtk_emu_run): an indexed draw of their vertex records, as many indices as the mesh stage wrote
+        enc_r_table(en, g_vt, MTLRenderStageVertex); enc_r_vbuf(en, MXE_SLOT, g_mtk.emu + g_mtk.emu_vbo);
+        enc_r_draw_indexed_indirect(en, MTLPrimitiveTypeTriangle, MTLIndexTypeUInt32, g_mtk.emu + g_mtk.emu_ibo, g_mtk.emu_iblen, g_mtk.emu + 13 * 4);
+        return;
+    }
+    if (fault_enc_on()) fault_enc_mark(en, [NSString stringWithFormat:@"task / mesh draw: task %s mesh %s, %s", ts ? ts->key : "-", ms->key, g_mtk.ind ? "indirect" : [NSString stringWithFormat:@"%llu workgroups", (unsigned long long)g_mtk.count].UTF8String]);
     uint64_t first = g_mtk.ind ? g_mtk.ind + 16 : 0;   // indirect: the converted arguments carry it at word 4 (ixc_arrays)
     if (!first) { id<MTLBuffer> b; size_t o = arena_alloc(16, &b); memcpy((uint8_t *)b.contents + o, &g_mtk.first, 4); first = b.gpuAddress + o; }
     enc_r_table(en, g_vt, MTLRenderStageMesh);
     if (ts) { enc_r_table(en, g_ot, MTLRenderStageObject); g_args_object = 1; encode_args(en, ts, 3, 0); g_args_object = 0; enc_o_args(first, MESH_FIRST_SLOT); }
     encode_args(en, ms, 4, 1); enc_r_vbuf(en, MESH_FIRST_SLOT, first);
+    // Payload relay (S2A.Dsh MeshStage.Relay: a payload past Metal's 16 KB): one buffer, head {mesh slice start (words), task workgroups, slices per task workgroup}, then one payload per
+    //   task workgroup, then one mesh stage-memory slice per (task workgroup, mesh workgroup < the task's thread count, which the task clamps its grid to). Bound at the relay slot of the
+    //   object table and of the mesh stage (vertex stream 11's slot, through enc_r_vbuf)
+    if (ts && ts->mesh_relay) {
+        uint64_t n = g_mtk.count, pw = ts->mesh_relay_pw, sw = ms->mesh_relay_sw, head = 8, base = (head + n * pw + 3) & ~3ull, grid = ts->mesh_threads, bytes = (base + n * grid * sw) * 4;
+        id<MTLBuffer> rb; size_t ro = arena_alloc((size_t)bytes, &rb); uint32_t *h = (uint32_t *)((uint8_t *)rb.contents + ro); h[0] = (uint32_t)base; h[1] = (uint32_t)n; h[2] = (uint32_t)grid;
+        enc_o_args(rb.gpuAddress + ro, ts->mesh_relay); enc_r_vbuf(en, ms->mesh_relay, rb.gpuAddress + ro);
+        static int once; if (!once++) MLOG("task / mesh payload relay: first draw (task %s mesh %s), %llu task workgroups, %.1f MB", ts->key, ms->key, (unsigned long long)n, bytes / 1048576.0);
+    }
     NSUInteger ot = ts ? ts->mesh_threads : 1, mt = ms->mesh_threads;
+    if (g_mtk.ind && fault_enc_on()) { NSUInteger fo; id<MTLBuffer> fbuf; if (m3_buf_at(g_mtk.ind, &fbuf, &fo)) fault_ring_put(fbuf, fo, ts ? ts->key : NULL, ms->key, atomic_load_explicit(&g_cur_frame, memory_order_relaxed)); }
     if (g_mtk.ind) enc_r_mesh_indirect(en, g_mtk.ind, ot, mt); else enc_r_mesh(en, g_mtk.count, ot, mt);
 }
 static void mesh_tasks_draw(const p_draw *dw) {
@@ -160,6 +505,8 @@ static void mesh_tasks_draw(const p_draw *dw) {
     __unsafe_unretained NvProg *pr = S.prog ? prog_get(S.prog) : nil;
     NvShader *ms = pr ? pr->sh[4] : nil, *ts = pr ? pr->sh[3] : nil;
     if (!ms || ms->mesh_kind != 2 || !ms->mesh_task || (ts && ts->mesh_kind != 1)) ts = nil;   // a task shader only for a mesh shader that takes one (a hull shader of an earlier bind is not)
+    if (ts && ts->mesh_relay && (dw->ind || !ms || !ms->mesh_relay || (uint64_t)dw->count * ts->mesh_threads * ms->mesh_relay_sw * 4 > (512ull << 20))) {   // relayed payload: the buffer is sized on the CPU from the workgroup count
+        g_mtk_skip++; RED_ONCE(152, "task / mesh draw with a relayed payload (task %s): %s, skipped", ts->key, dw->ind ? "indirect (workgroup count not known on the CPU)" : !ms || !ms->mesh_relay ? "the mesh shader does not take a relayed payload" : "relay buffer past 512 MiB"); return; }
     if (!ms || ms->mesh_kind != 2 || !ms->fn || (ms->mesh_task && !ts)) {
         g_mtk_skip++; BAD_ERR(); RED_ONCE(147, "task / mesh draw without its shaders (task %s, mesh %s%s): skipped", pr && pr->sh[3] ? pr->sh[3]->key : "-", ms ? ms->key : "-",
                                        ms && ms->mesh_kind == 2 && ms->mesh_task && !ts ? ", which takes a task shader" : ms && ms->mesh_kind != 2 ? ", not a mesh shader" : ""); return; }
@@ -177,11 +524,13 @@ static void mesh_tasks_draw(const p_draw *dw) {
     }
     NvProg *raster = pr->geo_raster;   // the pixel stage alone (geo_draw keeps its reader program here; a mesh program has no geometry stage)
     if (!raster || raster->sh[0] || raster->sh[1] != pr->sh[1]) { raster = [NvProg new]; raster->sh[1] = pr->sh[1]; raster->gp = pr->gp; pr->geo_raster = raster; }
+    mtk_publish();   // #770 S2A_MESH_PACE: deliver held pipelines first
+    g_mtk.emu = 0; g_mtk.emu_fn = nil; mtk_emu_run(dw, ts, ms, ind);   // #770: the host runs the stages on GPUs whose driver mesh stage hangs
     g_mtk.on = 1; g_mtk.miss = 0; g_mtk.ts = ts; g_mtk.ms = ms; g_mtk.first = (uint32_t)dw->first; g_mtk.count = (uint32_t)dw->count; g_mtk.ind = ind;
     g_geo_program = raster;
     p_draw triangle = {.prim = 4, .count = 3, .instances = 1};
     draw(&triangle, NULL);
-    g_geo_program = nil; g_mtk.on = 0; g_mtk.ts = g_mtk.ms = nil; args_dirty_all();
+    g_geo_program = nil; g_mtk.on = 0; g_mtk.ts = g_mtk.ms = nil; g_mtk.emu = 0; g_mtk.emu_fn = nil; args_dirty_all();
     if (g_mtk.miss) { g_mtk_wait++; return; }
     swrite_note(pr);   // the task / mesh stages' storage writes (draw() saw the pixel stage alone)
     if (!g_mtk_n++) MLOG("task / mesh: first draw (%s), task %s mesh %s fragment %s, %u workgroups from %u", ind ? "indirect" : "direct", ts ? ts->key : "-", ms->key, pr->sh[1] ? pr->sh[1]->key : "-",
@@ -338,6 +687,12 @@ static void geo_runset_gsr(const geo_runset *s) {
     pthread_mutex_unlock(&g_gsr_mu);
 }
 static struct { int active, gpc, gpk; id cap, gs, cap_pso; uint64_t runs, draws, kernels, barriers, cut, hazard; geo_hz hz; geo_runset rs; id pack; uint64_t *jobs; size_t njobs, cjobs; } g_gr;   // cap_pso: the capture lane's current pipeline (only captures set one there; cleared when the lanes begin)   // gpc / gpk: the lane encoders' GPUPROF labels (gp_lane_begin); jobs: the run's compactions, encoded at its end
+// 段为什么结束（诊断，随「geometry run」那行出）：调用方在结束段之前把原因放进 g_gr_why，geo_run_flush 取走并清零；没放的算「结束主遍 / 开别的编码器 / 提交 / 等 GPU」。
+//   一帧几百笔几何绘制而每段只装一笔时（每段都断主遍、附件整张读进写出），这一行说清是谁断的
+enum { GEO_END_OTHER, GEO_END_OP, GEO_END_DRAW, GEO_END_INELIG, GEO_END_CUT, GEO_END_HAZARD, GEO_END_N };
+enum { GEO_INEL_WAIT, GEO_INEL_UBD, GEO_INEL_DEFER, GEO_INEL_HOIST, GEO_INEL_FSW, GEO_INEL_REST, GEO_INEL_N };
+static int g_gr_why, g_gr_why_op, g_gr_why_inel;
+static uint64_t g_gr_end[GEO_END_N], g_gr_end_op[128], g_gr_inel[GEO_INEL_N];
 static int geo_run_active(void) { return g_gr.active; }   // for pass_color_unwritten (nvn_mtl.m, before this include)
 static int geo_fs_writes(NvShader *fs) {
     if (!fs) return 0;
@@ -346,7 +701,11 @@ static int geo_fs_writes(NvShader *fs) {
     return 0;
 }
 static void geo_run_flush(void) {
+    int why = g_gr_why; g_gr_why = 0;   // 先取走：没在段里时也清，免得留给下一次
     if (!g_gr.active) return;
+    g_gr_end[why]++;
+    if (why == GEO_END_OP) g_gr_end_op[(unsigned)g_gr_why_op < 128 ? g_gr_why_op : 127]++;
+    if (why == GEO_END_INELIG) g_gr_inel[g_gr_why_inel]++;
     if (g_rlane) MDIE("geometry run: flushed from lane %d (an encoder, commit or wait inside a lane)", g_rlane);
     g_gr.active = 0;   // first: the calls below must not come back here
     gp_lane_end(g_gr.cap, g_gr.gpc, (uint32_t)g_gr.draws); enc_full_barrier_end(g_gr.cap); [g_gr.cap endEncoding];
@@ -362,6 +721,18 @@ static void geo_run_flush(void) {
     g_gr.cap = g_gr.gs = g_gr.cap_pso = nil; g_vt_valid = 0; args_dirty_all();
     if (g_gr.runs == 1 || g_gr.runs % 2000 == 0) MLOG("geometry run: %llu runs, %llu geometry draws in them, barriers before %llu of %llu geometry kernels, %llu runs ended to cut the segment for scratch, %llu ended for a read / write across the run's reordering (a run: captures, geometry kernels and main-pass draws each in one encoder)",
         (unsigned long long)g_gr.runs, (unsigned long long)g_gr.draws, (unsigned long long)g_gr.barriers, (unsigned long long)g_gr.kernels, (unsigned long long)g_gr.cut, (unsigned long long)g_gr.hazard);
+    if (g_gr.runs == 1 || g_gr.runs % 2000 == 0) {
+        int top[3] = {-1, -1, -1};   // 结束段次数最多的三种操作
+        for (int o = 0; o < 128; o++) if (g_gr_end_op[o]) for (int k = 0; k < 3; k++) if (top[k] < 0 || g_gr_end_op[o] > g_gr_end_op[top[k]]) { for (int j = 2; j > k; j--) top[j] = top[j - 1]; top[k] = o; break; }
+        char ops[96] = ""; size_t n = 0;
+        for (int k = 0; k < 3 && top[k] >= 0 && n < sizeof ops; k++) n += (size_t)snprintf(ops + n, sizeof ops - n, "%sop %d%s %llu", k ? ", " : "", top[k], top[k] == OP_UPDATE_UB ? " (inline uniform update)" : "", (unsigned long long)g_gr_end_op[top[k]]);
+        MLOG("geometry run ends by cause: a state-changing operation %llu (%s), a non-geometry draw %llu, the next geometry draw not eligible %llu (waits for GPU-written index / vertex data %llu, "
+             "inline uniform updates pending %llu, deferred pass %llu, hoisted / merged pass %llu, fragment stage writes memory %llu, other %llu), scratch cut %llu, read / write hazard %llu, "
+             "pass end / other encoder / commit / wait %llu", (unsigned long long)g_gr_end[GEO_END_OP], n ? ops : "-", (unsigned long long)g_gr_end[GEO_END_DRAW], (unsigned long long)g_gr_end[GEO_END_INELIG],
+             (unsigned long long)g_gr_inel[GEO_INEL_WAIT], (unsigned long long)g_gr_inel[GEO_INEL_UBD], (unsigned long long)g_gr_inel[GEO_INEL_DEFER], (unsigned long long)g_gr_inel[GEO_INEL_HOIST],
+             (unsigned long long)g_gr_inel[GEO_INEL_FSW], (unsigned long long)g_gr_inel[GEO_INEL_REST], (unsigned long long)g_gr_end[GEO_END_CUT], (unsigned long long)g_gr_end[GEO_END_HAZARD],
+             (unsigned long long)g_gr_end[GEO_END_OTHER]);
+    }
 }
 // The run begins: no encoder is open (geo_draw ended the pass); the two lane encoders begin with a full barrier, not through main_barrier_begin (its state follows the main stream)
 static void geo_run_begin(void) {
@@ -378,7 +749,7 @@ static void geo_run_begin(void) {
 //   ARENA_WAIT_S for the GPU ("frame scratch: waited 2 s", a 2.1 s freeze)
 static void geo_scratch_cut(int run, uint64_t total) {
     if (g_arena_seg + total < ARENA_CUT) return;
-    if (run && g_gr.active) { geo_run_flush(); rp_end(); g_gr.cut++; }
+    if (run && g_gr.active) { g_gr_why = GEO_END_CUT; geo_run_flush(); rp_end(); g_gr.cut++; }
     sub_cut();
 }
 // Exec loop: the ops a run lets through (state only; draws decide in draw())
@@ -435,6 +806,7 @@ static int geo_pt_pick(NvProg *pr, NvShader *base, int tf, int instances, int to
     if (!side || !creader || side->geo_invocations != 1) return 0;
     *gs = side; *reader = creader; return 1;
 }
+static int geo_vs_writes(NvShader *vs) { for (int i = 0; i < vs->rf.nb; i++) if (vs->rf.b[i].rw) return 1; return 0; }   // the vertex stage writes memory (storage, images, pool tables)
 static void geo_draw(NvProg *pr, const p_draw *dw0, const p_draw_idx *di0) {
     NvShader *vs = pr->sh[0], *base = pr->sh[2];
     // Feedback on with a geometry shader that has no capture layout (control section strides all 0, e.g. Xenoblade 3 95bfab6122539993): the GPU captures nothing and still draws,
@@ -450,7 +822,7 @@ static void geo_draw(NvProg *pr, const p_draw *dw0, const p_draw_idx *di0) {
     // a write queued in this submission (pend), a storage write in it (sbw), or a GPU write of an earlier submission still running (gw); the same test as ubp_get. Waiting on every
     // indexed draw made Xenoblade 3 (95bfab6122539993, hundreds of indexed geometry draws a frame) take 0.4-2 s a frame on the submit thread
     uint64_t ilo = di0 ? di.ibuf : 0, ihi = di0 ? di.ibuf + ((uint64_t)di.count << di.itype) : 0;
-    int wait = ind != 0 || (di0 && (pend_hits(ilo, ihi - ilo) || g_sbw_over || sbw_hits(ilo, ihi) || gw_live(ilo, ihi)));
+    int wait = ind != 0 || (di0 && (pend_hits(ilo, ihi - ilo) || g_sbw_over || sbw_hits(ilo, ihi) || gw_live(ilo, ihi) || ifw_hits(ilo, ihi)));
     for (int i = 0; i < 16; i++) if (S.vbuf[i].size && pend_hits(S.vbuf[i].address, S.vbuf[i].size)) wait = 1;
     for (int i = 0; i < vs->rf.nv; i++) if (vconv_wanted(&vs->rf, i, NULL, 0)) wait = 1;
     geo_gml_snap();   // 本笔各阶段的原始池表写按这一份预测（geo_fs_writes / geo_stage_ranges）
@@ -465,9 +837,13 @@ static void geo_draw(NvProg *pr, const p_draw *dw0, const p_draw_idx *di0) {
         int fk = geo_stage_ranges(pr->sh[1], 1, h_fr, &h_nfr, h_fw, &h_nfw, 32); h_fk = !!(fk & GEO_RK); h_fwk = !!(fk & GEO_WK);   // B 看片元读；片元的写入段的只有预测下的原始池表写（geo_fs_writes），C 看它
         int why = 0;
         if (g_gr.active && !(why = geo_runset_gml(&g_gr.rs)) && !(why = geo_run_hazard(&g_gr.rs, h_cap, h_ncap, h_ck, h_gw, h_ngw, h_gk))) why = geo_run_hazard_fw(&g_gr.rs, h_cap, h_ncap, h_ck, h_gr, h_ngr, h_grk, h_gw, h_ngw, h_gk);
-        if (why) { geo_run_flush(); if (g_gr.hazard++ < 8) MLOG("geometry run ended before a draw (%llu ends so far): %s (geometry %s)", (unsigned long long)g_gr.hazard, geo_hazard_why[why], base->key); }
+        if (why) { g_gr_why = GEO_END_HAZARD; geo_run_flush(); if (g_gr.hazard++ < 8) MLOG("geometry run ended before a draw (%llu ends so far): %s (geometry %s)", (unsigned long long)g_gr.hazard, geo_hazard_why[why], base->key); }
     }
-    if (!run) geo_run_flush();
+    if (!run) {
+        g_gr_why = GEO_END_INELIG;
+        g_gr_why_inel = wait ? GEO_INEL_WAIT : g_nubd ? GEO_INEL_UBD : defer_has_active() ? GEO_INEL_DEFER : (g_hoist_n || g_fz.active) ? GEO_INEL_HOIST : geo_fs_writes(pr->sh[1]) ? GEO_INEL_FSW : GEO_INEL_REST;
+        geo_run_flush();
+    }
     if (!(run && g_gr.active)) {
         if (defer_has_active()) defer_fallback();
         lc_land(); rp_flush(); rp_end(); ubd_land();
@@ -517,14 +893,23 @@ static void geo_draw(NvProg *pr, const p_draw *dw0, const p_draw_idx *di0) {
     if (di0 && (di.itype < 0 || di.itype > 2 || !nvn_host_readable(di.ibuf, (uint64_t)count * isz))) {
         GEO_RED("【红】 geometry index buffer is not readable"); return;
     }
-    for (int i = 0; i < count; i++) {
+    // 没有图元重启时（11-16 能耗线：040074A01BF12000 帧回放，一帧 121 笔几何、每笔约 1k 个下标，这段原占 geo_draw 约三成指令）：按下标宽度各走一个紧循环，
+    //   只记 order 与上下界（编译器向量化），去重直接读 order（装配之后它不再用），不再逐个抄进 unique；有重启时照旧逐个判
+    if (!restart) {
+        const uint8_t *q = di0 ? (const uint8_t *)(uintptr_t)di.ibuf : NULL; uint32_t l = UINT32_MAX, h = 0;
+        if (!di0) { for (int i = 0; i < count; i++) order[i] = (uint32_t)i; l = 0; h = (uint32_t)count - 1; }
+        else if (isz == 2) for (int i = 0; i < count; i++) { uint16_t x; memcpy(&x, q + 2 * (size_t)i, 2); order[i] = x; l = MIN(l, (uint32_t)x); h = MAX(h, (uint32_t)x); }
+        else if (isz == 4) for (int i = 0; i < count; i++) { uint32_t x; memcpy(&x, q + 4 * (size_t)i, 4); order[i] = x; l = MIN(l, x); h = MAX(h, x); }
+        else for (int i = 0; i < count; i++) { uint32_t x = q[i]; order[i] = x; l = MIN(l, x); h = MAX(h, x); }
+        lo = l; hi = h; nu = (size_t)count;
+    } else for (int i = 0; i < count; i++) {
         uint32_t v = (uint32_t)i;
         if (di0) {   // typed loads, not a variable-length memcpy per index (a library call each; unaligned-safe through memcpy of a fixed size)
             const uint8_t *q = (const uint8_t *)(uintptr_t)di.ibuf + (size_t)i * isz;
             if (isz == 2) { uint16_t h; memcpy(&h, q, 2); v = h; } else if (isz == 4) memcpy(&v, q, 4); else v = *q;
         }
         order[i] = v;
-        if (restart && v == restart_index) continue;
+        if (v == restart_index) continue;
         lo = MIN(lo, v); hi = MAX(hi, v); unique[nu++] = v;
     }
     if (!nu) { return; }
@@ -566,7 +951,11 @@ static void geo_draw(NvProg *pr, const p_draw *dw0, const p_draw_idx *di0) {
     nvn_geo_assemble(prim, order, count, restart, restart_index, pmap, words);
     for (size_t i = 0; i < words; i++) ((uint32_t *)pmap)[i] -= lo;
     static uint64_t *uq_bm; static size_t uq_words;   // submit thread only
-    size_t unique_count = nvn_geo_unique_sorted(unique, nu, lo, hi, (uint32_t *)pcapture_ix, &uq_bm, &uq_words);
+    // 抓顶点按区间（11-16 能耗线：040074A01BF12000 帧回放，121 笔几何的去重结果与 [lo, hi] 逐笔相等，去重这段每笔约 1.5 万条指令）：没有重启、顶点阶段不写内存、
+    //   跨度不超过下标数时，不排序去重，直接对 [lo + base_vertex, 跨度) 画点（同 tf_draw 的变换反馈抓取）。lo、hi 都是被引用的顶点，中间的顶点地址落在两者之间；
+    //   多抓的顶点只写进没人读的记录槽（主遍下标只指被引用的），GPU 多算至多「跨度 − 去重数」≤ 下标数个顶点。非索引绘制本来就按 first / count 抓，不需要去重
+    int by_range = !di0 || (!restart && span <= (uint64_t)count && !geo_vs_writes(vs));
+    size_t unique_count = by_range ? 0 : nvn_geo_unique_sorted(restart ? unique : order, nu, lo, hi, (uint32_t *)pcapture_ix, &uq_bm, &uq_words);
     uint32_t vi[8] = {(uint32_t)span, (uint32_t)instances, 0, 0, (uint32_t)np, 0, 0, 0}; memcpy(pinfo, vi, 32);
     uint64_t ci[2] = {input, 0}; memcpy(pcapture_info, ci, 16);
     uint32_t cc[4] = {(uint32_t)first, (uint32_t)span, first_instance, (uint32_t)instances}; memcpy((uint8_t *)pcapture_info + 16, cc, 16);
@@ -587,11 +976,12 @@ static void geo_draw(NvProg *pr, const p_draw *dw0, const p_draw_idx *di0) {
         re = enc_r_begin(rd);
     }
     if (!run || g_gr.cap_pso != capture) { enc_r_pso(re, capture); if (run) g_gr.cap_pso = capture; }   // the capture lane keeps its pipeline across the run's draws
-    bind_vbufs(re);
+    bind_vbufs(re, vs);
     p_draw vertex_range = {.first = (int32_t)first, .count = (int32_t)span, .instances = instances, .base_instance = (int32_t)first_instance};
     vconv_bind(re, vs, 1, &vertex_range, NULL);
     args_dirty_all(); encode_args(re, vs, 0, 1); enc_r_vbuf(re, 13, capture_info);
-    if (di0) enc_r_draw_indexed(re, MTLPrimitiveTypePoint, unique_count, MTLIndexTypeUInt32, capture_ix, nu * 4, instances, di.base_vertex, first_instance);
+    if (di0 && !by_range) enc_r_draw_indexed(re, MTLPrimitiveTypePoint, unique_count, MTLIndexTypeUInt32, capture_ix, nu * 4, instances, di.base_vertex, first_instance);
+    else if (di0) enc_r_draw_instanced(re, MTLPrimitiveTypePoint, (NSUInteger)first, (NSUInteger)span, instances, first_instance);
     else enc_r_draw_instanced(re, MTLPrimitiveTypePoint, dw.first, dw.count, instances, first_instance);
     if (!run) enc_r_end(re);
     g_geo_bind[0] = input; g_geo_bind[1] = output; g_geo_bind[2] = raw; g_geo_bind[3] = info; g_geo_bind[4] = map;
@@ -665,7 +1055,7 @@ static void vcap_draw(NvProg *pr, const p_draw *dw, const p_draw_idx *di, uint64
     lc_land(); rp_flush(); rp_end(); ubd_land();
     if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
     MTL4RenderPassDescriptor *rd = pass_desc(); rd.renderTargetWidth = rd.renderTargetHeight = rd.defaultRasterSampleCount = 1;
-    id<MTL4RenderCommandEncoder> re = enc_r_begin(rd); enc_r_pso(re, capture); bind_vbufs(re);
+    id<MTL4RenderCommandEncoder> re = enc_r_begin(rd); enc_r_pso(re, capture); bind_vbufs(re, vs);
     p_draw range = {.first = (int32_t)first, .count = (int32_t)span, .instances = instances, .base_instance = (int32_t)first_instance};
     vconv_bind(re, vs, 1, &range, NULL);
     args_dirty_all(); encode_args(re, vs, 0, 1); enc_r_vbuf(re, 13, ib.gpuAddress + io);
@@ -726,7 +1116,7 @@ static int sx_draw(NvProg *pr, const p_draw *dw0, const p_draw_idx *di0) {
     memcpy(cpu + (info - gpu), ci, 16); memcpy(cpu + (info - gpu) + 16, cc, 16);
     if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
     MTL4RenderPassDescriptor *rd = pass_desc(); rd.renderTargetWidth = rd.renderTargetHeight = rd.defaultRasterSampleCount = 1;
-    id<MTL4RenderCommandEncoder> re = enc_r_begin(rd); enc_r_pso(re, capture); bind_vbufs(re);
+    id<MTL4RenderCommandEncoder> re = enc_r_begin(rd); enc_r_pso(re, capture); bind_vbufs(re, vs);
     p_draw vertex_range = {.first = (int32_t)first, .count = (int32_t)span, .instances = instances, .base_instance = (int32_t)first_instance};
     g_draw_binst = first_instance;
     vconv_bind(re, vs, 1, &vertex_range, NULL);

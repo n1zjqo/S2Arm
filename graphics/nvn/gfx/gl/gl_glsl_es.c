@@ -1,7 +1,8 @@
 // GLSL 源码改写层：游戏交给 glShaderSource 的 GLSL ES 1.00 / 3.00（及 NVIDIA 驱动多收的写法）→ glslang -V 收的 GLSL ES 3.10 文本。
 // 出包离线链（translator/gl_shaders.py，经本文件的命令行入口 S2A_GLSL_ES_MAIN）与宿主运行时兜底（gl_xlate.c，gl_prog.m 调）共用这一份实现，不写两遍。
 // 两步，与 gl_shaders.py translate() 的顺序一致：
-//   ① s2a_glsl_es_prefix（原文、预处理之前）：「#version 300 / 310 / 320」不带 profile → 补「 es」（NVIDIA 按 ES 读，glslang 照规范要求写 es；FINAL FANTASY VII 的 ff7/shaders/*.glsl）
+//   ① s2a_glsl_es_prefix（原文、预处理之前）：第一条「#version 300 / 310 / 320」没写 es → 补「 es」（NVIDIA 按 ES 读，glslang 照规范要求写 es；FINAL FANTASY VII 的 ff7/shaders/*.glsl）；
+//      后面跟注释的 es 插在注释前，跟 core / compatibility 的换成 es（#749）
 //   ② s2a_glsl_es_rewrite（glslang 预处理之后的文本）：
 //      · 版本：没有 #version 或 #version 100 = GLSL ES 1.00 → 去掉版本行，头上加「#version 310 es」+ float / int 缺省精度 highp（ES 1.00 片元常只在 #ifdef GL_ES 下设精度，
 //        预处理时 GL_ES 没定义）；#version 300 es → 310 es（3.10 是 3.00 的超集，语义不变）；
@@ -68,7 +69,10 @@ static size_t frag_data_at(const char *t, size_t n, size_t i, char k) {
 }
 
 char *s2a_glsl_es_prefix(const char *src, size_t n, size_t *out_n) {
-    // ^([ \t]*#[ \t]*version[ \t]+3[012]0)[ \t]*(\r?)$（多行，只改第一处）→ \1 es\2
+    // 第一条 #version 是 300 / 310 / 320、没写 es 时补成 es（NVIDIA 按 ES 读，glslang 照规范要求写 es）：
+    //   ^([ \t]*#[ \t]*version[ \t]+3[012]0)[ \t]*(\r?)$ → \1 es\2（原规则）；
+    //   #749：版本号后面跟注释（// 或 /*）→ es 插在注释前；跟桌面 GL 的 core / compatibility → 换成 es（这两个 profile 在 ES 下本来就编不过）。
+    //   已写 es、版本号不是这三个、后面是别的写法 → 原样（交 glslang 照常报）。只看第一条 #version：后面的版本行本来就是错的，不替它改
     for (size_t ls = 0; ls <= n; ) {
         size_t j = ls;
         while (j < n && (src[j] == ' ' || src[j] == '\t')) j++;
@@ -76,13 +80,26 @@ char *s2a_glsl_es_prefix(const char *src, size_t n, size_t *out_n) {
             j++; while (j < n && (src[j] == ' ' || src[j] == '\t')) j++;
             if (starts(src, n, j, "version")) {
                 j += 7; size_t k = j; while (k < n && (src[k] == ' ' || src[k] == '\t')) k++;
-                if (k > j && k + 3 <= n && src[k] == '3' && (src[k + 1] == '0' || src[k + 1] == '1' || src[k + 1] == '2') && src[k + 2] == '0') {
+                if (k > j && k + 3 <= n && src[k] == '3' && (src[k + 1] == '0' || src[k + 1] == '1' || src[k + 1] == '2') && src[k + 2] == '0'
+                    && (k + 3 == n || !(src[k + 3] >= '0' && src[k + 3] <= '9'))) {
                     size_t g1 = k + 3, m = g1; while (m < n && (src[m] == ' ' || src[m] == '\t')) m++;
                     int cr = m < n && src[m] == '\r'; size_t e = m + cr;
-                    if (e == n || src[e] == '\n') {
-                        sb o = {0}; sb_put(&o, src, g1); sb_str(&o, " es"); if (cr) sb_put(&o, "\r", 1); sb_put(&o, src + e, n - e); return sb_take(&o, out_n);
+                    size_t le = m; while (le < n && src[le] != '\n') le++;   // 版本行行尾
+                    #define WORD_AT(w) (starts(src, n, m, w) && (m + strlen(w) == le || !((src[m + strlen(w)] | 0x20) >= 'a' && (src[m + strlen(w)] | 0x20) <= 'z') && src[m + strlen(w)] != '_' && !(src[m + strlen(w)] >= '0' && src[m + strlen(w)] <= '9')))
+                    sb o = {0};
+                    if (e == n || src[e] == '\n') {   // 原规则：后面只有空白
+                        sb_put(&o, src, g1); sb_str(&o, " es"); if (cr) sb_put(&o, "\r", 1); sb_put(&o, src + e, n - e); return sb_take(&o, out_n);
                     }
+                    if (starts(src, n, m, "//") || starts(src, n, m, "/*")) {   // 跟注释：es 插在注释前
+                        sb_put(&o, src, g1); sb_str(&o, " es "); sb_put(&o, src + m, n - m); return sb_take(&o, out_n);
+                    }
+                    size_t wl = WORD_AT("core") ? 4 : WORD_AT("compatibility") ? 13 : 0;
+                    if (wl) {   // 桌面 profile：换成 es
+                        sb_put(&o, src, g1); sb_str(&o, " es"); sb_put(&o, src + m + wl, n - m - wl); return sb_take(&o, out_n);
+                    }
+                    #undef WORD_AT
                 }
+                break;   // 第一条 #version 已看过：不是要补的形态就原样
             }
         }
         const char *nl = memchr(src + ls, '\n', n - ls); if (!nl) break; ls = (size_t)(nl - src) + 1;
@@ -195,6 +212,94 @@ static char *fixups(char *t, size_t n, size_t *on, char *err, size_t errn) {
     sb_put(&o, t + i, n - i); free(t); return sb_take(&o, on);
 }
 
+// 接口块 varying 展平（#749 第 2 类）：顶点 out 块 / 片元 in 块 → 一个成员一条普通 varying，名字「块名_成员」（有实例名时；匿名块成员保持原名），
+//   正文里的「实例名.成员」同步改。GL 按块名 + 成员名配对、与实例名无关；后面的翻译按 varying 名字配对两阶段，展开后两边都是「块名_成员」，自然配上
+//   （原先 SPIRV-Cross 展开成「实例名_成员」：顶点 vs_out、片元 fs_in 两边对不上，翻译直接拒「接口块尚未接入按名链接」）。
+//   只认顶层：[layout(...)] [flat|smooth|noperspective|centroid|highp|mediump|lowp]* in|out 块名 { 成员; … } [实例名];
+//   块级与成员自带的限定符按 ES 规定的顺序重排到每个成员上：插值（flat / smooth / noperspective / centroid）→ in|out → 精度（highp / mediump / lowp）→ 类型；
+//   块级与成员的 layout（location 等）去掉（展开后按名配对）。块可以紧跟在预处理行（#extension …）后面。实例是数组、成员带「[」或「,」：整块原样不动（照旧由翻译报错）
+static int word_at(const char *t, size_t n, size_t i, const char *w) { size_t l = strlen(w); return starts(t, n, i, w) && boundary_before(t, i) && (i + l == n || !is_word((unsigned char)t[i + l])); }
+static size_t ident_end(const char *t, size_t n, size_t i) { while (i < n && is_word((unsigned char)t[i])) i++; return i; }
+#define FB_MIN(a, b) ((a) < (b) ? (a) : (b))
+static const char *const fb_interp[] = {"flat", "smooth", "noperspective", "centroid"}, *const fb_prec[] = {"highp", "mediump", "lowp"};
+// [i, z) 开头的 layout(...) 与限定符：插值词追加到 ip、精度词追加到 pp（各带尾随空格），返回第一个别的词的位置
+static size_t fb_quals(const char *t, size_t z, size_t i, sb *ip, sb *pp) {
+    for (int again = 1; again; ) {
+        again = 0; i = skip_space(t, z, i);
+        if (word_at(t, z, i, "layout")) { size_t j = skip_space(t, z, i + 6); if (j < z && t[j] == '(') { while (j < z && t[j] != ')') j++; if (j < z) { i = j + 1; again = 1; continue; } } }
+        for (int k = 0; k < 4 && !again; k++) if (word_at(t, z, i, fb_interp[k])) { sb_str(ip, fb_interp[k]); sb_str(ip, " "); i += strlen(fb_interp[k]); again = 1; }
+        for (int k = 0; k < 3 && !again; k++) if (word_at(t, z, i, fb_prec[k])) { sb_str(pp, fb_prec[k]); sb_str(pp, " "); i += strlen(fb_prec[k]); again = 1; }
+    }
+    return i;
+}
+// i 处是不是顶层语句开头：前一个非空白字符是开头 / ; / }，或前一行是预处理行（#version / #extension …）
+static int fb_stmt_start(const char *t, size_t i) {
+    size_t b = i; while (b > 0 && is_space((unsigned char)t[b - 1])) b--;
+    if (b == 0 || t[b - 1] == ';' || t[b - 1] == '}') return 1;
+    size_t ls = b; while (ls > 0 && t[ls - 1] != '\n') ls--;
+    while (ls < b && (t[ls] == ' ' || t[ls] == '\t')) ls++;
+    return ls < b && t[ls] == '#' && memchr(t + b, '\n', i - b) != NULL;
+}
+static char *flatten_blocks(char *t, size_t n, char stage, size_t *on) {
+    const char *dir = stage == 'v' ? "out" : stage == 'f' ? "in" : NULL;
+    if (!dir) { *on = n; return t; }
+    for (size_t scan = 0; scan < n; ) {
+        size_t s = scan;
+        if (!(is_word((unsigned char)t[s]) && boundary_before(t, s) && fb_stmt_start(t, s))) { scan++; continue; }
+        sb bip = {0}, bpp = {0};   // 块级插值 / 精度限定符
+        size_t j = fb_quals(t, n, s, &bip, &bpp);
+        if (!word_at(t, n, j, dir)) { free(bip.p); free(bpp.p); scan = ident_end(t, n, s) > s ? ident_end(t, n, s) : s + 1; continue; }
+        size_t bn0 = skip_space(t, n, j + strlen(dir)), bn1 = ident_end(t, n, bn0);
+        size_t lb = skip_space(t, n, bn1);
+        size_t rb = lb + 1; while (rb < n && t[rb] != '}' && t[rb] != '{') rb++;
+        size_t in0 = rb < n ? skip_space(t, n, rb + 1) : n, in1 = ident_end(t, n, in0), semi = skip_space(t, n, in1);
+        int ok = !(bn1 == bn0 || lb >= n || t[lb] != '{' || rb >= n || t[rb] != '}' || semi >= n || t[semi] != ';');   // 实例是数组（「[」在「;」前）或别的写法：不动
+        for (size_t k = lb + 1; ok && k < rb; k++) if (t[k] == '[' || t[k] == ',') ok = 0;
+        if (!ok) { free(bip.p); free(bpp.p); scan = bn1 > s ? bn1 : s + 1; continue; }
+        // 展开
+        sb o = {0}; sb_put(&o, t, s);
+        char blk[128], inst[128]; size_t bl = FB_MIN(bn1 - bn0, sizeof blk - 1), il = FB_MIN(in1 - in0, sizeof inst - 1);
+        memcpy(blk, t + bn0, bl); blk[bl] = 0; memcpy(inst, t + in0, il); inst[il] = 0;
+        char names[64][128]; int nm = 0;
+        for (size_t m = lb + 1; m < rb && nm < 64; ) {
+            size_t e = m; while (e < rb && t[e] != ';') e++;
+            size_t a = m, z = e; while (a < z && is_space((unsigned char)t[a])) a++; while (z > a && is_space((unsigned char)t[z - 1])) z--;
+            if (a < z) {
+                size_t ne = z, nb = ne; while (nb > a && is_word((unsigned char)t[nb - 1])) nb--;   // 成员名 = 最后一个词
+                size_t ml = FB_MIN(ne - nb, sizeof names[0] - 1); memcpy(names[nm], t + nb, ml); names[nm][ml] = 0;
+                sb mip = {0}, mpp = {0}; size_t ty = fb_quals(t, z, a, &mip, &mpp);
+                if (bip.n) sb_put(&o, bip.p, bip.n); if (mip.n) sb_put(&o, mip.p, mip.n);
+                sb_str(&o, dir); sb_str(&o, " ");
+                if (bpp.n && !mpp.n) sb_put(&o, bpp.p, bpp.n); if (mpp.n) sb_put(&o, mpp.p, mpp.n);   // 成员自带精度优先于块级
+                sb_put(&o, t + ty, nb - ty); free(mip.p); free(mpp.p);
+                if (il) { sb_str(&o, blk); sb_str(&o, "_"); } sb_str(&o, names[nm]); sb_str(&o, ";\n"); nm++;
+            }
+            m = e + 1;
+        }
+        free(bip.p); free(bpp.p);
+        size_t restart = o.n;
+        sb_put(&o, t + semi + 1, n - (semi + 1));
+        size_t tn; char *tt = sb_take(&o, &tn); if (!tt) { free(t); return NULL; }
+        free(t); t = tt; n = tn;
+        if (il) {   // 「实例名 . 成员」→「块名_成员」
+            sb r = {0}; size_t i = 0, last = 0;
+            while (i < n) {
+                if (word_at(t, n, i, inst)) {
+                    size_t d = skip_space(t, n, i + il);
+                    if (d < n && t[d] == '.') { size_t m0 = skip_space(t, n, d + 1), m1 = ident_end(t, n, m0);
+                        for (int k = 0; k < nm; k++) if (m1 - m0 == strlen(names[k]) && !memcmp(t + m0, names[k], m1 - m0)) {
+                            sb_put(&r, t + last, i - last); sb_str(&r, blk); sb_str(&r, "_"); sb_str(&r, names[k]); i = last = m1; goto nx; } }
+                }
+                i++;
+            nx:;
+            }
+            sb_put(&r, t + last, n - last); size_t rn; char *rr = sb_take(&r, &rn); if (!rr) { free(t); return NULL; } free(t); t = rr; n = rn;
+        }
+        scan = restart;
+    }
+    *on = n; return t;
+}
+
 char *s2a_glsl_es_rewrite(const char *pre, size_t n, char stage, size_t *out_n, char *err, size_t errn) {
     if (errn) err[0] = 0;
     if (stage != 'v' && stage != 'f' && stage != 'c') { snprintf(err, errn, "stage %c is not v / f / c", stage); return NULL; }
@@ -221,7 +326,16 @@ char *s2a_glsl_es_rewrite(const char *pre, size_t n, char stage, size_t *out_n, 
         body = sb_take(&o, &bn);
     } else body = es100(pre, n, stage, &bn);
     if (!body) { if (errn && !err[0]) snprintf(err, errn, "out of memory"); return NULL; }
-    return fixups(body, bn, out_n, err, errn);
+    // 「sample」在 GLSL ES 3.00 / 3.10 是保留字，3.20 或开了 GL_OES_shader_multisample_interpolation 才是插值限定符；ES 1.00 里是普通名字。
+    //   游戏拿它当变量名（ES 1.00 原文、或 NVIDIA 编译器放过的 3.x），升到 3.10 后 glslang 报「'sample' : Reserved word」整支编不过，
+    //   游戏查编译状态失败就断言退出（D-9EPN：5 支片元编不过、随后游戏 Break）。结果不是 3.20、也没开那个扩展时，这个词只可能是名字：整词改成 s2a_sample
+    int v320 = 0, msi = 0;
+    if (at) { size_t j = skip_space(at, rest, 8); v320 = starts(at, rest, j, "320") && (j + 3 == rest || !is_word((unsigned char)at[j + 3])); }
+    { static const char ext[] = "GL_OES_shader_multisample_interpolation"; for (size_t i = 0; !msi && i + sizeof ext - 1 <= n; i++) msi = !memcmp(pre + i, ext, sizeof ext - 1); }
+    if (!v320 && !msi) { size_t sn; char *x = sub_word(body, bn, "sample", "s2a_sample", &sn, NULL); free(body); if (!x) { if (errn && !err[0]) snprintf(err, errn, "out of memory"); return NULL; } body = x; bn = sn; }
+    size_t fn; char *fx = fixups(body, bn, &fn, err, errn);
+    if (!fx) return NULL;
+    return flatten_blocks(fx, fn, stage, out_n);
 }
 
 #ifdef S2A_GLSL_ES_MAIN

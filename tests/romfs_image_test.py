@@ -72,16 +72,37 @@ class Image(unittest.TestCase):
         with self.assertRaises(romfs_image.Red): self.build()
         self.assertFalse((self.out / 'manifest.json').exists())
 
+    def test_empty_romfs_delivers_and_materializes(self):
+        # #578：RomFS 一个文件都没有（数据全在 exefs）。期望：资源包有空的 romfs.files/、镜像行是 0 字节 + 空串的 sha256；
+        #   一键出包交付（deliver_pack.py）成功（原先退去克隆不存在的 romfs.img、FileNotFoundError）；从交付目标现拼的 romfs.img 是 0 字节
+        for k in [k for k in self.files if k.startswith('romfs/')]: del self.files[k]; (self.src / k).unlink()
+        self.files['romfs/.gitkeep'] = b''; (self.src / 'romfs/.gitkeep').write_bytes(b'')   # 同 #578 那款：romfs/ 里只有一个 0 字节占位
+        (self.root / 'ui_overlay.tsv').write_text('')
+        idx = index(600, []); (self.src / 'romfs.s2aidx').write_bytes(idx); self.files['romfs.s2aidx'] = idx; self.write_index()
+        self.build()
+        self.assertTrue((self.out / 'romfs.files').is_dir())
+        rows = {l.split('\t')[0]: l.split('\t') for l in (self.out / 'index.tsv').read_text().splitlines()}
+        self.assertEqual(rows['romfs.img'][1:], ['0', sha(b'')])
+        dst = Path(self.td.name) / 'delivered'
+        r = subprocess.run([sys.executable, str(R / 'pack/oneclick/deliver_pack.py'), str(self.out), str(dst)], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr[-400:])
+        f = Path(romfs_image.materialize(dst, 'romfs.img', 0, sha(b''), say=lambda *_: None))
+        self.assertEqual(f.read_bytes(), b''); f.unlink()
+
     def test_unchanged_is_reused(self):
         self.build(); mt = (self.out / 'index.tsv').stat().st_mtime_ns; self.build()
         self.assertEqual((self.out / 'index.tsv').stat().st_mtime_ns, mt)
 
-    def test_materialize_rejects_changed_file(self):
-        # 资源包里的文件被改过（同长不同内容）：现拼核 sha256 对不上 → 报红、不留半份
+    def test_materialize_warns_on_changed_file_and_continues(self):
+        # 维护者 11-17（按新规矩改：原先报红、不留半份）：资源包里的文件被改过（同长不同内容），现拼核 sha256 对不上 → 黄字说清、照常拼出这份
+        #   （坏也只坏这款的包）。期望（手写）：不抛错；提示里有「与索引不符」；拼出的镜像在、长度对、内容是改过之后的那份；不留 .part
         self.build(); f = self.out / 'romfs.files/z.bin'; f.unlink(); f.write_bytes(b'YY')
         row = {l.split('\t')[0]: l.split('\t') for l in (self.out / 'index.tsv').read_text().splitlines()}['romfs.img']
-        with self.assertRaises(romfs_image.Red): romfs_image.materialize(self.out, 'romfs.img', int(row[1]), row[2], say=lambda *_: None)
-        self.assertFalse((self.out / 'romfs.img').exists()); self.assertFalse((self.out / 'romfs.img.part').exists())
+        said = []
+        got = Path(romfs_image.materialize(self.out, 'romfs.img', int(row[1]), row[2], say=said.append))
+        self.assertTrue(any('与索引不符' in s for s in said), said)
+        self.assertTrue(got.is_file()); self.assertEqual(got.stat().st_size, int(row[1])); self.assertIn(b'YY', got.read_bytes())
+        self.assertFalse((self.out / 'romfs.img.part').exists())
 
 
 if __name__ == '__main__':

@@ -10,8 +10,12 @@ validation for each final build and device.
 
 This README records the implemented bring-up and its verification scope.
 
-Android community patches default to off; an explicitly configured `S2A_CPATCH_ON`
-may enable them. This source-level policy has not been verified on a device.
+Android community patches follow the same policy as Apple: only internal packs
+built with `S2A_COMMUNITY_PATCHES=1` carry `modules/cpatch.tsv`; without
+`S2A_CPATCH_ON` each patch uses the table's default, `S2A_CPATCH_ON=<ids>` enables
+only those ids and `none` disables all. The Android app has no settings page for
+this yet; set `S2A_CPATCH_ON` through the debug environment channel. This
+source-level policy has not been verified on a device.
 
 Shared shader-cache location, reset, write and periodic counter diagnostics are
 off by default on every platform. Set `S2A_SHADER_CACHE_DIAG=1` in the host
@@ -29,6 +33,39 @@ presenter draws clear colours and orientation markers; it is not connected to
 Ryujinx game rendering. No game-specific
 addresses, assets, firmware, keys, storage permissions, or network permission
 are included.
+
+## FPS overlay
+
+In the game library, **Show FPS (successful frame submissions)** controls the
+game overlay for this app package. It is off by default and persists across
+launches. The existing `s2arm.fps=on|off` Intent override writes the same
+`display` / `fps` preference; returning to the library refreshes its checkbox.
+The library does not load the native runtime or start an overlay timer.
+
+The overlay refreshes once per second. NVN direct sessions read the atomic
+successful-present counter through `s2a_android_nvn_present_count`; Vulkan
+guest-direct sessions and the legacy counter retain their existing sources.
+Missing windows, acquire timeouts and failed presents do not add NVN samples.
+This is a submission rate, not the screen refresh rate or GPU completion rate.
+The first sample and a paused/stopping session show `FPS —`; a valid sample
+with no new submissions shows `FPS 0.0`.
+
+Host coverage: `bash android/core-runtime/fps-tests/test.sh` and
+`python3 android/tests/nvn_present_count_test.py`. Diagnostic UI coverage uses
+`-Ps2arm.testRunner=org.s2arm.android.FpsOverlayInstrumentation`; add the existing
+debug-only `-Ps2arm.testAppIdSuffix=.w2` for an isolated install when needed.
+The runner restores only the original FPS preference. Diagnostic samples are
+unavailable and do not certify real NVN game frame rates.
+
+The separate `android_fps_table` CTest exercises the 60 FPS patch table, not
+the overlay sampler. Its enabled scenario explicitly sets `S2A_FPS60=1`;
+leaving the variable unset preserves the game's native frame-rate policy.
+
+The protected device runner requires a POSIX host (`fcntl`, `fork`, and
+process-exit monitoring); native Windows Python cannot provide this lock.
+Its `getprop` preflight accepts multiline property values, including boot
+history, while still rejecting malformed, duplicate, or incomplete records.
+This does not bypass debug-property admission or installation-state protection.
 
 ## Which build path to use
 
@@ -444,7 +481,18 @@ no controller-model override is applied.
   between face buttons.
 - **D-pad:** 8 sectors with a centre dead zone, so diagonals press two directions.
 - **Layout:** fills the area inside the system bars and cutouts in landscape; in
-  portrait it sits in a landscape-shaped box at the bottom.
+  portrait it sits in a landscape-shaped box at the bottom. Geometry is an F01
+  layout (`TouchLayout`, the iOS `ios/layouts/layout.schema.json` format)
+  projected into that box: the built-in one is `TouchLayout.androidDefault`, and
+  the four direction keys form one D-pad disc. Unlike iOS, Android sticks are
+  fixed at the centre of their activation region.
+- **Touch menu (no adb):** hold four fingers for 1.5 s. *Edit button positions*
+  dims the game and lets every key, the D-pad and both sticks be dragged; *Save*
+  writes the player's layout for this game to `files/touch-layouts/<title id>.json`
+  (the diagnostic app uses `app.json`), *Default* deletes it. *Touch passthrough*
+  sends touches that miss the controls to the game, and is remembered per game;
+  it is listed only in builds with `-Ps2arm.experimentalTouch=true` (the native
+  transport is off by default).
 
 The Activity merges the pad with a physical controller before publishing through
 `s2a_vpad_read`: buttons are OR'ed, and each stick comes from whichever is
@@ -453,6 +501,8 @@ connected. Focus loss, pause and device changes release it.
 
 Debug extras: `--es s2arm.touchpad on|off|auto`, and `--es s2arm.touchlog on`,
 which logs the layout and every change of the published input.
+`--ez s2arm.experimental_touch true|false` still switches passthrough for one run
+without changing the remembered choice.
 
 Checked on the Redmi K50 Ultra (landscape, 2026-10-22) with injected touches
 (`input motionevent`, sent only while this app was in front):
@@ -613,6 +663,8 @@ S2ARM_ANDROID_CS_SERVICES=static S2ARM_ANDROID_GAME_DIR=build/android-game/<titl
 python3 android/tools/game_apk.py --resources build/pack/<game> \
   android/app/build/outputs/apk/debug/app-debug.apk build/pack/<game>-res   # what that app installs
 ```
+
+出包链路（`pack/targets/android/package.py`）给 `--resources` 加 `--reuse-from <上一个已发布 release 的 resources/>`：上一包自己的 index 里与新包同路径、同大小、同 SHA-256 的**只读**文件改成硬链接，不再各写一份（ext4 没有 reflink，以前每个 release 的 `resources/` 都是一整份 RomFS）。链接后仍逐个核新包的 index；上一包不可用（读不出、与输出或输入重叠）、跨盘、链接被拒、文件可写或字节已变的，一律退回复制。所以同一台机器上相邻 release 的只读文件共享同一个 inode：别原地改 release 里的文件（先改权限再写会同时改到两个包），删哪个 release 都不影响另一个。
 
 构建后的设备部署统一用 `python3 android/tools/deploy_game.py --pack <完整源包> --apk <最终签名APK> --serial <设备> --mode direct`。
 脚本冻结 APK、生成配套资源绑定、安装、导入并核对设备 APK 哈希，避免重编后反复出现 `artifact.apk.sha256` 不匹配。

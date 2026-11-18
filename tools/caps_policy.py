@@ -389,9 +389,29 @@ def widen_measured(repo, root, pid, bid, target='apple'):
     return None
 
 
+# 只用社区补丁（11-13 维护者：「补丁方案已经彻底覆盖咱们通用满屏和60帧解锁的功能……撤掉咱们的60帧和通用满屏这一层，用开关实现……
+#   玩家拿到的就是干净的补丁方案或者原生游戏方案」）：fps60 只在有社区帧率补丁时开（60 帧开关此后只是「开关帧率补丁」），其余款原帧率；
+#   widen（我方满屏层）一律关——社区宽屏补丁走自己的开关（runtime/src/cpatch.c、widen.c ws_yield），不看这一键。
+#   S2A_CAPS_OWN=1 回到旧口径（我方帧率表 / 全引擎放开 / 我方满屏各来源照旧算），只给内部对照用
+def patch_only(): return os.environ.get('S2A_CAPS_OWN') != '1'
+
+
 def decide(repo, root, all_caps=False, target='apple'):
     """target ∈ IMPL 的键（apple / android）：强信号失效键、验证账内容哈希、已实测行全部按该平台口径查（F7：苹果验过的行不放行安卓包）"""
     pid, bid = ident(root); src = sources(root)
+    if patch_only():
+        fps = '社区帧率补丁' in src['fps60']
+        # 满屏两者合成一套（维护者 11-15「批了，两者合成一套」，取代 11-13 撤我方通用满屏的满屏那一半）：有社区满屏补丁的款补丁在宿主压过本键（runtime/src/caps.c）；
+        #   没有补丁、但本包在宽屏已验证名单（产物根 widen_verified.tsv，graphics/widen/tables/verified.tsv 按程序号 + main 构建号）→ 我方通用满屏缺省开；
+        #   登记过强信号（判过坏）照旧关；其余 16:9。玩家在设置里手动开 / 关照旧生效
+        wv = 'widen_verified.tsv' in src['widen']
+        sw = None
+        if wv and pid and bid:
+            sw = strong(repo, pid, bid, signal_hashes(repo_reader(repo), target))[0]['widen']
+        widen = (1, '缺省开：本包在宽屏已验证名单（没有社区满屏补丁时用我方通用满屏，维护者 11-15 两者合成一套）') if wv and not sw else \
+            (0, sw or '16:9：没有社区满屏补丁、也不在宽屏已验证名单（维护者 11-15 两者合成一套：验过的才开我方通用满屏）')
+        return {'fps60': (1, '默认开：来源 社区帧率补丁（只用社区补丁）') if fps else (0, '原帧率：没有社区帧率补丁（只用社区补丁，维护者 11-13 撤掉我方 60 帧）'),
+                'widen': widen, 'fps60_display': 0}
     if pid and bid and native60(repo, pid, bid): src['fps60'].append('游戏原生 60 帧')
     st, stale = ({'fps60': None, 'widen': None}, {'fps60': [], 'widen': []}) if all_caps or not (pid and bid) else strong(repo, pid, bid, signal_hashes(repo_reader(repo), target))
     for cap in ('fps60', 'widen'):   # 过时的强信号：本包实现下实测过（验证账同程序号 + 构建号 + 能力 + 本包内容哈希、结论过、没冲突）才放开（10-30 维护者定 (B)）

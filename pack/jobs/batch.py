@@ -33,7 +33,7 @@ import filelock  # noqa: E402
 
 # 同一款先出 Mac、再出 iPhone：解包只做一次靠这个顺序——iPhone 出包收尾（成功或失败）会清掉这款的解包和中间产物（library.prune_build），
 #   Mac 打包成功不清；iPhone 在前时第二个平台只能重新解包（端到端实测：20675 个解包文件全部重写）。iPhone 还能从 Mac 的产物根接着做（build.seed_from_sibling）
-PLATFORMS = ("mac", "iphone")
+PLATFORMS = ("mac", "iphone", "appletv")   # Apple TV 排在 iPhone 后：iPhone 带 followUp 不清解包，接着出 tvOS 版（export_plan）
 STATES = ("pending", "running", "completed", "failed", "cancelled")
 PAUSE_CODES = ("disk_full",)   # 失败了就暂停整批的错误码（pack/jobs/errors.py）
 
@@ -69,18 +69,11 @@ def locked(private_root):
     """一条命令读 → 改 → 写期间独占 batch.json（作业层已有的 filelock，Mac / Windows 同一套）：两个进程同时 mark 时不互相盖掉（审计 P2-270）。
     锁被占着就短等（每条命令都是毫秒级），等不到报错，不静默写"""
     root = Path(private_root); root.mkdir(parents=True, exist_ok=True)
-    with open(root / "batch.json.lock", "a+") as f:
-        for _ in range(100):
-            try:
-                filelock.try_lock(f); break
-            except BlockingIOError:
-                time.sleep(0.05)
-        else:
-            raise OSError("批次正被另一个进程改着，稍后再试")
-        try:
+    try:
+        with filelock.held(root / "batch.json.lock", wait_s=5, poll=0.05):
             yield
-        finally:
-            filelock.unlock(f)
+    except filelock.Busy:
+        raise OSError("批次正被另一个进程改着，稍后再试") from None
 
 
 def recover(batch):
@@ -100,16 +93,20 @@ def save(private_root, batch):
 
 
 def create(items, location=None):
-    """items: [{gameId, name, platforms}]（界面识别完、玩家勾好的；没勾平台的款不进批次）"""
+    """items: [{gameId, name, platforms, sgrade?}]（界面识别完、玩家勾好的；没勾平台的款不进批次）。
+    sgrade = false：这款在出包页取消了「S 级优化（Beta）· 出包时打入」（按款记住），批量出也不带社区补丁与金手指（export_plan 转给子作业）"""
     out = []
     seen = set()
     for raw in items:
         gid, platforms = raw.get("gameId"), [p for p in PLATFORMS if p in (raw.get("platforms") or [])]   # 同一款先出 Mac 再出 iPhone（PLATFORMS 的说明）
+        odd = [p for p in (raw.get("platforms") or []) if p not in PLATFORMS]
+        if odd:   # 不认识的平台明确报错，不静默丢（11-15：上层控制口去掉平台清单前，这一层原先把它悄悄滤掉）
+            raise ValueError(f"不认识的出包平台：{'、'.join(map(str, odd))}（只支持 {' / '.join(PLATFORMS)}）")
         if not isinstance(gid, str) or not gid or gid in seen or not platforms:
             continue
         seen.add(gid)
         out.append({"gameId": gid, "name": str(raw.get("name") or gid), "platforms": platforms,
-                    "results": {p: {"state": "pending"} for p in platforms}})
+                    "results": {p: {"state": "pending"} for p in platforms}, **({"sgrade": False} if raw.get("sgrade") is False else {})})
     if not out:
         raise ValueError("这一批里没有勾了平台的游戏")
     return {"schema": 1, "created": int(time.time()), "location": location or None, "paused": None, "items": out}
@@ -138,7 +135,7 @@ def next_step(batch):
 
 def mark(batch, gid, platform, state, message="", code=None, output=None):
     if state not in STATES:
-        raise ValueError(f"状态不对：{state}")
+        raise ValueError(f"状态不对：{state}")  # 非玩家句
     item = find(batch, gid)
     if platform not in item["results"]:
         raise ValueError(f"{gid} 这一批没有 {platform}")
@@ -203,7 +200,7 @@ def show(batch):
 def main(argv=None):
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
-    ap = argparse.ArgumentParser(description="批量出包的批次（Mac / Windows 共用）")
+    ap = argparse.ArgumentParser(description="批量出包的批次（Mac / Windows 共用）")  # 非玩家句
     ap.add_argument("command", choices=("show", "create", "mark", "recover", "cancel", "resume", "retry", "clear"))
     ap.add_argument("--private-root", required=True)
     ap.add_argument("--json"); ap.add_argument("--game"); ap.add_argument("--platform", choices=PLATFORMS)
@@ -236,7 +233,7 @@ def run(a):
             raise ValueError("没有进行中的批次")
         if a.command == "mark":
             if not (a.game and a.platform and a.state):
-                raise ValueError("mark 要 --game --platform --state")
+                raise ValueError("mark 要 --game --platform --state")  # 非玩家句
             mark(batch, a.game, a.platform, a.state, a.message, a.code, a.output)
         elif a.command == "recover": recover(batch)
         elif a.command == "cancel": cancel(batch)

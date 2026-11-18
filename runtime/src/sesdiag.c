@@ -24,8 +24,11 @@ int s2a_sesmark_prev(const char *docs) {
     char b[8] = {0}; ssize_t r = read(fd, b, sizeof b - 1); close(fd);
     return r >= 2 && !memcmp(b, "bg", 2) ? S2A_SESMARK_BG : S2A_SESMARK_FG;   // 读不全按 fg：宁可多问一次
 }
+// 只解包的起动（S2A_PACK_APPLY_ONLY=1，推完资源包起一次 App 解开就退）不是一局：不写也不删标记，上一局留下的照原样留给下一次正式起局。
+//   原先这一次起动照常写 fg（diag.m 挂上 / 回前台），解包线程做完直接 _exit 不删，装机或更新后的第一局都读到「前台未收尾」：凭空问发诊断，并把开着的补丁当崩溃嫌疑关掉
+static int apply_only(void) { const char *e = getenv("S2A_PACK_APPLY_ONLY"); return e && *e == '1'; }
 void s2a_sesmark_set(const char *docs, int state) {
-    char p[1100]; if (!mark_path(docs, p, sizeof p)) return;
+    char p[1100]; if (apply_only() || !mark_path(docs, p, sizeof p)) return;
     if (state == S2A_SESMARK_NONE) { if (unlink(p) && errno != ENOENT) LOG("【红】会话标记删除失败 errno=%d", errno); return; }
     int fd = open(p, O_WRONLY | O_CREAT | O_TRUNC, 0644); if (fd < 0) { LOG("【红】会话标记写入失败 errno=%d", errno); return; }
     ssize_t w = write(fd, state == S2A_SESMARK_BG ? "bg\n" : "fg\n", 3); (void)w; close(fd);
@@ -71,9 +74,10 @@ int s2a_log_summary(const char *path, size_t head_cap, size_t tail_cap, s2a_log_
     size_t head = sz <= head_cap + tail_cap ? sz : head_cap, tail = sz <= head_cap + tail_cap ? 0 : tail_cap;
     char *b = malloc((head > tail ? head : tail) + 1); if (!b) { close(fd); return -1; }
     ssize_t r = head ? pread(fd, b, head, 0) : 0;
-    if (r > 0) scan(b, (size_t)r, o);
+    if (r > 0) { o->read += (size_t)r; scan(b, (size_t)r, o); }
     if (tail) {
         r = pread(fd, b, tail, (off_t)(sz - tail));
+        if (r > 0) o->read += (size_t)r;
         if (r > 0) { const char *s = memchr(b, '\n', (size_t)r); if (s) scan(s + 1, (size_t)(b + r - (s + 1)), o); }   // 尾段第一行多半被截断：从第一个换行后起
         o->truncated = 1;
     }

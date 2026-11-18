@@ -12,6 +12,7 @@ import shlex
 import sys
 import os
 import unittest
+import unittest.mock as um
 from unittest.mock import patch
 import zipfile
 
@@ -31,6 +32,19 @@ def oneclick_stages(source):
 
 
 REAL_ONECLICK_STAGES = oneclick_stages((ROOT / "pack/oneclick/oneclick.sh").read_text())
+
+
+# 导入路径跑完还原（11-16）：本文件有用例在进程内加载 pack/iml_check.py（它把自己所在的 pack/ 插到 sys.path 最前）、经作业层把 tools/ 插进 sys.path；
+#   不还原，同一进程里后跑的 test_win_jobs 导入 pack.orch 时 pack 解析成 pack/pack.py（「pack is not a package」），全量 discover 才红
+_SYS_PATH = []
+
+
+def setUpModule():
+    _SYS_PATH[:] = sys.path
+
+
+def tearDownModule():
+    sys.path[:] = _SYS_PATH
 
 
 class PackageFailures(JobCase):
@@ -312,7 +326,7 @@ class InstallFailures(JobCase):
             z.writestr("Payload/Test.app/S2Arm", b"bin")
         self.c.r.update(gameId=gid)
         import ipa as packer
-        def fake_assemble(c, g, others=(), failed=(), root=None, dest=None):
+        def fake_assemble(c, g, others=(), failed=(), root=None, dest=None, agreed=()):
             return archive, [gid], "SID1"
         def unpack(args, **kw):
             with zipfile.ZipFile(archive) as z: z.extractall(args[-1])
@@ -427,6 +441,40 @@ class FreeAccountLimits(unittest.TestCase):
         self.assertEqual((install.classify(raw), impactor.explain(raw)), ("app_id_taken", "app_id_taken"))
         self.assertTrue(loc.get(RECOVERY["app_id_taken"]) and spec["app_id_taken"]["title"]["en"] and "app_id_taken" in guide)
         self.assertEqual(ctl.AI_NEXT["app_id_taken"][0], "human")
+        # apple_session_expired（玩家错误摘要原文，Windows v0.2.7 plumesign 恢复保存的会话时报）：认成登录过期、给 Impactor 重新登录的办法，各处都登记；
+        #   旁边的 9401 / 两步验证 / 密码错各自仍归原码，不被这条吞掉
+        raw = "Error: Developer API error 1100 (HTTP Some(200)): Your session has expired. Please log in. (listTeams.action)"
+        self.assertEqual(impactor.explain(raw), "apple_session_expired")
+        self.assertIn("移除账号", RECOVERY["apple_session_expired"]); self.assertIn("添加账号", RECOVERY["apple_session_expired"])
+        self.assertTrue(loc.get(RECOVERY["apple_session_expired"]) and spec["apple_session_expired"]["title"]["en"] and "apple_session_expired" in guide)
+        self.assertEqual(ctl.AI_NEXT["apple_session_expired"][0], "human")
+        # signing_server_unreachable（#3fc02b 玩家原文，Windows 0.3.7）：认成连不上签名服务器、给查网络的办法，各处都登记；
+        #   同是 anisette 但不是网络的报错（-80046）仍归原码
+        raw = ("Error: Anisette error: Request Error error sending request for url (https://mac-ani.jkcoxson.com/v3/client_info)\n\nCaused by:\n"
+               "    2: client error (Connect)\n    3: dns error\n    4: 不知道这样的主机。 (os error 11001)")
+        self.assertEqual(impactor.explain(raw), "signing_server_unreachable")
+        self.assertIn("mac-ani.jkcoxson.com", RECOVERY["signing_server_unreachable"]); self.assertIn("DNS", RECOVERY["signing_server_unreachable"])
+        self.assertTrue(loc.get(RECOVERY["signing_server_unreachable"]) and spec["signing_server_unreachable"]["title"]["en"] and "signing_server_unreachable" in guide)
+        self.assertEqual(ctl.AI_NEXT["signing_server_unreachable"][0], "human")
+        self.assertEqual(impactor.explain("Anisette error: -80046 Apple rejected"), "login_identity_rejected")
+        # #edc5f5 拆三种（期望手写）：没登录 / 没选中 → apple_not_signed_in；连不上 *.apple.com → apple_server_unreachable；1100 仍是过期。
+        #   连不上 anisette 服务器（jkcoxson）仍归 signing_server_unreachable，不被新的那条吞掉；各处都登记
+        for raw, code in (("Error: No account selected. Please login first using 'plumesign account login'", "apple_not_signed_in"),
+                          ("Error: not logged in", "apple_not_signed_in"),
+                          ("Error: error sending request for url (https://gsa.apple.com/grandslam/GsService2)\n\nCaused by:\n    dns error", "apple_server_unreachable"),
+                          ("Error: Anisette error: Request Error error sending request for url (https://mac-ani.jkcoxson.com/v3/client_info) dns error", "signing_server_unreachable"),
+                          ("Error: Developer API error 1100 (HTTP Some(200)): Your session has expired. Please log in.", "apple_session_expired")):
+            with self.subTest(raw=raw[:40]):
+                self.assertEqual(impactor.explain(raw), code)
+        for code in ("apple_not_signed_in", "apple_server_unreachable"):
+            with self.subTest(code=code):
+                self.assertTrue(loc.get(RECOVERY[code]) and spec[code]["title"]["en"] and spec[code]["detail"]["en"] and code in guide)
+                self.assertEqual(ctl.AI_NEXT[code][0], "human")
+        self.assertIn("添加账号", RECOVERY["apple_not_signed_in"]); self.assertNotIn("过期", RECOVERY["apple_not_signed_in"])
+        self.assertIn("DNS", RECOVERY["apple_server_unreachable"]); self.assertIn("不是 Apple ID", RECOVERY["apple_server_unreachable"])
+        for other, code in (("Developer API error 9401: An App ID with Identifier 'x' is not available.", "app_id_taken"),
+                            ("-21669 verification code", "two_factor_wrong"), ("-20101 entered incorrectly", "apple_id_wrong")):
+            self.assertEqual(impactor.explain(other), code)
 
 
 class LogCauses(JobCase):
@@ -459,6 +507,7 @@ class LogCauses(JobCase):
                 "【红】01007EF00011E000 直连库出库失败（rc=1，[直连库] 🔴 出库失败 rc=1（%s））" % build_log,
                 self.STOP]
 
+    @um.patch("errors._free_bytes", lambda path: 1 << 30)   # 前提：盘真满了（只剩 1 GB）——盘满字样要核实才采信（剃刀 H9）
     def test_direct_stage_dotnet_disk_full_reads_build_log(self):
         log = self.direct_build_log(
             "[直连库] 第 4/5 步 出库：41971 支，8 路并行\n"
@@ -495,6 +544,31 @@ class LogCauses(JobCase):
         self.assertEqual(error.code, "permission_denied")
         self.assertEqual(d["suggestion"], RECOVERY["permission_denied"])
 
+    def test_exfat_unsupported_ops_says_change_drive(self):
+        # 11-10 网友（v0.2.6 Mac）：存放位置设到外接盘写入失败；exFAT 映像复现，解包 seed 克隆退回拷贝后发布用 RENAME_EXCL 回 errno 45。
+        #   原先落成笼统的「资源准备失败」；现在说清这块盘格式不支持、换 APFS 盘
+        from errors import RECOVERY
+        error, d = self.mac_refresh(["克隆失败：main：[Errno 45] Operation not supported: '[PRIVATE_PATH]'",
+                                     "【红】克隆 exefs 失败",
+                                     "【红】010024B00F9D0000 刷新停在 seed 阶段（rc=1），现行 = 010024B00F9D0000@ex-1234abcd"])
+        self.assertEqual(error.code, "volume_ops_unsupported")
+        self.assertEqual(d["summary"], "存放位置所在磁盘格式不支持：这块盘不支持出包需要的文件操作（常见于 exFAT / FAT 格式的外接盘）。")
+        self.assertEqual(d["suggestion"], RECOVERY["volume_ops_unsupported"])
+
+    def test_memory_error_says_out_of_memory(self):
+        # #711（11-11 Windows 16 GB）：抽取进程池按逻辑核数开满，Python 子进程打 MemoryError。原先落成笼统的阶段失败；
+        #   现在说「电脑内存不够」、下一步关掉占内存的程序 / 调大页面文件
+        from errors import RECOVERY
+        error, d = self.mac_refresh(["Traceback (most recent call last):", '  File "nxsh_extract.py", line 88, in <module>', "MemoryError", self.STOP])
+        self.assertEqual(error.code, "out_of_memory")
+        self.assertEqual(d["summary"], "电脑内存不够：出包时内存用完了。")
+        self.assertEqual(d["suggestion"], RECOVERY["out_of_memory"])
+
+    def test_memory_error_mentioned_in_prose_is_not_out_of_memory(self):
+        # 反例（同一用例里作业日志会累积，单拆一个）：句中提到 MemoryError 不算，只认独占一行的异常名
+        error, _ = self.mac_refresh(["说明：遇到 MemoryError 时请调小并行度", self.STOP])
+        self.assertNotEqual(error.code, "out_of_memory")
+
     def test_windows_precheck_missing_metal_says_metal_unavailable(self):
         # 11-09 Windows 出包机：S2A_METAL_BIN 指到不存在的目录，预检打「环境缺件 metal」、退 75。原先落成笼统的 package_failed（出包未完成）
         error, d = self.mac_refresh(["【红】环境缺件 metal：Metal Developer Tools（D:\\no_such_metal\\bin；S2A_METAL_BIN 可指定，否则查 PATH / 官方安装目录）",
@@ -524,6 +598,7 @@ class LogCauses(JobCase):
         error, _ = self.mac_refresh(self.direct_refresh_lines(log))
         self.assertEqual(error.code, "package_failed")
 
+    @um.patch("errors._free_bytes", lambda path: 1 << 30)   # 前提：盘真满了（只剩 1 GB）——盘满字样要核实才采信（剃刀 H9）
     def test_python_errno_28_in_fresh_refresh_log(self):
         events = self.root / "events.jsonl"
         events.write_text("\n".join(json.dumps(e, ensure_ascii=False) for e in [
@@ -543,6 +618,7 @@ class LogCauses(JobCase):
         got = ipa.oneclick_failure(events, None, None, refresh_log=refresh, refresh_before=ipa._log_identity(refresh))
         self.assertEqual(got.code, "package_failed")
 
+    @um.patch("errors._free_bytes", lambda path: 1 << 30)   # 前提：盘真满了（只剩 1 GB）——盘满字样要核实才采信（剃刀 H9）
     def test_windows_dotnet_not_enough_space(self):
         events = self.root / "events.jsonl"
         events.write_text(json.dumps(dict(ev="result", ok=False, msg="刷新停在：【红】fixture 直连库出库失败（rc=1）")))
@@ -560,9 +636,74 @@ class LogCauses(JobCase):
                 self.assertEqual(error.code, "metal_unavailable")
                 self.assertEqual(d["summary"], "缺少 Metal 组件：编着色器要用的 Metal 组件没装上。")
 
+    @um.patch("errors._tool_present", lambda name: False)   # 前提：spirv-cross 真没装（「command not found」要核实才采信，剃刀 H9）
     def test_other_missing_tool(self):
         error, _ = self.mac_refresh(["pack/stage_x.sh: line 9: spirv-cross: command not found", "【红】fixture 刷新停在 caps 阶段（rc=1），现行 = fixture@ex-1"])
         self.assertEqual(error.code, "tool_missing")
+
+    def test_disk_full_words_with_free_space_are_not_believed(self):
+        # 剃刀 H9 反例：日志里有 [Errno 28] 字样（例如前面一次已重试成功的写），但点名的盘还剩 40 GB → 不说盘满，按阶段归；字样与未采信理由进 detail
+        #   （坑记录 11-09：Windows rc=127 被一律译成盘满，玩家照提示删了 37 GB）
+        with um.patch("errors._free_bytes", return_value=40 << 30):
+            error, d = self.mac_refresh(["OSError: [Errno 28] No space left on device: '/w/tmp/retry.bin'",
+                                         "【红】fixture 刷新停在 sysdata 阶段（rc=1），现行 = fixture@ex-1"])
+        self.assertEqual(d["code"], "package_failed")
+        self.assertIn("候选 disk_full 未采信", d["detail"])
+        self.assertIn("40.0 GB", d["detail"])
+
+    def test_command_not_found_for_present_tool_is_not_believed(self):
+        # 剃刀 H9 反例：「x: command not found」但 x 现在找得到（可选探测、PATH 一时没带上）→ 不叫玩家去装工具，按阶段归
+        with um.patch("errors._tool_present", return_value=True):
+            error, d = self.mac_refresh(["pack/stage_x.sh: line 9: spirv-cross: command not found", "【红】fixture 刷新停在 caps 阶段（rc=1），现行 = fixture@ex-1"])
+        self.assertNotEqual(error.code, "tool_missing")
+        self.assertIn("候选 tool_missing 未采信", d["detail"])
+
+    def test_rewrite_gap_failure_carries_machine_facts(self):
+        # 剃刀 G5 / H9：改写失败带机读事实（facts），前端按字段显示、不解析中文。证据里两条统计行取最后一条；GAP 行去掉地址 / 寄存器后按类别计数。
+        #   期望手算：最后一条 PFRW mod=main need=120 gaps=3 fatal=0；三条 GAP 归两类——「ldr _, [_, _]」2 次、「svc _」1 次
+        error, d = self.mac_refresh(["PFRW mod=rtld need=4 gaps=0 fatal=0",
+                                     "PFRW mod=main need=120 gaps=3 fatal=0",
+                                     "GAP\t1\t0x7100001000\tldr x1, [x2, #0x10]",
+                                     "GAP\t2\t0x7100002000\tldr x3, [x4, #-8]",
+                                     "GAP\t3\t0x7100003000\tsvc #0x55",
+                                     "【红】fixture 改写 main：这款有程序代码需要的改写空间超过了能放下的上限，出不了包（日志 x）",
+                                     "【红】fixture 刷新停在 rewrite 阶段（rc=1），现行 = fixture@ex-1"])
+        self.assertEqual(error.code, "rewrite_gap")
+        self.assertEqual(d["facts"], {"module": "main", "need": 120, "gaps": 3, "fatal": 0,
+                                      "gapKinds": [{"kind": "ldr _, [_, _]", "count": 2}, {"kind": "svc _", "count": 1}]})
+
+    def test_gap_line_from_a_degraded_rewrite_does_not_claim_a_later_failure(self):
+        # v0.3.1：改写有缺口照出产物、降级继续，日志里留着 PFRW gaps=3；之后直连阶段失败，不许归成 rewrite_gap（旧规则按 PFRW 认）
+        error, d = self.mac_refresh(["PFRW mod=main need=120 gaps=3 fatal=0",
+                                     "【黄】fixture 改写降级继续：没改写的缺口 3 处（svc 3）",
+                                     "【红】fixture 刷新停在 direct 阶段（rc=1），现行 = fixture@ex-1"])
+        self.assertNotEqual(error.code, "rewrite_gap")
+
+    # v0.3.1 拿不准不停 ⑪ / ⑧：物理做不下去照停，但归到说人话的码（原先落成笼统的 package_failed）。每例单独一个方法：任务日志按例累积
+    def test_profile_structure_unsupported_speaks_plainly(self):
+        error, d = self.mac_refresh(["【黄】直连缺口：配置推导不支持本款：main is not an NSO", "【红】fixture 直连单轨停在 直连配置推导：直连缺口：配置推导不支持本款（direct_profile rc=3）"])
+        self.assertEqual(error.code, "game_structure_unsupported", d)
+
+    def test_profile_graphics_api_still_wins(self):
+        error, d = self.mac_refresh(["【黄】直连缺口：配置推导不支持本款：unsupported graphics API: unknown（no NVN）", "【红】fixture 直连单轨停在 直连配置推导：直连缺口：配置推导不支持本款（direct_profile rc=3）"])
+        self.assertEqual(error.code, "graphics_api_unsupported", d)
+
+    def test_metal_none_built_is_metal_unavailable(self):
+        error, d = self.mac_refresh(["[RED] mac Metal 库一份都没出（编不过 12 支、编成 0、复用 0）：编译器在这台机器上用不了，不发布没有着色器库的包", "【红】fixture 刷新停在 direct 阶段（rc=1），现行 = fixture@ex-1"])
+        self.assertEqual(error.code, "metal_unavailable", d)
+
+    def test_pack_verify_sha_mismatch_is_package_verify_mismatch(self):
+        # 11-13 玩家 Windows 报错原文：ipa 收尾里资源包核对一批 romfs 文件 SHA 与 index 不符，原先落成未归类 package_failed
+        error, d = self.mac_refresh(["【红】ipa_tail.log：rc=1；🔴 资源包核对 pkg/pack.files：7 个文件不对：['romfs/Env/a.zs（SHA 与 index 不符）']；已让这 7 个文件下次出包重读重算"])
+        self.assertEqual(error.code, "package_verify_mismatch", d)
+
+    def test_native_library_missing_is_tool_missing(self):
+        error, d = self.mac_refresh(["[RED] 原生库缺件（出包机环境，不是游戏内容）：DllNotFoundException（abc）", "【红】fixture 刷新停在 direct 阶段（rc=1），现行 = fixture@ex-1"])
+        self.assertEqual(error.code, "tool_missing", d)
+
+    def test_non_rewrite_failure_has_no_facts(self):
+        error, d = self.mac_refresh(["【红】fixture 刷新停在 sysdata 阶段（rc=1），现行 = fixture@ex-1"])
+        self.assertNotIn("facts", d)
 
     def test_unrecognized_cause_asks_for_error_summary(self):
         error, d = self.mac_refresh(["【红】fixture 刷新停在 sysdata 阶段（rc=1），现行 = fixture@ex-1"])
@@ -570,6 +711,22 @@ class LogCauses(JobCase):
         self.assertEqual(d["summary"], "出包未完成。")
         self.assertIn("「复制错误摘要」", d["suggestion"])
         self.assertIn("刷新停在 sysdata 阶段", d["detail"])
+
+
+class ToolReason(unittest.TestCase):
+    def test_own_cleanup_note_is_not_the_reason(self):
+        # #711：写 IMG 的工具崩了只留调用栈，作业层收尾往同一份日志追加「[s2a] 收掉本阶段工具会话里的残留进程…」，原先摘要的原因就成了这一行。
+        #   期望：跳过 [s2a] 开头的作业层记录；有红行取最后一条红行，没有就取工具自己的最后一行（异常那行）
+        import tempfile
+        from errors import tool_reason
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "img.log"
+            log.write_text("Traceback (most recent call last):\n  File \"pack/img.py\", line 82, in build\n"
+                           "AttributeError: 'os.stat_result' object has no attribute 'st_blocks'\n"
+                           "[s2a] 收掉本阶段工具会话里的残留进程 1 个：dotnet.exe\n", encoding="utf-8")
+            self.assertEqual(tool_reason(log), "AttributeError: 'os.stat_result' object has no attribute 'st_blocks'")
+            log.write_text("【红】写标准 RomFS 段失败：x\nmore\n[s2a] 收掉本阶段工具会话里的残留进程 1 个：dotnet.exe\n", encoding="utf-8")
+            self.assertEqual(tool_reason(log), "【红】写标准 RomFS 段失败：x")
 
 
 class PlayerSummary(unittest.TestCase):
@@ -587,6 +744,22 @@ class PlayerSummary(unittest.TestCase):
 
 
 class RecoveryCoverage(unittest.TestCase):
+    def test_library_busy_stays_short_and_stuck_lock_has_recovery(self):
+        source = RECOVERY["library_busy"]
+        self.assertEqual(source, "等正在用游戏库的那个任务结束（或在任务列表里取消它）再重试；什么都没有改动。")
+        stuck = RECOVERY["library_lock_stuck"]
+        self.assertIn("重新连接或重新挂载", stuck)
+        self.assertIn("不要手动删除锁文件", stuck)
+        translations = json.loads((ROOT / "launchers/macos/adapter/Sources/S2ArmAppleAdapter/Resources/Localizable.json").read_text())
+        self.assertTrue(next(i["en"] for i in translations if i.get("source") == source))
+        self.assertTrue(next(i["en"] for i in translations if i.get("source") == stuck))
+        spec = json.loads((ROOT / "launchers/shared/experience.v1.json").read_text())
+        error = next(i for i in spec["errors"]["items"] if i["code"] == "library_busy")
+        self.assertEqual(error["detail"]["zh-Hans"], "等它结束再试，这次什么都没有改动。")
+        stuck_error = next(i for i in spec["errors"]["items"] if i["code"] == "library_lock_stuck")
+        self.assertEqual(stuck_error["detail"]["zh-Hans"], stuck)
+        self.assertIn("remount", stuck_error["detail"]["en"].lower())
+
     def test_real_lap_names_are_all_mapped_and_unknown_names_fail(self):
         source = (ROOT / "pack/oneclick/oneclick.sh").read_text()
         self.assertEqual(set(oneclick_stages(source)), set(ipa.ONECLICK_PHASES))

@@ -18,6 +18,14 @@ public sealed partial class EnvironmentWindow
 {
     private JsonElement? devCert;          // devCert status 作业的结果：imported / active / cert
     private bool devCertLoading;
+    // 渲染里自动读证书状态：每个游戏库只读一次，没连库不读。读的结果回来要 Render，Render 又会画到这一栏——没连库时作业同步返回 null，
+    //   原先「devCert 还是空、又不在读」就再读一次 → Render → 再读……无限递归栈溢出，引导页（还没建库）点设置键当场闪退。显式刷新（进设置页、导入后）照旧直接调
+    private string? devCertFor;
+    private void EnsureDevCert()
+    {
+        if (libraryId is null || devCertFor == libraryId || devCertLoading) return;
+        devCertFor = libraryId; _ = RefreshDevCertAsync();
+    }
 
     private string S(string id) => T("export.sign." + id);
 
@@ -50,26 +58,30 @@ public sealed partial class EnvironmentWindow
     /// <param name="card">false = 只要内容不包卡片（嵌在别的卡片里时）。</param>
     private Control DevCertRow(string? title = null, string? appleIdTitle = null, bool card = true)
     {
-        if (devCert is null && !devCertLoading) _ = RefreshDevCertAsync();
+        if (devCert is null) EnsureDevCert();
         var st = devCert;
         var imported = st is { } s0 && Flag(s0, "imported");
         var active = st is { } s1 && Flag(s1, "active");
         var panel = new StackPanel { Spacing = 10 };
-        var line = new Grid { ColumnDefinitions = new ColumnDefinitions("*,Auto,Auto"), ColumnSpacing = 8 };
+        var line = new Grid { ColumnDefinitions = new ColumnDefinitions("*,Auto"), ColumnSpacing = 8 };
         var heading = Label(title ?? S("title"), 16); heading.VerticalAlignment = VerticalAlignment.Center;
         line.Children.Add(heading);
         Button Mode(string key, bool on, Action handler, string? text = null)
         {
-            var b = new Button { Content = text ?? S(key), Padding = new Thickness(14, 8), CornerRadius = new CornerRadius(8),
-                Background = on ? Accent : Brush.Parse("#29292D"), Foreground = on ? Canvas : Ink };
+            // 分段选择的一段（11-14 体验梳理，开发甲定）：选中的那段填色，另一段透明；外面一圈底色把两段收成一组，和旁边的动作按钮区分开
+            var b = new Button { Content = text ?? S(key), Padding = new Thickness(14, 7), CornerRadius = new CornerRadius(7),
+                Background = on ? Accent : Brushes.Transparent, Foreground = on ? Canvas : Ink, BorderThickness = new Thickness(0) };
             AutomationId(b, "export.sign." + key);
             b.Click += (_, _) => handler();
             return b;
         }
         var apple = Mode("appleId", !active, () => _ = SetDevCertAsync(false), appleIdTitle);
         var mine = Mode("devcert", active, () => { if (imported) _ = SetDevCertAsync(true); else _ = ImportDevCertAsync(); });
-        Grid.SetColumn(apple, 1); line.Children.Add(apple);
-        Grid.SetColumn(mine, 2); line.Children.Add(mine);
+        var segment = new Border { Background = Brush.Parse("#29292D"), CornerRadius = new CornerRadius(9), Padding = new Thickness(3),
+            VerticalAlignment = VerticalAlignment.Center,
+            Child = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 2, Children = { apple, mine } } };
+        AutomationId(segment, "export.sign.segment");
+        Grid.SetColumn(segment, 1); line.Children.Add(segment);
         panel.Children.Add(line);
         if (active && st is { } s && s.TryGetProperty("cert", out var c) && c.ValueKind == JsonValueKind.Object)
         {
@@ -93,7 +105,7 @@ public sealed partial class EnvironmentWindow
             foreach (var (list, color) in new[] { ("blocking", "#E5675F"), ("warnings", "#E8C65A") })
                 if (c.TryGetProperty(list, out var items) && items.ValueKind == JsonValueKind.Array)
                     foreach (var w in items.EnumerateArray())
-                        panel.Children.Add(new TextBlock { Text = (list == "blocking" ? "✕ " : "⚠ ") + Str(w, "text"), FontSize = 12.5,
+                        panel.Children.Add(new TextBlock { Text = (list == "blocking" ? "✕ " : "⚠ ") + B(Str(w, "text")), FontSize = 12.5,
                             TextWrapping = TextWrapping.Wrap, Foreground = Brush.Parse(color) });
             var actions = new WrapPanel { Orientation = Orientation.Horizontal };
             var replace = new Button { Content = S("replace"), Padding = new Thickness(14, 8), CornerRadius = new CornerRadius(8),

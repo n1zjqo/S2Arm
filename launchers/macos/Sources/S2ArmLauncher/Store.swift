@@ -22,6 +22,7 @@ final class WorkerOutput: @unchecked Sendable {
 @MainActor final class Store: ObservableObject {
     @Published var preferences = Preferences()
     @Published var games: [Game] = []
+    @Published var downstreamPrompt: Game?   // 下游深度方案确认页（DownstreamView.swift）：导出前弹，选完记下再接着导出
     @Published var tasks: [TaskRecord] = []
     @Published var checks: [ToolCheck] = []
     @Published var platformChecks: [String:[ToolCheck]] = [:]
@@ -55,7 +56,7 @@ final class WorkerOutput: @unchecked Sendable {
     @Published var installReadiness: InstallReadiness?
     @Published var installWhenReady = false
     var installCheckStarted: Date?
-    /// 选的游戏库位置在非 APFS 磁盘上：弹框说明并给改用默认位置 / 重选
+    /// 选的游戏库位置在不支持的磁盘格式上：弹框说明并给改用默认位置 / 重选
     @Published var libraryFormatProblem: LibraryFormatProblem?
     /// 导出页同时勾了 iPhone / iPad 和 Mac 的游戏：iPhone 版结束后接着排 Mac 版
     var macAfterIPA: Set<String> = []
@@ -190,7 +191,7 @@ final class WorkerOutput: @unchecked Sendable {
         if let overrideResources { resources = overrideResources }
         else if let r = Bundle.main.resourceURL, Bundle.main.bundleURL.pathExtension == "app" || FileManager.default.fileExists(atPath:r.appendingPathComponent("Jobs/main.py").path) { resources = r }
         else { resources = Store.sourceTree?.appendingPathComponent("launchers/macos") ?? Bundle.main.bundleURL }
-        try? FileManager.default.createDirectory(at:privateRoot,withIntermediateDirectories:true,attributes:[.posixPermissions:0o700])
+        try? FileManager.default.createDirectory(at:privateRoot,withIntermediateDirectories:true)
         if let data = try? Data(contentsOf:privateRoot.appendingPathComponent("preferences.json")), let p = try? JSONDecoder().decode(Preferences.self,from:data) { preferences = p }
         // 旧默认库（私有目录里的「游戏库」）已被作业层同盘改名到 ~/S2Arm（layout.relocate_default）：设置跟着换，别当成库丢了
         let moved = S2ArmPaths.library(privateRoot:privateRoot, saved:preferences.library)
@@ -273,7 +274,6 @@ final class WorkerOutput: @unchecked Sendable {
     @discardableResult func persist(_ data: Data, to url: URL, _ what: String, privateFile: Bool = false) -> Bool {
         do {
             try data.write(to:url,options:.atomic)
-            if privateFile { try FileManager.default.setAttributes([.posixPermissions:0o600],ofItemAtPath:url.path) }
             return true
         } catch {
             self.error="\(what)没能写进磁盘（\(error.localizedDescription)）。这次运行里仍按新的来，下次打开会回到旧值；请检查磁盘空间和权限。"
@@ -283,9 +283,10 @@ final class WorkerOutput: @unchecked Sendable {
     func chooseLibrary() {
         let panel = NSOpenPanel(); panel.title = L("选择游戏库位置：放导出时的工作数据和存档，游戏原件不用挪（首次请选择空文件夹）"); panel.canChooseFiles = false; panel.canChooseDirectories = true; panel.canCreateDirectories = true; panel.prompt = L("选择")
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        // 游戏库（导出时的工作数据）要放 APFS；游戏原件放哪都行、原地只读（11-02 维护者定）。选到 exFAT 等不拦，说明后工作数据放内置盘的默认位置（后端 setup 同一规则兜底）
+        // 游戏库（导出时的工作数据）要放 APFS 或 exFAT；游戏原件放哪都行、原地只读。FAT32 等仍说明后改用默认位置（后端 setup 同一规则兜底）
         let format = Store.volumeFormat(url)
-        if !format.isEmpty, format != "apfs" { libraryFormatProblem = LibraryFormatProblem(path:url.path, format:format); return }
+        let ok = format.isEmpty || format == "apfs" || format == "exfat"
+        if !ok { libraryFormatProblem = LibraryFormatProblem(path:url.path, format:format); return }
         setupLibrary(url)
     }
     /// 改用这台 Mac 上的默认位置（~/S2Arm，在内置盘上）；用户指定过 S2Arm 数据目录时是数据目录下的「游戏库」，不一定在内置盘
@@ -486,8 +487,8 @@ final class WorkerOutput: @unchecked Sendable {
     }
     // 缺省游戏库（维护者 10-23：减少交互，首次打开不再让玩家选库）：~/S2Arm（游戏库结构 P3：访达里看得见；自定义数据目录时仍在数据目录里），设置里可换
     var defaultLibraryURL: URL { S2ArmPaths.defaultLibrary(privateRoot:privateRoot) }
-    /// 任务日志 + 任务记录：库建好了在 <库>/logs（任务记录 logs/jobs/），否则 <私有目录>/logs（S2ArmPaths.logsRoot，同作业层 core.logs_root）
-    var logsRoot: URL { S2ArmPaths.logsRoot(privateRoot:privateRoot, library:preferences.library) }
+    /// 任务日志 + 任务记录：固定 <私有目录>/logs（任务记录 logs/jobs/，剃刀 H6；S2ArmPaths.logsRoot，同作业层 core.logs_root）
+    var logsRoot: URL { S2ArmPaths.logsRoot(privateRoot:privateRoot) }
     var jobsRoot: URL { logsRoot.appendingPathComponent("jobs") }
     func ensureLibrary(_ then: @escaping () -> Void) {
         guard preferences.library.isEmpty else { then(); return }
@@ -635,9 +636,9 @@ final class WorkerOutput: @unchecked Sendable {
             req["libraryId"] = ""
             req["storageLibraryId"] = preferences.libraryId
         }
-        let dir = privateRoot.appendingPathComponent("requests"); try? FileManager.default.createDirectory(at:dir,withIntermediateDirectories:true,attributes:[.posixPermissions:0o700]); let file = dir.appendingPathComponent(id+".json")
+        let dir = privateRoot.appendingPathComponent("requests"); try? FileManager.default.createDirectory(at:dir,withIntermediateDirectories:true); let file = dir.appendingPathComponent(id+".json")
         do {
-            let data = try JSONSerialization.data(withJSONObject:req); try data.write(to:file,options:.atomic); try FileManager.default.setAttributes([.posixPermissions:0o600],ofItemAtPath:file.path)
+            let data = try JSONSerialization.data(withJSONObject:req); try data.write(to:file,options:.atomic)
             let python = try pythonExecutable()
             let isGUI = operation.hasPrefix("platform")
             let entry = try isGUI ? guiJobURL() : jobEngineURL()
@@ -969,7 +970,7 @@ final class WorkerOutput: @unchecked Sendable {
     // 装到 iPhone（10-26 维护者 定：Xcode 做主路、AltStore 备选）：用玩家在 Xcode 登录的 Apple ID 重签自签 IPA、数据线装上、拷资源包并逐文件核对（pack/jobs/install.py）
     func installToPhone(_ game: Game) {
         selection = "tasks"
-        executionTask = worker("install",extra:["gameId":game.id]) { r in
+        executionTask = worker("install",extra:["gameId":game.id].merging(downstreamScheme(game).map { ["scheme":$0] } ?? [:]) { a, _ in a }) { r in
             let device = (r["device"] as? String).map { "「\($0)」" } ?? ""   // 设备名夹在句中：按片段先翻译再拼（提示显示时 L() 整句查不到）
             // 资源传完但没拉起 App 解开（作业结果 unpackPending，11-09 #336）：不说「已装到 iPhone」，说还差的一步和原因 / 办法（后端原话）
             let done = (r["unpackPending"] as? String) ?? L("已装到 iPhone") + device + Store.packPushedClause(r["packFiles"] as? Int) + L("。打开游戏：第一次会先导入游戏资源（几分钟），保持在前台、别锁屏，导入完会自动进入游戏。免费 Apple ID 签的 App 7 天过期，到时连上再点一次「装到 iPhone」。")
@@ -979,6 +980,7 @@ final class WorkerOutput: @unchecked Sendable {
     /// 出 iPhone 包的请求：目标设备可有可无（有才带 target）
     func ipaRequest(_ game: Game, target: IPhoneTarget?, spaceOverride: Bool = false) -> [String:Any] {
         var r: [String:Any] = ["gameId":game.id]
+        if let s = downstreamScheme(game) { r["scheme"] = s }   // 玩家在确认页选了下游深度方案
         if spaceOverride { r["spaceOverride"] = true }   // 空间预检拦下后玩家点了「仍然继续」
         if let t = target { r["target"] = t.request }
         return r

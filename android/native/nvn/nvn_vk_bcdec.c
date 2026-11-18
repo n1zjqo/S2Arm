@@ -55,8 +55,8 @@ struct nvn_vk_bcdec {
     VkPipeline pipe[N_VARIANTS];
     // 提交未证明完成的保留资源（与 texcache 账本同级：等 fence 后再放）。
     struct retained { VkFence fence; VkCommandBuffer cmd; VkBuffer buf; VkDeviceMemory mem;
-                      VkImage img; VkDeviceMemory img_mem; VkImageView view; VkDescriptorSet ds; } kept[8];
-    int nkept;
+                      VkImage img; VkDeviceMemory img_mem; VkImageView view, out_view; VkDescriptorSet ds;
+                      struct retained *next; } *kept;
 };
 
 static const uint32_t *SPV[4];
@@ -145,19 +145,37 @@ fail:
     return -1;
 }
 
-void nvn_vk_bcdec_destroy(struct s2a_vk_device *d, struct nvn_vk_bcdec *bc) {
-    if (!bc) return;
-    for (int i = 0; i < bc->nkept; i++) {
-        struct retained *e = &bc->kept[i];
-        if (e->fence) vkWaitForFences(d->device, 1, &e->fence, VK_TRUE, 1000000000ull);
+int nvn_vk_bcdec_wait(struct s2a_vk_device *d, struct nvn_vk_bcdec *bc, uint64_t timeout_ns) {
+    if (!bc) return 0;
+    uint32_t n = 0;
+    for (struct retained *e = bc->kept; e; e = e->next) n++;
+    if (n) {
+        VkFence *fences = malloc((size_t)n * sizeof *fences);
+        if (!fences) return -1;
+        uint32_t i = 0; for (struct retained *e = bc->kept; e; e = e->next) fences[i++] = e->fence;
+        VkResult result = s2a_vk_wait_fences(d->device, n, fences, timeout_ns);
+        free(fences);
+        if (result != VK_SUCCESS) return -1;
+    }
+    while (bc->kept) {
+        struct retained *e = bc->kept;
+        bc->kept = e->next;
         if (e->fence) vkDestroyFence(d->device, e->fence, NULL);
         if (e->cmd) vkFreeCommandBuffers(d->device, d->command_pool, 1, &e->cmd);
+        if (e->ds) vkFreeDescriptorSets(d->device, bc->pool, 1, &e->ds);
         if (e->buf) vkDestroyBuffer(d->device, e->buf, NULL);
         if (e->mem) vkFreeMemory(d->device, e->mem, NULL);
+        if (e->out_view) vkDestroyImageView(d->device, e->out_view, NULL);
         if (e->view) vkDestroyImageView(d->device, e->view, NULL);
         if (e->img) vkDestroyImage(d->device, e->img, NULL);
         if (e->img_mem) vkFreeMemory(d->device, e->img_mem, NULL);
+        free(e);
     }
+    return 0;
+}
+
+void nvn_vk_bcdec_destroy(struct s2a_vk_device *d, struct nvn_vk_bcdec *bc) {
+    if (!bc || nvn_vk_bcdec_wait(d, bc, 1000000000ull) != 0) return;
     for (int i = 0; i < N_VARIANTS; i++) if (bc->pipe[i]) vkDestroyPipeline(d->device, bc->pipe[i], NULL);
     for (int i = 0; i < 4; i++) if (bc->mod[i]) vkDestroyShaderModule(d->device, bc->mod[i], NULL);
     if (bc->pl) vkDestroyPipelineLayout(d->device, bc->pl, NULL);
@@ -180,6 +198,9 @@ int nvn_vk_bcdec_decode(struct nvn_vk_bcdec *bc, struct s2a_vk_device *d,
     if (bytes < nblocks * (size_t)bb) {
         snprintf(why, why_size, "bcdec: %s input %zu < %zu blocks", family, bytes, nblocks * (size_t)bb); return -1;
     }
+    // 必须在提交前保留账本节点：提交后不能因分配失败丢失在途资源。
+    struct retained *keep = calloc(1, sizeof *keep);
+    if (!keep) { snprintf(why, why_size, "bcdec: retention allocation failed"); return -1; }
 
     // 临时资源一次建齐，任一失败跳 cleanup 全回收（未提交语义）。
     VkBuffer buf = VK_NULL_HANDLE; VkDeviceMemory mem = VK_NULL_HANDLE;
@@ -285,21 +306,17 @@ int nvn_vk_bcdec_decode(struct nvn_vk_bcdec *bc, struct s2a_vk_device *d,
             snprintf(fail_why, sizeof fail_why, "bcdec: %s dispatch submit failed", family); goto cleanup;
         }
         submitted = 1;
-        if (vkWaitForFences(d->device, 1, &fence, VK_TRUE, 5000000000ull) != VK_SUCCESS) {
+        if (s2a_vk_wait_fences(d->device, 1, &fence, 5000000000ull) != VK_SUCCESS) {
             // 提交成功但没有完成证明：转入保留账本，资源不得释放/复用。
-            if (bc->nkept < 8) {
-                struct retained *e = &bc->kept[bc->nkept++];
-                e->fence = fence; e->cmd = cmd; e->buf = buf; e->mem = mem;
-                e->img = in; e->img_mem = in_mem; e->view = in_view; e->ds = ds;
-                vkDestroyImageView(d->device, out_view, NULL);
-                snprintf(why, why_size, "bcdec: %s dispatch completion unproven", family);
-                return -2;
-            }
-            snprintf(why, why_size, "bcdec: %s dispatch completion unproven (ledger full)", family);
+            keep->fence = fence; keep->cmd = cmd; keep->buf = buf; keep->mem = mem;
+            keep->img = in; keep->img_mem = in_mem; keep->view = in_view; keep->out_view = out_view; keep->ds = ds;
+            keep->next = bc->kept; bc->kept = keep;
+            snprintf(why, why_size, "bcdec: %s dispatch completion unproven", family);
             return -2;
         }
     }
 cleanup:
+    free(keep);
     if (!submitted) {
         if (cmd) vkFreeCommandBuffers(d->device, d->command_pool, 1, &cmd);
         if (fence) vkDestroyFence(d->device, fence, NULL);
@@ -324,4 +341,70 @@ cleanup:
     vkDestroyBuffer(d->device, buf, NULL);
     vkFreeMemory(d->device, mem, NULL);
     return 0;
+}
+
+void nvn_vk_bcdec_rec_free(struct s2a_vk_device *d, struct nvn_vk_bcdec_rec *rec) {
+    if (!rec) return;
+    if (rec->pool) vkDestroyDescriptorPool(d->device, rec->pool, NULL);   // 连带释放其中的描述符集
+    if (rec->out_view) vkDestroyImageView(d->device, rec->out_view, NULL);
+    if (rec->in_view) vkDestroyImageView(d->device, rec->in_view, NULL);
+    if (rec->in) vkDestroyImage(d->device, rec->in, NULL);
+    if (rec->in_mem) vkFreeMemory(d->device, rec->in_mem, NULL);
+    memset(rec, 0, sizeof *rec);
+}
+
+// 描述符池每次一个：段完成前集不能回收，模块共用的 8 个集的池会被同一段里的多次拷贝用光。
+int nvn_vk_bcdec_prepare(struct nvn_vk_bcdec *bc, struct s2a_vk_device *d, VkImage dst, uint32_t nvn_format,
+                         uint32_t w, uint32_t h, uint32_t mip, uint32_t layer, struct nvn_vk_bcdec_rec *rec, char *why, size_t why_size) {
+    memset(rec, 0, sizeof *rec);
+    VkFormat view_fmt; const char *family; int bb;
+    if (!bc || !nvn_vk_bcdec_route(nvn_format, &view_fmt, NULL, NULL, &family, &bb)) {
+        snprintf(why, why_size, "bcdec: no route for nvn format 0x%02x", nvn_format); return -1;
+    }
+    if (!w || !h) { snprintf(why, why_size, "bcdec: %s prepare: empty extent", family); return -1; }
+    int vi = variant_index(&ROUTES[nvn_format].v);
+    uint32_t bw = (w + 3) / 4, bh = (h + 3) / 4;
+    VkFormat in_fmt = bb == 8 ? VK_FORMAT_R32G32_UINT : VK_FORMAT_R32G32B32A32_UINT;
+
+    VkImageCreateInfo ici = { .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+    ici.imageType = VK_IMAGE_TYPE_2D; ici.format = in_fmt; ici.extent = (VkExtent3D){bw, bh, 1};
+    ici.mipLevels = 1; ici.arrayLayers = 1; ici.samples = VK_SAMPLE_COUNT_1_BIT; ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    if (vkCreateImage(d->device, &ici, NULL, &rec->in) != VK_SUCCESS) goto fail;
+    VkMemoryRequirements imr; vkGetImageMemoryRequirements(d->device, rec->in, &imr);
+    VkMemoryAllocateInfo imai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+    imai.allocationSize = imr.size;
+    imai.memoryTypeIndex = s2a_vk_memory_type(d, imr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, NULL);
+    if (imai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(d->device, &imai, NULL, &rec->in_mem) != VK_SUCCESS ||
+        vkBindImageMemory(d->device, rec->in, rec->in_mem, 0) != VK_SUCCESS) goto fail;
+    VkImageViewCreateInfo vci = { .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+    vci.image = rec->in; vci.viewType = VK_IMAGE_VIEW_TYPE_2D; vci.format = in_fmt;
+    vci.subresourceRange = (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    if (vkCreateImageView(d->device, &vci, NULL, &rec->in_view) != VK_SUCCESS) goto fail;
+    VkImageViewCreateInfo ovci = { .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+    ovci.image = dst; ovci.viewType = VK_IMAGE_VIEW_TYPE_2D; ovci.format = view_fmt;
+    ovci.subresourceRange = (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, mip, 1, layer, 1};
+    if (vkCreateImageView(d->device, &ovci, NULL, &rec->out_view) != VK_SUCCESS) goto fail;
+    VkDescriptorPoolSize ps[2] = { { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1 }, { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1 } };
+    VkDescriptorPoolCreateInfo dpi = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+    dpi.maxSets = 1; dpi.poolSizeCount = 2; dpi.pPoolSizes = ps;
+    if (vkCreateDescriptorPool(d->device, &dpi, NULL, &rec->pool) != VK_SUCCESS) goto fail;
+    VkDescriptorSetAllocateInfo dai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+    dai.descriptorPool = rec->pool; dai.descriptorSetCount = 1; dai.pSetLayouts = &bc->dsl;
+    if (vkAllocateDescriptorSets(d->device, &dai, &rec->ds) != VK_SUCCESS) goto fail;
+    VkDescriptorImageInfo oi = { VK_NULL_HANDLE, rec->out_view, VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo ii = { VK_NULL_HANDLE, rec->in_view, VK_IMAGE_LAYOUT_GENERAL };
+    VkWriteDescriptorSet wr[2] = {0};
+    wr[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; wr[0].dstSet = rec->ds; wr[0].dstBinding = 0;
+    wr[0].descriptorCount = 1; wr[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; wr[0].pImageInfo = &oi;
+    wr[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; wr[1].dstSet = rec->ds; wr[1].dstBinding = 1;
+    wr[1].descriptorCount = 1; wr[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE; wr[1].pImageInfo = &ii;
+    vkUpdateDescriptorSets(d->device, 2, wr, 0, NULL);
+
+    rec->pipe = bc->pipe[vi]; rec->pl = bc->pl; rec->bw = bw; rec->bh = bh;
+    return 0;
+fail:
+    snprintf(why, why_size, "bcdec: %s prepare resource setup failed", family);
+    nvn_vk_bcdec_rec_free(d, rec);
+    return -1;
 }

@@ -12,7 +12,9 @@
 //   ⑧ 程序没有网格着色器：跳过、报红 1 行（不当普通绘制画）
 //   ⑨ 着色器映射表的阶段名（翻译侧 shader_map.tsv 第 3 列写 task / mesh）经 prog_get 的 stage_of 落到宿主阶段 3 / 4（nvn2_stage_host：NVN 阶段 6 / 7 放曲面两阶段的位置），
 //      shader_get 按该阶段载入的是 object / mesh 着色器（11-06 时之笛日志每局 20–30 行「shader … (task|mesh) failed to load」：stage_of 不认这两个名字回 -1，库里明明有）
+//   ⑫ #1208 GPU 挂死隔离收网格管线：第一次画出进本提交嫌疑；隔离后同一对跳过、报红、写进隔离表
 //   ⑩ GPU 没有对象 / 网格管线（g_mesh_ok = 0，MTLGPUFamilyMetal3 以下）：跳过并计数、报红 1 行、不画（不当普通绘制画）
+// 校验层（mk 另跑 MTL_DEBUG_LAYER=1 两套后端）：全部项照过、不中止。负对照（11-11 手工）：改前 pso_desc 给网格管线设 vertexFunction = 网格函数，校验层两套后端都 abort rc=134（setVertexFunction 断言）
 // 负对照（11-05 手工做，见坑记录）：把 mtk_encode 写进 29 号槽的起始号换成 0 → ④ 0x07、⑤ 0x0f、⑥ 0x07，三项红
 #include "../gfx/nvn/nvn_mtl.m"
 
@@ -74,6 +76,9 @@ int main(void) {
     @autoreleasepool {
         const char *libdir = getenv("T_MESH_LIB"); REQUIRE(libdir);   // mk 编好的 <键>_b.metallib 所在目录；json 由本测写
         setenv("DM_PRESENT_LINK", "0", 1);
+        // 本测自己的目录：pso_user.tsv 旁边还有 GPU 挂死隔离表 gpu_quarantine.tsv（⑫ 写它；放共用 /tmp 会被下一局 / 别的单测读到）
+        char pdir[] = "/tmp/t_nvn_mesh_XXXXXX"; REQUIRE(mkdtemp(pdir)); char pso_user[sizeof pdir + 16]; snprintf(pso_user, sizeof pso_user, "%s/pso_user.tsv", pdir);
+        { int pfd = open(pso_user, O_CREAT | O_WRONLY, 0644); REQUIRE(pfd >= 0); close(pfd); } setenv("DM_PSO_USER", pso_user, 1);   // ④c：本测记下的网格管线行
         mtl_init(); g_msl_dir = @(libdir);
         printf("后端 Metal %d，录制 %s\n", g_m3 ? 3 : 4, rec_on() ? "开" : "关");
         NSString *dir = @(libdir);
@@ -121,7 +126,10 @@ int main(void) {
         p_draw d4 = {.prim = DM_PRIM_MESH_TASKS, .first = 2, .count = 3, .instances = 1};
         o = capture(^{ mesh_draw(&d4, &waited); });
         int cols = frame_columns();
-        VERIFY(waited && red_lines(o, nil) == 0, "④ 首笔管线后台建：本笔先跳过并计数、不报红（跳过过 %d；stderr：%s）", waited, o.UTF8String);
+        // 11-13 0400486024DEC000 开局发白：网格管线没编好时一律跳过，不按 skip_safe 的规则。期望（按规则手写）：这是目标第一次被画（近两帧没画过），这笔不能跳过 →
+        //   在每帧预算（缺省 250 ms）内等后台那条编好、本笔照画，日志写明原因与「ready」；反证：修前同一处先跳过（waited = 1）、不打这一行
+        VERIFY(!waited && [o containsString:@"waited for its background pipeline"] && [o containsString:@"(ready)"] && [o containsString:@"a target not drawn in the last two frames"] && red_lines(o, nil) == 0,
+               "④ 首笔管线、目标近两帧没画过：不跳过，等后台编好照画、写明原因、不报红（跳过过 %d；stderr：%s）", waited, o.UTF8String);
         VERIFY(cols == 0x1c && g_mtk_n == n0 + 1, "④ 无任务 first 2 count 3：列 2、3、4 白（列掩码 %#x，期望 0x1c；画出 +%llu）", cols, (unsigned long long)(g_mtk_n - n0));
 
         // ⑤
@@ -152,6 +160,110 @@ int main(void) {
         cols = frame_columns();
         VERIFY(cols == 0 && g_mtk_ind_n == i0 + 1 && red_lines(o, nil) == 0, "⑦ 间接零工作量：GPU 写 {0, 1} → 一列不画（列掩码 %#x，期望 0）、照记一笔、不报红（stderr：%s）", cols, o.UTF8String);
 
+        // ④b 目标已连续几帧画过（④–⑦）、这帧开头清过：丢一笔最多影响一帧，新管线照旧后台编、本笔先跳过。期望：跳过过、不打「built on the submit thread」、
+        //   等编好再画出列 2、3、4。换一个片元着色器（新键）让管线是第一次遇到
+        { NvShader *fs2 = [NvShader new]; fs2->stage = 1; strlcpy(fs2->key, "eeeeeeeeeeeeeeee_b", sizeof fs2->key); fs2->ventry = @"main0";
+          NSError *e = nil; id<MTLLibrary> l = [g_dev newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\nfragment float4 main0() { return float4(1, 1, 1, 0.5); }\n" options:nil error:&e]; REQUIRE(l); fs2->fn = [l newFunctionWithName:@"main0"]; REQUIRE(fs2->fn);
+          NvProg *direct2 = [NvProg new]; direct2->sh[1] = fs2; direct2->sh[4] = md;
+          static prog_t gp4b; memset(&gp4b, 0, sizeof gp4b); gp4b.magic = MAGIC('P', 'R', 'O', 'G'); gp4b.serial = nvn_new_serial(); serial_put(gp4b.serial, direct2);
+          frame_begin(); S.prog = &gp4b; __block int w4b = 0;
+          o = capture(^{ mesh_draw(&d4, &w4b); });
+          cols = frame_columns();
+          VERIFY(w4b && ![o containsString:@"built on the submit thread"] && red_lines(o, nil) == 0 && cols == 0x1c,
+                 "④b 目标稳定且这帧清过：新网格管线后台编、本笔先跳过，编好后画出列 2、3、4（跳过过 %d，列掩码 %#x；stderr：%s）", w4b, cols, o.UTF8String); }
+
+        // ④c 网格管线进本机记录（pso_user.tsv 的 M 行）→ 下一局预热按这行拼回绘制查表用的键、把管线交给表 → 首笔网格绘制直接画（11-13 开局发白根修②）。
+        //   期望（按格式手写）：④ 当场编、⑤ 带任务、④b 后台编的三条各记一行 M（⑥ ⑦ 与 ④ 同一条），无任务的第 2 列是「-」、⑤ 那行是任务键 1111…，第 3 列补齐掩码 0；用 ④ 那行（片元 ffff…）解析出的键与
+        //   绘制时的键逐字节相同（表里查得到 ④ 的管线）；把表里这条删掉（新开局）后经交接函数放回，同一笔绘制不跳过、不当场编、画出列 2、3、4
+        { NSString *txt = [NSString stringWithContentsOfFile:@(pso_user) encoding:NSUTF8StringEncoding error:nil]; NSMutableArray<NSString *> *mrows = [NSMutableArray array];
+          for (NSString *l in [txt componentsSeparatedByString:@"\n"]) if ([l hasPrefix:@"M\t"]) [mrows addObject:l];
+          NSString *row4 = nil, *row5 = nil;
+          for (NSString *l in mrows) { NSArray *c = [l componentsSeparatedByString:@"\t"]; pso_skey sk; if (c.count != 4 || pso_skey_parse([c[1] UTF8String], &sk) || strcmp(sk.fs, "ffffffffffffffff_b")) continue;
+              if (!strcmp(sk.vs, "3333333333333333_b")) row4 = l; else if (!strcmp(sk.vs, "2222222222222222_b")) row5 = l; }
+          VERIFY(mrows.count == 3 && row4 && [[row4 componentsSeparatedByString:@"\t"][2] isEqual:@"-"] && [[row4 componentsSeparatedByString:@"\t"][3] isEqual:@"0"] &&
+                 row5 && [[row5 componentsSeparatedByString:@"\t"][2] isEqual:@"1111111111111111_b"],
+                 "④c ④ / ⑤ / ④b 的网格管线各记一行 M（实得 %lu 行），无任务记「-」、⑤ 记任务键、补齐掩码 0（④ 那行第 2、3 列：%s）", (unsigned long)mrows.count,
+                 row4 ? [[row4 componentsSeparatedByString:@"\t"] subarrayWithRange:NSMakeRange(2, 2)].description.UTF8String : "无");
+          REQUIRE(row4);
+          if (!g_shmap) g_shmap = [NSMutableDictionary dictionary];   // 本测没有映射表：把夹具的键登记成本款的（warm_stale 才不当别的游戏版本丢掉）
+          for (NSString *k in @[@"1111111111111111", @"2222222222222222", @"3333333333333333", @"ffffffffffffffff", @"eeeeeeeeeeeeeeee"]) g_shmap[k] = @"x";
+          long lines = 0; NSArray<WarmTask *> *tasks = warm_parse(@[@(pso_user)], &lines); WarmTask *t4 = nil;
+          for (WarmTask *t in tasks) if (t->kind == 4 && [t->fkey isEqual:@"ffffffffffffffff_b"] && [t->vkey isEqual:@"3333333333333333_b"]) t4 = t;
+          VERIFY(t4 && [t4->vkey isEqual:@"3333333333333333_b"] && !t4->tkey.length && t4->pad == 0, "④c 预热解析 M 行：网格键 3333…、片元键 ffff…、无任务、掩码 0（实得 %s / %s / %s / %#x）",
+                 t4 ? t4->vkey.UTF8String : "-", t4 ? t4->fkey.UTF8String : "-", t4 ? t4->tkey.UTF8String : "-", t4 ? t4->pad : 0);
+          REQUIRE(t4);
+          // ④f D-75KF：同一对（④ 那行的 pso_skey、无任务）既有补齐行（掩码 20）又有不补齐行（掩码 0）→ 预热丢掉不补齐那行（它被拒过）；⑤ 那行（有任务键）没有补齐行、照留。
+          //   期望（按规则手写）：kind 4 里 3333…/ffff… 无任务的只剩掩码 0x20 一条；⑤ 那条在
+          { NSString *rest = [[row4 componentsSeparatedByString:@"\t"][1] copy], *pp = [NSTemporaryDirectory() stringByAppendingPathComponent:@"t_nvn_mesh_pad_rows.tsv"];
+            NSString *txt = [NSString stringWithFormat:@"%@\nM\t%@\t-\t20\n%@\n", row4, rest, row5];
+            [txt writeToFile:pp atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            long ln = 0; NSArray<WarmTask *> *tp = warm_parse(@[pp], &ln); int unpadded = 0, padded = 0, with_task = 0;
+            for (WarmTask *t in tp) if (t->kind == 4 && [t->fkey isEqual:@"ffffffffffffffff_b"]) {
+                if ([t->vkey isEqual:@"3333333333333333_b"] && !t->tkey.length) { if (t->pad) padded += t->pad == 0x20; else unpadded++; }
+                else if (t->tkey.length) with_task++; }
+            VERIFY(unpadded == 0 && padded == 1 && with_task == 1 && ln == 2, "④f 同对有补齐行时预热丢掉不补齐那行（实得 不补齐 %d / 补齐 %d / 带任务 %d / 行数 %ld，期望 0 / 1 / 1 / 2）", unpadded, padded, with_task, ln);
+            [NSFileManager.defaultManager removeItemAtPath:pp error:nil]; }
+          pso_skey sk; [t4->rs[0] getBytes:&sk length:sizeof sk]; mtk_key mk; mtk_warm_key(&sk, NULL, md, fs, 0, &mk);
+          os_unfair_lock_lock(&g_pso_mtk_lock); id had = hm_get_id(&g_pso_mtk, &mk); os_unfair_lock_unlock(&g_pso_mtk_lock);
+          VERIFY(had && had != NSNull.null && had != g_pso_mtk_building, "④c 按 M 行拼回的键在网格管线表里查得到 ④ 编好的那条（%p）", (__bridge void *)had);
+          REQUIRE(had);
+          os_unfair_lock_lock(&g_pso_mtk_lock); hm_del_id(&g_pso_mtk, &mk); os_unfair_lock_unlock(&g_pso_mtk_lock);
+          uint64_t wc0 = g_mtk_warm_claimed; mtk_warm_claim([NSData dataWithBytes:&mk length:sizeof mk], had);
+          VERIFY(g_mtk_warm_claimed == wc0 + 1, "④c 交接：表里没有这条时，预热交来的管线放进表（交接 +%llu）", (unsigned long long)(g_mtk_warm_claimed - wc0));
+          frame_begin(); S.prog = &gp[0]; uint64_t sn0 = g_mtk_waits; __block int w4c = 0;
+          o = capture(^{ mesh_draw(&d4, &w4c); });
+          cols = frame_columns();
+          VERIFY(!w4c && g_mtk_waits == sn0 && cols == 0x1c && red_lines(o, nil) == 0,
+                 "④c 预热交来的管线：同一笔不跳过、不用等、画出列 2、3、4（跳过过 %d，等待 +%llu，列掩码 %#x；stderr：%s）", w4c, (unsigned long long)(g_mtk_waits - sn0), cols, o.UTF8String); }
+        unlink(pso_user);
+
+        // ④d（D-84J2 起）丢不起的那笔等到管线编好，只受「编译服务卡死」封顶（DM_NVN_PSO_UNSAFE_WAIT_MS，这里设 300 ms）：编译被挂住时等满封顶才跳过、打红行并写明是封顶。
+        //   新目标（近两帧没画过）+ 新片元（管线没编过）。④e：编译在等待中途放开 → 等到编好就画出，不计跳过、没有红行
+        { tex_t rt2; memset(&rt2, 0, sizeof rt2); rt2.magic = MAGIC('T', 'E', 'X', 0); rt2.serial = nvn_new_serial(); rt2.d = g_rt.d; nvn_tex_layout(&rt2.d, &rt2.L); nvn_be_tex_init(&rt2); REQUIRE(tex_mtl(&rt2));
+          NvShader *fs3 = [NvShader new]; fs3->stage = 1; strlcpy(fs3->key, "dddddddddddddddd_b", sizeof fs3->key); fs3->ventry = @"main0";
+          NSError *e = nil; id<MTLLibrary> l = [g_dev newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\nfragment float4 main0() { return float4(1, 1, 1, 0.25); }\n" options:nil error:&e]; REQUIRE(l); fs3->fn = [l newFunctionWithName:@"main0"]; REQUIRE(fs3->fn);
+          NvProg *direct3 = [NvProg new]; direct3->sh[1] = fs3; direct3->sh[4] = md;
+          static prog_t gp4d; memset(&gp4d, 0, sizeof gp4d); gp4d.magic = MAGIC('P', 'R', 'O', 'G'); gp4d.serial = nvn_new_serial(); serial_put(gp4d.serial, direct3);
+          nvn_be_set_frame(++g_frame); nvn_be_sub_begin(); state_reset();
+          const struct { op_hdr set; p_set_rt_c rt; const tex_t *color0; uint8_t snap[sizeof(tex_t)]; op_hdr end; } c = {
+              .set = {OP_SET_RT, sizeof(op_hdr) + sizeof(p_set_rt_c) + 8 + sizeof(tex_t)}, .rt = {.n = 1, .cmask = 1}, .color0 = &rt2, .end = {OP_END, sizeof(op_hdr)} };
+          nvn_be_exec((const uint8_t *)&c);
+          // 后台编译先挂住（占满后台并发名额 g_mtk_sem）：这笔管线在检查时一定还没编好，期望不靠编译快慢。
+          //   原先不挂：门禁机编得快（0.1 ms 编好），检查时已能画、没走「跳过」，超预算 +0 / 跳过 +0（main c3708ffdb 已知红）
+          REQUIRE(g_mtk_sem); int held = mtk_width(); for (int i = 0; i < held; i++) dispatch_semaphore_wait(g_mtk_sem, DISPATCH_TIME_FOREVER);
+          int b0 = g_mtk_budget, u0 = g_pso_unsafe_ms; g_mtk_budget = 0; g_pso_unsafe_ms = 300; S.prog = &gp4d; uint64_t ov0 = g_mtk_wait_over, w0 = g_mtk_wait, mx0 = g_mtk_wait_max;
+          uint64_t t4d = bp_now(); o = capture(^{ draw(&d4, NULL); }); double ms4d = (bp_now() - t4d) / 1e6;
+          g_mtk_budget = b0; g_pso_unsafe_ms = u0; for (int i = 0; i < held; i++) dispatch_semaphore_signal(g_mtk_sem);
+          dispatch_group_wait(g_mtk_group, DISPATCH_TIME_FOREVER);
+          rp_flush(); uint64_t fence = nvn_be_sub_commit(); REQUIRE(nvn_be_wait(fence, 10000000000ull));
+          (void)mx0;
+          VERIFY(g_mtk_wait_over == ov0 + 1 && g_mtk_wait == w0 + 1 && ms4d >= 300 && [o containsString:@"stuck-compiler cap DM_NVN_PSO_UNSAFE_WAIT_MS 300 ms"] && [o containsString:@"not ready: skipped this frame"] && red_lines(o, nil) == 1,
+                 "④d 编译挂住：丢不起的那笔等满封顶 300 ms 才跳过、计数、打一条红行写明封顶（等了 %.0f ms，超时 +%llu，跳过 +%llu；stderr：%s）", ms4d, (unsigned long long)(g_mtk_wait_over - ov0), (unsigned long long)(g_mtk_wait - w0), o.UTF8String);
+          // 这笔从没画出来过，它的管线在请求编译时就进了本机记录（M 行，片元键 dddd…）。反证：只在第一次画出时记，这里就没有
+          int rec4d = 0; pso_user_seen_load();
+          for (NSString *l in g_pso_user_seen) { if (![l hasPrefix:@"M\t"]) continue; pso_skey sk; NSArray *c = [l componentsSeparatedByString:@"\t"];
+              if (c.count >= 2 && !pso_skey_parse([c[1] UTF8String], &sk) && !strcmp(sk.fs, "dddddddddddddddd_b")) rec4d++; }
+          VERIFY(rec4d == 1, "④d 没画出来过的网格管线在请求编译时就记了一行 M（实得 %d 行）", rec4d); }
+        // ④e 同样丢不起的一笔（又一张新目标 + 又一个新片元），编译挂住约 100 ms 后放开：这笔等到管线编好就画出——不跳过、不计超时、没有红行，等待 ≥ 挂住的时长
+        { tex_t rt3; memset(&rt3, 0, sizeof rt3); rt3.magic = MAGIC('T', 'E', 'X', 0); rt3.serial = nvn_new_serial(); rt3.d = g_rt.d; nvn_tex_layout(&rt3.d, &rt3.L); nvn_be_tex_init(&rt3); REQUIRE(tex_mtl(&rt3));
+          NvShader *fs4 = [NvShader new]; fs4->stage = 1; strlcpy(fs4->key, "eeeeeeeeeeeeeeee_b", sizeof fs4->key); fs4->ventry = @"main0";
+          NSError *e = nil; id<MTLLibrary> l = [g_dev newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\nfragment float4 main0() { return float4(1, 1, 1, 0.5); }\n" options:nil error:&e]; REQUIRE(l); fs4->fn = [l newFunctionWithName:@"main0"]; REQUIRE(fs4->fn);
+          NvProg *direct4 = [NvProg new]; direct4->sh[1] = fs4; direct4->sh[4] = md;
+          static prog_t gp4e; memset(&gp4e, 0, sizeof gp4e); gp4e.magic = MAGIC('P', 'R', 'O', 'G'); gp4e.serial = nvn_new_serial(); serial_put(gp4e.serial, direct4);
+          nvn_be_set_frame(++g_frame); nvn_be_sub_begin(); state_reset();
+          const struct { op_hdr set; p_set_rt_c rt; const tex_t *color0; uint8_t snap[sizeof(tex_t)]; op_hdr end; } c = {
+              .set = {OP_SET_RT, sizeof(op_hdr) + sizeof(p_set_rt_c) + 8 + sizeof(tex_t)}, .rt = {.n = 1, .cmask = 1}, .color0 = &rt3, .end = {OP_END, sizeof(op_hdr)} };
+          nvn_be_exec((const uint8_t *)&c);
+          int held = mtk_width(); for (int i = 0; i < held; i++) dispatch_semaphore_wait(g_mtk_sem, DISPATCH_TIME_FOREVER);
+          dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC), dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ for (int i = 0; i < held; i++) dispatch_semaphore_signal(g_mtk_sem); });
+          int b0 = g_mtk_budget, u0 = g_pso_unsafe_ms; g_mtk_budget = 0; g_pso_unsafe_ms = 10000; S.prog = &gp4e; uint64_t ov0 = g_mtk_wait_over, w0 = g_mtk_wait, n0 = g_mtk_n;
+          uint64_t t4e = bp_now(); NSString *o4 = capture(^{ draw(&d4, NULL); }); double ms4e = (bp_now() - t4e) / 1e6;
+          g_mtk_budget = b0; g_pso_unsafe_ms = u0;
+          dispatch_group_wait(g_mtk_group, DISPATCH_TIME_FOREVER);
+          rp_flush(); uint64_t fence = nvn_be_sub_commit(); REQUIRE(nvn_be_wait(fence, 10000000000ull));
+          VERIFY(g_mtk_wait_over == ov0 && g_mtk_wait == w0 && g_mtk_n == n0 + 1 && ms4e >= 100 && ms4e < 10000 && red_lines(o4, nil) == 0,
+                 "④e 编译 100 ms 后放开：丢不起的那笔等到编好就画出（等了 %.0f ms，画出 +%llu，跳过 +%llu，超时 +%llu；stderr：%s）", ms4e, (unsigned long long)(g_mtk_n - n0), (unsigned long long)(g_mtk_wait - w0), (unsigned long long)(g_mtk_wait_over - ov0), o4.UTF8String); }
+
         // ⑧
         frame_begin(); S.prog = &gp[2]; uint64_t s0 = g_mtk_skip;
         p_draw d8 = {.prim = DM_PRIM_MESH_TASKS, .first = 0, .count = 4, .instances = 1};
@@ -174,6 +286,31 @@ int main(void) {
         cols = frame_columns();
         VERIFY(cols == 0 && g_mtk_skip == s0 + 2 && g_mtk_n == n0 && red_lines(o, @"no object / mesh pipelines") == 1,
                "⑩ GPU 无网格管线：两笔都跳过（+%llu）、报红 1 行、不画（列掩码 %#x；stderr：%s）", (unsigned long long)(g_mtk_skip - s0), cols, o.UTF8String);
+
+        // ⑫ #1208 GPU 挂死隔离收网格管线：一条网格管线（网格 3333… + 新片元 cccc…）第一次画出 → 进本提交的嫌疑（quar_take 里有「3333333333333333\tcccccccccccccccc」，
+        //   格式同普通管线的 quar_name：两键各前 16 字）；这批嫌疑报错隔离后，同一对的网格绘制跳过、不画、报红 1 行点名隔离，并写进隔离表（以后的局也跳过）。
+        //   反证：改前 mtk_pso 不调 quar_built / quar_has —— 嫌疑里没有它（GPU 在这次提交挂死时什么都不隔离，下一局挂在同一处），隔离后照画列 0..3
+        { NvShader *fs5 = [NvShader new]; fs5->stage = 1; strlcpy(fs5->key, "cccccccccccccccc_b", sizeof fs5->key); fs5->ventry = @"main0";
+          NSError *e = nil; id<MTLLibrary> l = [g_dev newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\nfragment float4 main0() { return float4(1); }\n" options:nil error:&e]; REQUIRE(l); fs5->fn = [l newFunctionWithName:@"main0"]; REQUIRE(fs5->fn);
+          NvProg *direct5 = [NvProg new]; direct5->sh[1] = fs5; direct5->sh[4] = md;
+          static prog_t gp12; memset(&gp12, 0, sizeof gp12); gp12.magic = MAGIC('P', 'R', 'O', 'G'); gp12.serial = nvn_new_serial(); serial_put(gp12.serial, direct5);
+          NSString *pair = @"3333333333333333\tcccccccccccccccc";
+          frame_begin(); (void)quar_take(); S.prog = &gp12;
+          p_draw d12 = {.prim = DM_PRIM_MESH_TASKS, .first = 0, .count = 4, .instances = 1};
+          __block int w12 = 0; o = capture(^{ mesh_draw(&d12, &w12); });
+          NSArray<NSString *> *sus = quar_take();   // 提交前取：frame_columns 的提交会自己取走
+          cols = frame_columns();
+          VERIFY(cols == 0x0f && [sus containsObject:pair] && [o containsString:@"first drawn"],
+                 "⑫ 网格管线第一次画出：画出列 0..3、进本提交的 GPU 出错嫌疑、打 first drawn（列掩码 %#x，嫌疑 %s；stderr：%s）", cols, [sus componentsJoinedByString:@" | "].UTF8String, o.UTF8String);
+          quar_fault(sus, [NSError errorWithDomain:@"t" code:1 userInfo:nil]);
+          frame_begin(); uint64_t q0 = g_mtk_quar_skip; S.prog = &gp12;
+          o = capture(^{ draw(&d12, NULL); draw(&d12, NULL); });
+          cols = frame_columns();
+          NSString *qf = [NSString stringWithContentsOfFile:[@(pdir) stringByAppendingPathComponent:@"gpu_quarantine.tsv"] encoding:NSUTF8StringEncoding error:nil] ?: @"";
+          VERIFY(quar_has(md, fs5) && cols == 0 && g_mtk_quar_skip == q0 + 2 && red_lines(o, @"quarantine") == 2 && [qf containsString:pair],
+                 "⑫ 隔离后同一对网格绘制两笔都跳过（+%llu）、不画（列掩码 %#x）、每笔报红 1 行（全局前 4 笔）、写进隔离表（%s；stderr：%s）",
+                 (unsigned long long)(g_mtk_quar_skip - q0), cols, [qf containsString:pair] ? "有" : "无", o.UTF8String);
+          unlink([[@(pdir) stringByAppendingPathComponent:@"gpu_quarantine.tsv"] fileSystemRepresentation]); rmdir(pdir); }
     }
     if (failures) { printf("✗ t_nvn_mesh：%u 项里 %u 项不符\n", checks, failures); return 1; }   // 原生门禁按「✓ t_ / ✗ t_」逐组判
     printf("✓ t_nvn_mesh：%u 项全过（任务 / 网格绘制：约定字段载入、上限报红、无顶点阶段的程序、直接 / 有任务 / GPU 写参数的间接 / 零工作量画出的列与手算一致、缺网格着色器报红、映射表阶段名 task / mesh 载入、无网格管线的 GPU 跳过报红）\n", checks); return 0;

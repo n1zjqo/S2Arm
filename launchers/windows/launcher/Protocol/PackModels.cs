@@ -27,11 +27,14 @@ public sealed record Milestone(string Id, string Label, string Purpose, double? 
 
 /// <summary>
 /// Time estimate of a milestone plan. Port of the Mac adapter's MilestoneEstimate (one rule for both launchers; only real readings,
-/// 维护者 10-25): the current step's rate when it has a real fraction ≥ 5 %; a whole-job remaining time only when the current and every
-/// later step have a local record, scaled by the calibration of the finished steps (actual ÷ record, clamped to 0.5–3).
+/// 维护者 10-25): the current step's time left measured from its live counter (MeasuredStep, from MilestoneTrack: the counter's own
+/// slope since it started counting — same as the Mac JobProgress.stepLeft, 剃刀 M20); a whole-job remaining time only when the current
+/// and every later step have a local record, scaled by the calibration of the finished steps (actual ÷ record, clamped to 0.5–3).
+/// #944：原先按「本步已用 ×（1 − 比例）÷ 比例」外推、比例不到 5 % 不给——一步里换计数器（直连库：翻译 35 分钟后编批库按 MB 数）时，
+/// 已用时间里含着前一个计数器的时间，编批库头 2 GB 一直不给、之后给的也偏。
 /// </summary>
 public sealed record MilestoneEstimate(IReadOnlyList<Milestone> Plan, string? Current, IReadOnlyDictionary<string, double> Started,
-    double? Fraction, double Now)
+    double? Fraction, double Now, double? MeasuredStep = null)
 {
     public int? Index { get { var i = Plan.ToList().FindIndex(m => m.Id == Current); return i < 0 ? null : i; } }
     public double StepElapsed => Current is not null && Started.TryGetValue(Current, out var s) ? Math.Max(0, Now - s) : 0;
@@ -54,8 +57,7 @@ public sealed record MilestoneEstimate(IReadOnlyList<Milestone> Plan, string? Cu
         }
     }
 
-    public double? StepRemainingByRate =>
-        Index is null || Fraction is not { } f || f < 0.05 || f >= 1 ? null : StepElapsed * (1 - f) / f;
+    public double? StepRemainingByRate => Index is null ? null : MeasuredStep;
 
     public double? Remaining
     {
@@ -94,7 +96,15 @@ public sealed class MilestoneTrack
     public IReadOnlyDictionary<string, double> Started => started;
     /// <summary>Real done / total of the current step (progress events); null without a real count.</summary>
     public double? Fraction { get; private set; }
+    /// <summary>整单进度（作业层每条事件的 overall，0–1，只增不减、成功才到 1；pack/jobs/overall.py）。大百分比与分段条只显示它，
+    /// 不再按当前计数器自己拼（11-11 维护者：「百分比反复到 91% 又跳回 40%」）。没有的作业为 null，照旧</summary>
+    public double? Overall { get; private set; }
     public string Message { get; private set; } = "";
+    /// <summary>当前计数器的速率起点（时刻、完成数）与总数；换计数器（总数变 / 从头数 / 换步）就从这一条重算（同 Mac JobProgress）</summary>
+    private (double T, double Done, double Total)? rateOrigin;
+    /// <summary>按实测速率算的本步还需（秒）与算出它的时刻：两次事件之间倒数</summary>
+    private double? eta, etaAt;
+    private const double MinimumSpan = 2.0;
 
     public void Ingest(JsonElement e, double now)
     {
@@ -108,13 +118,20 @@ public sealed class MilestoneTrack
         }
         if (e.TryGetProperty("milestone", out var m) && m.ValueKind == JsonValueKind.String && m.GetString() is { Length: > 0 } id && id != Current)
         {
-            Current = id; Fraction = null;
+            Current = id; Fraction = null; rateOrigin = null; eta = etaAt = null;
             started.TryAdd(id, now);
         }
+        if (e.TryGetProperty("overall", out var o) && o.ValueKind == JsonValueKind.Number)
+            Overall = Math.Max(Overall ?? 0, Math.Min(1, o.GetDouble()));
         if (type is "stage" or "message" or "cache") Fraction = null;   // 新的一句说明 = 上一个百分比不再代表当前在做的事（社区贡献者补丁 #8）
         if (type == "progress" && e.TryGetProperty("totalUnits", out var total) && total.ValueKind == JsonValueKind.Number && total.GetDouble() > 0 &&
             e.TryGetProperty("doneUnits", out var done) && done.ValueKind == JsonValueKind.Number)
-            Fraction = Math.Min(1, Math.Max(0, done.GetDouble() / total.GetDouble()));
+        {
+            double d = done.GetDouble(), n = total.GetDouble();
+            Fraction = Math.Min(1, Math.Max(0, d / n));
+            if (rateOrigin is not { } ro || ro.Total != n || d < ro.Done) { rateOrigin = (now, d, n); eta = etaAt = null; }
+            else if (now - ro.T >= MinimumSpan && d > ro.Done) { eta = Math.Max(0, n - d) / ((d - ro.Done) / (now - ro.T)); etaAt = now; }
+        }
         if (type is "stage" or "progress" or "message" && e.TryGetProperty("message", out var text) && text.ValueKind == JsonValueKind.String &&
             text.GetString() is { Length: > 0 } message)
             Message = message;
@@ -131,7 +148,8 @@ public sealed class MilestoneTrack
         return end is { } x ? Math.Max(0, x - s) : null;
     }
 
-    public MilestoneEstimate Estimate(double now) => new(Plan, Current, new Dictionary<string, double>(started), Fraction, now);
+    public MilestoneEstimate Estimate(double now) => new(Plan, Current, new Dictionary<string, double>(started), Fraction, now,
+        eta is { } left && etaAt is { } at ? Math.Max(0, left - (now - at)) : null);
 }
 
 /// <summary>Disk space budget from the pack job's space event (mirrors PackSpace in the Mac frontend).</summary>
@@ -173,20 +191,16 @@ public sealed record InstallReadiness(IReadOnlyList<InstallItem> Items, bool Rea
             var items = new List<InstallItem>();
             foreach (var i in result.GetProperty("items").EnumerateArray())
             {
+                // 剃刀 W7：不认识的动作、不安全的链接只忽略这一项（这一项不给按钮 / 链接），不再整份清单作废——
+                //   原先后端加一个新动作，前端就当「这次没查到手机状态」，玩家只能盲装
                 Uri? url = null;
-                if (i.TryGetProperty("url", out var u) && u.ValueKind != JsonValueKind.Null)
-                {
-                    if (u.ValueKind != JsonValueKind.String || !Uri.TryCreate(u.GetString(), UriKind.Absolute, out url) ||
-                        url.Scheme != Uri.UriSchemeHttps || url.Host.Length == 0 || url.UserInfo.Length != 0)
-                        throw new LibraryProtocolException("Invalid official download URL.");
-                }
+                if (i.TryGetProperty("url", out var u) && u.ValueKind == JsonValueKind.String &&
+                    Uri.TryCreate(u.GetString(), UriKind.Absolute, out var parsed) &&
+                    parsed.Scheme == Uri.UriSchemeHttps && parsed.Host.Length != 0 && parsed.UserInfo.Length == 0)
+                    url = parsed;
                 string? action = null;
-                if (i.TryGetProperty("action", out var a) && a.ValueKind != JsonValueKind.Null)
-                {
-                    if (a.ValueKind != JsonValueKind.String || !InstallItem.Actions.Contains(a.GetString()!))
-                        throw new LibraryProtocolException("Unknown checklist action.");
+                if (i.TryGetProperty("action", out var a) && a.ValueKind == JsonValueKind.String && InstallItem.Actions.Contains(a.GetString()!))
                     action = a.GetString();
-                }
                 items.Add(new(LibraryJobResult.Text(i, "id"), i.GetProperty("ok").GetBoolean(),
                     i.TryGetProperty("waiting", out var w) && w.GetBoolean(), LibraryJobResult.Text(i, "title"),
                     LibraryJobResult.Text(i, "detail", true), i.TryGetProperty("who", out var who) ? who.GetString() ?? "" : "", url, action));

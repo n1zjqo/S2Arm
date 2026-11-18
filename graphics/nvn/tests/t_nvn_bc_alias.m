@@ -13,6 +13,8 @@
 //   A 无人深空次序：BC 贴图的存储里先有 CPU 留下的旧字节（0xA5），GPU 写 RG32UI 之后 BC 贴图才第一次被用 → 应 = 已知块
 //   B 增量：BC 贴图先被用过一次（存储全 0，读回全 0），之后 GPU 写 RG32UI，再用 → 应 = 已知块（第一次读回应全 0）
 //   C 负对照：关掉同步（g_bcal_off），按 A 的次序 → 读回不等于已知块（说明 A 的通过靠的是同步，不是巧合）
+//   E 写入者早已出了已释放贴图环：GPU 写 RG32UI 后 Finalize，再过 600 张贴图，BC 贴图才第一次用 → 应 = 已知块（#951 菜单缩略图）
+//   F 写入者 Finalize 后存储被另一张贴图 GPU 覆写 → 记账放掉留住的写入者贴图（不再延长它的寿命）；G 对照：没被覆写的仍留着
 //   D CPU 后写为准：GPU 写 RG32UI 之后，CPU 往同一段存储写进另外 4 个块（8x8 BC1 只占一个 GOB，块 (bx, by) 在 GOB 内偏移 8·(2·by + bx)），BC 贴图再第一次被用 → 应 = CPU 写的块
 #include "../gfx/nvn/nvn_mtl.m"
 #include "../gfx/nvn/nvn_protos.h"
@@ -114,6 +116,47 @@ int main(void) { @autoreleasepool {
       tex(&bc, NVN_FORMAT_RGBA_DXT1, W, 7 << 20); tex(&rg, NVN_FORMAT_RG32UI, 2, 7 << 20);
       gpu_write(&rg); memcpy(mem + (7 << 20), cpu, 32); API(nvnMemoryPoolFlushMappedRange)(&pool, 7 << 20, 512);
       read_blocks(&bc, got); CHECK(!memcmp(got, cpu, 32), "D GPU 写之后 CPU 又改写了这段存储：BC 贴图读回的是 CPU 写的块（不被 GPU 那次写盖掉）"); }
+    // E：写入者早已出了「已释放贴图」环（11-13 #951 菜单缩略图）：GPU 写 RG32UI 后游戏 Finalize 它，之后又有 600 张贴图写过、Finalize（环只留最近 512 张），
+    //   BC 贴图这时才第一次用 → 仍应 = 已知块（原先按序号 / 共享表都取不到写入者，字节不拷、读成旧字节）
+    { static NVNtexture bc, rg, dummy; memset(mem + (8 << 20), 0xA5, 4096); tex(&bc, NVN_FORMAT_RGBA_DXT1, W, 8 << 20); tex(&rg, NVN_FORMAT_RG32UI, 2, 8 << 20);
+      gpu_write(&rg); API(nvnTextureFinalize)(&rg);
+      for (int i = 0; i < 600; i++) { tex(&dummy, NVN_FORMAT_RG32UI, 2, (9 << 20) + (ptrdiff_t)i * 4096); gpu_write(&dummy); API(nvnTextureFinalize)(&dummy); }
+      read_blocks(&bc, got);
+      CHECK(!memcmp(got, want, 32), "E 写入者 Finalize 后又过了 600 张贴图、BC 贴图才用：读回的块 = 写进去的 4 个块");
+      int bad = sample(&bc); CHECK(!bad, "E 64 个像素与手算一致（不符 %d）", bad); }
+    // F：写入者 Finalize 后，另一种描述的贴图在同一段存储上 GPU 写过（字节已不是写入者的）→ 记账放掉留住的写入者贴图（11-14 每帧换尺寸的渲染目标一张张被留住、
+    //   图形内存只涨不落）。对照：同样 Finalize、没被覆写的那一项（G）过同样多次提交仍留着（E 要的就是它）
+    { static NVNtexture rg, ow, rg2; int wk = 0, wk2 = 0; uint64_t k = (uint64_t)(uintptr_t)(mem + (13 << 20)), k2 = (uint64_t)(uintptr_t)(mem + (14 << 20));
+      @autoreleasepool {
+        tex(&rg, NVN_FORMAT_RG32UI, 2, 13 << 20); gpu_write(&rg); tex(&rg2, NVN_FORMAT_RG32UI, 2, 14 << 20); gpu_write(&rg2);
+        pthread_mutex_lock(&g_bcal_mu); bcal_e *e = nvn_hm_get(&g_bcal, &k), *e2 = nvn_hm_get(&g_bcal, &k2);
+        wk = e && e->wtex; wk2 = e2 && e2->wtex; pthread_mutex_unlock(&g_bcal_mu);   // 写完、Finalize 之前两项都留着写入者贴图
+        API(nvnTextureFinalize)(&rg); API(nvnTextureFinalize)(&rg2);
+        tex(&ow, NVN_FORMAT_R32UI, 2, 13 << 20); gpu_write(&ow);
+        for (int i = 0; i < 40; i++) run(^{});
+      }
+      pthread_mutex_lock(&g_bcal_mu); bcal_e *e = nvn_hm_get(&g_bcal, &k), *e2 = nvn_hm_get(&g_bcal, &k2); int held = e && e->wtex, held2 = e2 && e2->wtex; pthread_mutex_unlock(&g_bcal_mu);
+      CHECK(wk && !held, "F 写入者 Finalize 后存储被另一张贴图（R32UI，不是块大小的写入者）GPU 覆写：记账不再留着它（表里 %s）", held ? "还留着" : "已放");
+      CHECK(wk2 && held2, "G 对照：写入者 Finalize 后存储没被覆写，过同样 40 次提交记账仍留着它（表里 %s）", held2 ? "留着" : "已放"); }
+    // H（#1220）：写入者没 Finalize（仍是活对象），存储被另一张贴图 GPU 覆写 → 记账照样放掉它，但只能放自己那份引用：
+    //   序号表 / 定稿 / 共享存储表还点名这张 Metal 贴图时，它必须还在驻留集（原先一律退役，GPU 做完那次提交就出驻留集，之后的绘制读它缺页）；
+    //   F 那张 Finalize 了、没人点名 → 照旧退役出驻留集（防内存只涨不落的修复不变）
+    { static NVNtexture rg3, ow3, rgF, owF; uint64_t k3 = (uint64_t)(uintptr_t)(mem + (15 << 20)), kF = (uint64_t)(uintptr_t)(mem + (12 << 20)); id w3 = nil, wF = nil;
+      @autoreleasepool {
+        tex(&rg3, NVN_FORMAT_RG32UI, 2, 15 << 20); gpu_write(&rg3); tex(&rgF, NVN_FORMAT_RG32UI, 2, 12 << 20); gpu_write(&rgF);
+        pthread_mutex_lock(&g_bcal_mu); bcal_e *e3 = nvn_hm_get(&g_bcal, &k3), *eF = nvn_hm_get(&g_bcal, &kF);
+        w3 = e3 && e3->wtex ? (__bridge id)e3->wtex : nil; wF = eF && eF->wtex ? (__bridge id)eF->wtex : nil; pthread_mutex_unlock(&g_bcal_mu);
+        API(nvnTextureFinalize)(&rgF);
+        tex(&ow3, NVN_FORMAT_R32UI, 2, 15 << 20); gpu_write(&ow3); tex(&owF, NVN_FORMAT_R32UI, 2, 12 << 20); gpu_write(&owF);
+        for (int i = 0; i < 40; i++) run(^{});
+      }
+      pthread_mutex_lock(&g_bcal_mu); bcal_e *e3 = nvn_hm_get(&g_bcal, &k3); int held3 = e3 && e3->wtex; pthread_mutex_unlock(&g_bcal_mu);
+      pthread_mutex_lock(&g_smu); int named3 = w3 && (serial_holds(&g_by_serial, w3) || serial_holds(&g_ghost, w3) || serial_holds(&g_ghost_active, w3) || serial_holds(&g_alias, w3));
+      int namedF = wF && (serial_holds(&g_by_serial, wF) || serial_holds(&g_ghost, wF) || serial_holds(&g_ghost_active, wF) || serial_holds(&g_alias, wF)); pthread_mutex_unlock(&g_smu);
+      pthread_mutex_lock(&g_res_mu); int res3 = w3 && [g_res_objects containsObject:w3], resF = wF && [g_res_objects containsObject:wF]; pthread_mutex_unlock(&g_res_mu);
+      CHECK(w3 && !held3, "H 活写入者的存储被覆写：记账放掉它（表里 %s）", held3 ? "还留着" : "已放");
+      CHECK(w3 && (!named3 || res3), "H 放掉之后仍被点名（%s）的写入者贴图还在驻留集（%s）", named3 ? "点名" : "没点名", res3 ? "在" : "不在");
+      CHECK(wF && !namedF && !resF, "H 对照：Finalize 了、只挂在共享存储表同键上的写入者：那一项一并摘掉、退役出驻留集（还被点名 %d、在驻留集 %d）", namedF, resF); }
     printf("%s t_nvn_bc_alias：%u 项，不符 %u（Metal %s）\n", failures ? "✗" : "✓", checks, failures, g_m3 ? "3" : "4");
     return failures != 0;
 } }

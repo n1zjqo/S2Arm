@@ -22,25 +22,25 @@ public class DebugAppProbe {
   try {
    Path game=GameSessionAdmissionTest.fixture(app);
    var installed=GameSessionAdmissionTest.apk(app,game);
-   try(var session=GameSession.load(GameSessionAdmissionTest.spec(app,game),app.toFile(),installed,false,false)) {
+   try(var session=GameSession.load(GameSessionAdmissionTest.spec(app,game),app.toFile(),installed,false)) {
     check(session!=null,"default release remains admitted");
    }
    GameSessionAdmissionTest.artifact(game,t->t.replace(BASE,TEST));
    var testInstalled=new GameSession.InstalledApk(installed.file,TEST,1,installed.signerSha256,false);
    for(boolean debug:new boolean[]{false,true}) for(boolean gate:new boolean[]{false,true}) {
     boolean accepted=false;
-    try(var session=GameSession.load(GameSessionAdmissionTest.spec(app,game),app.toFile(),testInstalled,debug,false,gate)) {
+    try(var session=GameSession.load(GameSessionAdmissionTest.spec(app,game),app.toFile(),testInstalled,debug,gate)) {
      accepted=true; check(session.spec.game.titleId.equals(TITLE),"title unchanged");
     } catch(BootContract.BadGame expected) { }
     check(accepted==(debug&&gate),"both debug gates required");
-    try(var lock=GameStorage.acquire(app.toFile())) {check(lock!=null,"lock released");}
+    try(var lock=GameStorage.acquire(app.toFile(),TITLE)) {check(lock!=null,"lock released");}
    }
    for(var wrong:List.of(new GameSession.InstalledApk(installed.file,BASE,1,installed.signerSha256,false),
      new GameSession.InstalledApk(installed.file,TEST,2,installed.signerSha256,false),
      new GameSession.InstalledApk(installed.file,TEST,1,List.of("00".repeat(32)),false),
      new GameSession.InstalledApk(installed.file,TEST,1,installed.signerSha256,true))) {
     boolean refused=false;
-    try(var session=GameSession.load(GameSessionAdmissionTest.spec(app,game),app.toFile(),wrong,true,false,true)) {}
+    try(var session=GameSession.load(GameSessionAdmissionTest.spec(app,game),app.toFile(),wrong,true,true)) {}
     catch(IOException|BootContract.BadGame expected) {refused=true;}
     check(refused,"complete installed identity retained");
    }
@@ -87,7 +87,7 @@ public class DebugAppProbe {
     catch(IOException e){refused=true;}check(refused,"import exact installed package");
    }
    Files.writeString(installed.file.toPath(),"other APK");boolean refused=false;
-   try(var session=GameSession.load(GameSessionAdmissionTest.spec(app,game),app.toFile(),testInstalled,true,false,true)){}
+   try(var session=GameSession.load(GameSessionAdmissionTest.spec(app,game),app.toFile(),testInstalled,true,true)){}
    catch(IOException e){refused=true;}check(refused,"APK hash still enforced");
    System.out.println("Debug app admission: "+count+" checks PASS; synthetic host, not Android execution");
   } finally {GameInstall.deleteTree(app.toFile());}
@@ -155,7 +155,7 @@ class DebugAppAdmissionTest(unittest.TestCase):
         self.assertIn('source -> checkedImportSource(source, context.getPackageName(),', library)
         install = (JAVA / 'GameInstall.java').read_text()
         self.assertIn('sourceCheck.checked(directory(dir))', install)
-        self.assertIn('revisionEnabled, DebugGate.open(), timing)', library)
+        self.assertIn('!= 0, DebugGate.open(), timing)', library)
         main = (JAVA / 'MainActivity.java').read_text()
         self.assertIn('BootContract.packageTitle(getPackageName(),', main)
         self.assertIn('(getApplicationInfo().flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0 && DebugGate.open())', main)
@@ -165,7 +165,7 @@ class DebugAppAdmissionTest(unittest.TestCase):
             (root / 'DebugAppProbe.java').write_text(PROBE)
             (root / 'ImportGuard.java').write_text(wrapper)
             classes = ['Json', 'BootContract', 'BootSpec', 'ProcessBirth', 'RuntimeLibrary',
-                       'GamePack', 'GameFingerprint', 'GameStorage', 'GameInstall', 'GameSession', 'GameResume']
+                       'GamePack', 'GameFingerprint', 'GameStorage', 'GameInstall', 'ImportReceiver', 'GameSession', 'GameResume']
             sources = [JAVA / (x + '.java') for x in classes]
             sources += [ANDROID / 'tests/GameSessionAdmissionTest.java', root / 'ImportGuard.java', root / 'DebugAppProbe.java']
             # Host-only Android logging seam; admission/import decisions stay production code.

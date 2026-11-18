@@ -40,7 +40,7 @@ struct nvn_vk_tex {
     uint32_t nvn_target;    // NVNtextureTarget（8/9 = CUBEMAP/CUBEMAP_ARRAY；5/6/MS 与 10/BUFFER 未建图）
     uint32_t nvn_flags;     // NVNtextureFlags（0x10 LINEAR / 0x20 SPARSE 等）
     uint32_t nvn_stride;    // TextureBuilderSetStride（线性纹理行距）
-    int32_t nvn_pkg_block_h;// 打包布局的 block height（0 = 自动算法）
+    int32_t nvn_pkg_layout;// 打包布局参数（编码见 nvn_tex.h pkg_layout；0 = 自动算法）
     uint8_t stencil_mode;   // TextureBuilderSetDepthStencilMode(STENCIL)：采样 stencil 面而不是深度面
     uint16_t swz;          // NVN TextureBuilderSetSwizzle：r | g<<3 | b<<6 | a<<9
     uint8_t set_swz;
@@ -188,6 +188,8 @@ int nvn_vk_texcache_release_retained(struct s2a_vk_device *d, uint64_t timeout_n
 // 诊断/测试注入：1 = 真实提交后按“完成未知”处理；2 = 假装提交失败；0 = 正常语义。
 void nvn_vk_texcache_set_upload_fault(int mode);
 // 帧内引用计数：命令缓冲/描述符仍引用该图像时禁止淘汰/销毁；flush 完成后再 unpin。
+// 只查已有活纹理；调用者持有会话锁，失效或未命中返回 NULL。
+struct nvn_vk_tex *nvn_vk_texcache_find_serial(struct nvn_vk_texcache *c, uint64_t serial);
 void nvn_vk_texcache_pin(struct nvn_vk_tex *t);
 void nvn_vk_texcache_unpin(struct nvn_vk_tex *t);
 void nvn_vk_texcache_destroy(struct nvn_vk_texcache *c);

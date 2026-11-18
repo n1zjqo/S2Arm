@@ -98,7 +98,7 @@ typedef struct {
     struct gl_vao default_vao;                            // 0 号顶点数组（GLES 缺省顶点数组）：每个上下文一个、不共享（GLES 3.2 §10.3.1 容器对象）
     uint32_t dirty;                                       // GLD_*：哪些状态变了、下一笔绘制要重取管线 / 重绑
 } gl_state;
-enum { GLE_CULL = 1, GLE_DEPTH = 2, GLE_STENCIL = 4, GLE_SCISSOR = 16, GLE_POLY_OFFSET = 32, GLE_COLOR_TABLE = 64 };   // gl_state.enable 的位；混合开关在 color[i].blend
+enum { GLE_CULL = 1, GLE_DEPTH = 2, GLE_STENCIL = 4, GLE_SCISSOR = 16, GLE_POLY_OFFSET = 32, GLE_COLOR_TABLE = 64, GLE_FB_SRGB = 128, GLE_DEBUG = 256, GLE_DEBUG_SYNC = 512 };   // gl_state.enable 的位；混合开关在 color[i].blend
 enum { GLD_PIPE = 1, GLD_DSS = 2, GLD_VP = 4, GLD_SC = 8, GLD_RES = 16, GLD_VB = 32 };
 extern __thread gl_state *gl_cur;   // 本线程的当前上下文状态（egl.m 在 MakeCurrent 时设；每个线程各绑各的，同 EGL 规范）
 void gl_set_error(GLenum e);      // 只记第一个（规范：多个错误时 glGetError 逐个取，这里只留第一个，够用到普查出现反例为止）
@@ -118,8 +118,11 @@ void gl_surface_wid(uint32_t *color, uint32_t *depth);   // 当前绘制表面�
 typedef struct { __strong id<MTLTexture> col[GL_COLOR_TARGETS], dep, sten; NSUInteger w, h; GLuint fb; uint32_t cid[GL_COLOR_TARGETS], did; int fake_dep; } gl_target;   // fake_dep：dep 是本层挂的假深度（GL 目标没有深度、程序写 gl_FragDepth），深度测试恒过、不写
 int gl_draw_target(gl_target *t);        // 0 = 无目标 / 不完整 / 不支持（已报红）；附件纹理按本次提交登记使用
 void gl_dev_init(void);                  // gl_draw.m：取共用设备、建本层队列与共享事件（一次）
-void *gl_lookup(const char *name);       // gl_core.m：函数表查找（eglGetProcAddress、装载器）
-void *gl_entry(const char *name);        // gl_core.m：交给游戏的入口 = 查表 + 重活（swglb）套 S2Arm 切栈桩；eglGetProcAddress 与装载器（host_adapt.m s2a_gl_entry）都走它
+void *gl_lookup(const char *name);       // gl_core.m：函数表查找（eglGetProcAddress、装载器），只回真实现
+int gl_core_alias(const char *name, char *core, size_t cap);   // gl_core.m：扩展别名（ARB / EXT / OES / KHR）去后缀得核心名，语义不同的除外；是核心名回 1
+void *gl_entry(const char *name);        // gl_core.m：交给游戏的入口 = 查表 + 重活（swglb）套 S2Arm 切栈桩；只给真实现（装载器 host_adapt.m s2a_gl_entry）
+void *gl_stub(const char *name);         // gl_core.m：没实现的核心名的安全空实现（非核心名回空）；调用方找遍真实现之后才要
+void *gl_entry_or_stub(const char *name); // gl_core.m：eglGetProcAddress 交出的 = gl_entry，没有时 gl_stub
 int gl_is_big(const char *name);         // gl_core.m：要跑在宿主栈上的名字
 
 // ---------- 编码（gl_draw.m 实现，各片调用） ----------
@@ -133,6 +136,7 @@ void gl_clear(GLbitfield mask);                           // 按当前清除值�
 void gl_wait(uint64_t v);                                 // 等本层共享事件到 v（glFinish、上屏前取回读）
 struct gl_vao *gl_vao_cur(void);                        // gl_buf.m：当前顶点数组；0 号是 GLES 的缺省顶点数组（不在名字表里）
 void gl_buffer_ref(struct gl_buffer *b);                   // 绑定当前存储进编码器时登记本次提交
+GLuint gl_pack_buffer_name(void); struct gl_buffer *gl_pack_buffer(void);   // gl_buf.m：当前绑的像素打包缓冲（名字 / 对象，没绑 0 / NULL）
 int gl_buffer_busy(const struct gl_buffer *b);             // 当前存储仍被未完成的提交引用
 extern id<MTLDevice> gl_dev; extern id<MTLSharedEvent> gl_ev;
 

@@ -65,6 +65,8 @@ uint32_t s2a_android_host_console_mode(void);
 
 // 前后台冻结策略（bridge.cpp 的 setForeground 与宿主单测共用；纯函数，便于覆盖时序）。
 // 返回值：FREEZE=冻结客机与游戏时钟，UNFREEZE=放开，KEEP=不变。
+// 退后台一律冻结，不看游戏的「失焦暂停」开关（同 iOS 后台整体冻结）：安卓退后台就没有窗口了，客机照跑上不了屏，
+//   关了失焦暂停的游戏约 1.5 秒后自己 Abort（#855：系统选文件框一盖上，返回时游戏已从头启动）。
 // 停机已开始（stopGame 已 foreground_unfreeze、正在等客机应答）时，迟到的 onPause 不得再冻结：
 //   否则收尾线程等客机线程退出会卡到硬预算超时（finishAndRemoveTask 还要 10 秒才执行，Home 路径必现）。
 enum {
@@ -73,10 +75,10 @@ enum {
     S2A_ANDROID_FOREGROUND_UNFREEZE = -1,
 };
 
-static inline int s2a_android_foreground_action(int foreground, int stop_started, int frozen, int focus_suspend) {
+static inline int s2a_android_foreground_action(int foreground, int stop_started, int frozen) {
     if (foreground) return frozen ? S2A_ANDROID_FOREGROUND_UNFREEZE : S2A_ANDROID_FOREGROUND_KEEP;
     if (stop_started) return S2A_ANDROID_FOREGROUND_KEEP;   // 收尾不冻，冻着的由 stopGame 先放开
-    return (!frozen && focus_suspend) ? S2A_ANDROID_FOREGROUND_FREEZE : S2A_ANDROID_FOREGROUND_KEEP;
+    return frozen ? S2A_ANDROID_FOREGROUND_KEEP : S2A_ANDROID_FOREGROUND_FREEZE;
 }
 
 // Shell side of the stop table: an eventfd (non-blocking) that becomes readable when the core
@@ -89,6 +91,11 @@ int s2a_android_host_stop_requested(void);
 // 停止先被接受则返回 0；准入先完成则后续停止属于运行中会话，由退出 owner 处理。
 // 不持锁调用 guest / 托管代码，也不声称成功准入后的线程已因停止而静止。
 int s2a_android_host_try_enter_guest(void);
+
+// 主 guest 运行态发布（#961）与 request_stop 在同一 stop_lock 上线性化。停止先被接受则不调
+// publish、返回 1；否则锁内调一次 publish 并返回其结果。publish 只能做原子状态转换：不调
+// guest / 托管代码、不阻塞。发布之后的停止属于运行中会话，由退出 owner 处理。
+int s2a_android_host_publish_running(int (*publish)(void));
 
 int s2a_android_host_stop_fd(void);
 int s2a_android_host_take_stop(uint32_t *reason, char *detail, size_t n);

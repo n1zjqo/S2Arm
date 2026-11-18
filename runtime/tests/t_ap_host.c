@@ -7,7 +7,7 @@
 //    冻结中停 → 不打；解冻后停 → 3 次；再上屏再停 → 仍 3 次（每局至多 3 次）。
 // ⑤ 标称帧率（s2a_nominal_fps_set → s2a_ap_nominal_fps）：没报过 = 0；报 0 / 负数不收仍 0、不打日志；报 60 → 60 并打一行「标称帧率：60 帧/秒」；
 //    再报 60 → 不重打；报 30 → 30 并打一行带「运行中变了」；报 -5 不收仍 30。期望按函数约定手写（读 fps 与日志行）。
-// ⑧ 开发设施开关：s2a_dev_on 桩 0（玩家口径）→ 首帧上屏后停住看门不起、停 1.6 秒现场 0 份；桩 1（开发包）→ 1 份。各在 fork 子进程里从零开始。
+// ⑧ 开发设施开关：s2a_dev_on 桩 0（玩家口径）→ 首帧上屏后看门只救场（审计 P1-191）、停 1.6 秒现场 0 份；桩 1（开发包）→ 1 份。各在 fork 子进程里从零开始。
 // ⑦ 永久卡住（最该救的那种局：n 恒 1、idle 一直涨）：只打 1 份现场 → 屏幕提示 1 次 → 到 lim+4s 秒走 _exit(86)。
 //    在设 S2A_STALL_DUMP_S 之前 fork 出子进程（阈值是首次调用时缓存的 static），钩子把「退出码 + 现场份数 + 提示次数」带回父进程，
 //    进程内不真死。负对照：把门槛改回 n>=3 时这一项必红（子进程到点不退）。
@@ -20,6 +20,7 @@
 #include <sys/wait.h>
 void s2a_host_shutdown(const char *why) { (void)why; }
 void s2a_dguard_frame(uint64_t now) { (void)now; }
+void s2a_playtime_frame(uint64_t now, int focused) { (void)now; (void)focused; }
 void s2a_dguard_evidence(const char *why, int stall) { (void)why; (void)stall; }
 void s2a_load_first_frame(uint64_t now) { (void)now; }   // loadprog.c 加载页：首帧调   // dguard.c 直连安全网：s2a_frame_presented 每帧调
 void s2a_wg_frame(void) {}   // thread.c 帧间隔工作组（S2A_WORKGROUP）：s2a_frame_presented 每帧调
@@ -46,6 +47,11 @@ void s2a_thread_dump(void) { g_ndump++; }          // 桩：看门经 dlsym 取�
 static _Atomic int g_dev = 1;   // ⑧ 开发设施开关桩（os.c s2a_dev_on）：缺省 1 = 开发包，原有 ④ ⑦ 照旧
 int s2a_dev_on(void) { return atomic_load(&g_dev); }
 int s2a_guest_frozen(void) { return g_fz; }
+// ④b 停帧现场「外因四态」的桩（os.c 的三个导出 + 上面 thread.c 的冻结）：缺符号时看门记 -1，这里都要有
+static _Atomic int g_host_focused = 1, g_focus_suspend = 1, g_host_sleeping;
+int s2a_host_focused(void) { return atomic_load(&g_host_focused); }
+int s2a_focus_suspend(void) { return atomic_load(&g_focus_suspend); }
+int s2a_host_sleeping(void) { return atomic_load(&g_host_sleeping); }
 static _Atomic int g_nhost;
 int s2a_dump_threads(const char *why) { (void)why; g_nhost++; return 0; }   // 桩：宿主线程栈
 static int capture(void (*fn)(void), char *out, size_t n) {
@@ -73,22 +79,29 @@ int main(void) {
     if (atomic_load(&g_s2a_hud_fn) != 1 || stamp < before || stamp > after) {
         printf("✗ HUD 帧时间戳未使用宿主单调纳秒钟\n"); bad++;
     }
-    {   // ⑧ 开发设施开关（11-07 质量线，cmdr/壳内开发设施盘点.md）：玩家口径（s2a_dev_on = 0）首帧上屏后不起停住看门线程，停 1.6 秒 → 现场 0 份；
-        //    开发包（= 1）同样条件 → 1 份（同 ④ 第一步）。看门只在首帧上屏起一次（静态标记），所以各在一个 fork 出的子进程里从零开始；份数经管道带回
+    {   // ⑧ 停住现场（11-17 起归诊断读数）：玩家口径（s2a_dev_on = 0）与开发包（= 1）一样，首帧上屏后起停住看门，停 1.6 秒 → 现场 1 份；
+        //    （11-07 原为玩家口径 0 份）（同 ④ 第一步）。看门只在首帧上屏起一次（静态标记），所以各在一个 fork 出的子进程里从零开始；份数经管道带回
         for (int dev = 0; dev <= 1; dev++) {
             int pfd[2]; if (pipe(pfd)) { printf("✗ ⑧ pipe\n"); bad++; break; }
             pid_t pid = fork();
             if (pid == 0) { close(pfd[0]); atomic_store(&g_dev, dev); setenv("S2A_STALL_DUMP_S", "1", 1); s2a_frame_presented(); usleep(1600000);
                             char b = (char)atomic_load(&g_ndump); ssize_t w = write(pfd[1], &b, 1); (void)w; _exit(0); }
             close(pfd[1]); char b = -1; ssize_t r = read(pfd[0], &b, 1); close(pfd[0]); int st; waitpid(pid, &st, 0);
-            int want = dev ? 1 : 0;
+            int want = 1;   // 11-17 拆开：停住现场归「诊断读数」，玩家口径也打（只进日志、一局至多 3 次），不再看开发设施开关
             if (r != 1 || b != want) { printf("✗ ⑧ 开发设施 %s：停住现场 %d 份（期望 %d）\n", dev ? "开（开发包）" : "关（玩家口径）", (int)b, want); bad++; }
-            else printf("✓ ⑧ 开发设施 %s：停住看门%s，停 1.6 秒现场 %d 份\n", dev ? "开（开发包）" : "关（玩家口径）", dev ? "照起" : "不起", (int)b);
+            else printf("✓ ⑧ 开发设施 %s：停住看门全套（诊断读数，不看开发设施开关），停 1.6 秒现场 %d 份\n", dev ? "开（开发包）" : "关（玩家口径）", (int)b);
         }
     }
-    {   // ⑧b 判定矩阵（native.h s2a_dev_decide）：环境变量 > Info.plist > 缺省开；期望按约定手写
+    {   // ⑧c 审计 P1-191：停帧救场是给玩家的，看门线程的模式与开发设施分开（s2a_ap_stall_mode）。期望按规则手写：
+        //    开发设施开 + 现场秒数 > 0 → 2（全套）；开发设施关（玩家包）→ 1（只救场，原先 0 = 线程不起、救场走不到）；开发设施开但现场关（0 秒）→ 1
+        int s2a_ap_stall_mode(int, int);
+        int m1 = s2a_ap_stall_mode(1, 10), m0 = s2a_ap_stall_mode(0, 10), mz = s2a_ap_stall_mode(1, 0);
+        if (m1 != 2 || m0 != 1 || mz != 1) { printf("✗ ⑧c 看门模式 开发包 %d（期望 2）/ 玩家包 %d（期望 1）/ 现场关 %d（期望 1）\n", m1, m0, mz); bad++; }
+        else printf("✓ ⑧c 看门模式：开发包全套、玩家包只救场、现场关也只救场\n");
+    }
+    {   // ⑧b 判定矩阵（native.h s2a_dev_decide）：环境变量 > Info.plist > 缺省关；期望按约定手写
         struct { const char *env; int has, on, want; const char *what; } dm[] = {
-            {NULL, 0, 1, 1, "都没有 → 开（开发包缺省）"}, {NULL, 1, 0, 0, "plist 0 → 关（玩家包）"}, {NULL, 1, 1, 1, "plist 1 → 开"},
+            {NULL, 0, 1, 0, "都没有 → 关（11-17 缺省关：漏写的出包路径也不漏开）"}, {NULL, 1, 0, 0, "plist 0 → 关（玩家包）"}, {NULL, 1, 1, 1, "plist 1 → 开"},
             {"1", 1, 0, 1, "环境变量 1 盖过 plist 0 → 开（排查玩家问题）"}, {"0", 0, 1, 0, "环境变量 0 → 关"}, {"", 1, 0, 0, "空环境变量不算 → 按 plist 0 关"} };
         for (unsigned i = 0; i < sizeof dm / sizeof *dm; i++) {
             int got = s2a_dev_decide(dm[i].env, dm[i].has, dm[i].on);
@@ -144,6 +157,34 @@ int main(void) {
             bad += !ok;
         } else { printf("✗ ⑦b 起不了子进程（fork/pipe 失败）\n"); bad++; }
     }
+    {   // ④b 停帧现场带「外因四态」：宿主焦点 / 失焦暂停 / 宿主睡眠 / 客机冻结。期望值按桩手写：第 1 份现场焦点=0（玩家切走），
+        //    同一进程里把桩改成 1 再停一次，第 2 份现场必须跟着变（钉住「每份现场现读、不是起线程时缓存」）。
+        //    看门线程每进程只起一次（g_stall_started），所以在父进程首帧上屏之前 fork 出来跑，日志走管道由父进程按子串判
+        int pfd[2]; pid_t pid = -1;
+        if (!pipe(pfd)) {
+            pid = fork();
+            if (pid == 0) {
+                close(pfd[0]); g_s2a_logfd = pfd[1];
+                setenv("S2A_STALL_DUMP_S", "1", 1);
+                atomic_store(&g_host_focused, 0); atomic_store(&g_focus_suspend, 1); atomic_store(&g_host_sleeping, 0); atomic_store(&g_fz, 0);
+                s2a_frame_presented(); usleep(1600000);   // lim=4 格（1 秒）打第 1 份现场
+                atomic_store(&g_host_focused, 1);
+                s2a_frame_presented(); usleep(1600000);   // 一帧后重新武装，改桩后再打第 2 份
+                _exit(0);
+            }
+            close(pid > 0 ? pfd[1] : pfd[0]);
+        }
+        if (pid > 0) {
+            char o[8192]; size_t k = 0; ssize_t r;
+            while (k < sizeof o - 1 && (r = read(pfd[0], o + k, sizeof o - 1 - k)) > 0) k += (size_t)r;
+            o[k] = 0; close(pfd[0]);
+            int st = 0; waitpid(pid, &st, 0);
+            int ok1 = strstr(o, "外因状态 宿主焦点=0 失焦暂停=1 宿主睡眠=0 客机冻结=0") != NULL;
+            int ok2 = strstr(o, "外因状态 宿主焦点=1 失焦暂停=1 宿主睡眠=0 客机冻结=0") != NULL;
+            printf("%s ④b 停帧现场外因四态：第 1 份 焦点=0 %s、第 2 份 焦点=1 %s（期望都有）\n", ok1 && ok2 ? "✓" : "✗", ok1 ? "有" : "无", ok2 ? "有" : "无");
+            bad += !(ok1 && ok2);
+        } else { printf("✗ ④b 起不了子进程（fork/pipe 失败）\n"); bad++; }
+    }
     setenv("S2A_STALL_DUMP_S", "1", 1);   // 首帧前设：看门在首帧起线程时读阈值
     for (int i = 0; i < 3; i++) s2a_frame_presented();
     uint64_t s2a_ap_frames(void); if (s2a_ap_frames() != 3) { printf("✗ 上屏帧数 %llu，期望 3\n", (unsigned long long)s2a_ap_frames()); bad++; }
@@ -180,6 +221,14 @@ int main(void) {
             int got = s2a_ap_stall_exit_after(ex[i].idle, ex[i].n, ex[i].lim, ex[i].s);
             if (got != ex[i].want) { printf("✗ ⑥ 降级退出 idle=%d n=%d lim=%d s=%d → %d（期望 %d）\n", ex[i].idle, ex[i].n, ex[i].lim, ex[i].s, got, ex[i].want); bad++; }
             else printf("✓ ⑥ 降级退出 idle=%d n=%d lim=%d s=%d → %d\n", ex[i].idle, ex[i].n, ex[i].lim, ex[i].s, got);
+        }
+        // ⑥c 停帧救场判据（11-14）：30 秒窗口新上屏 ≤ 15 帧（< 0.5 帧/秒）算停帧。期望手写：0 / 4（交换间隔 1000 在 120 Hz 下 30 秒约 3.6 帧）/ 15 → 是；16 / 1800 → 否
+        int s2a_ap_crawl_due(uint64_t);
+        struct { uint64_t d; int want; } cr[] = {{0, 1}, {4, 1}, {15, 1}, {16, 0}, {1800, 0}};
+        for (unsigned i = 0; i < sizeof cr / sizeof *cr; i++) {
+            int got = s2a_ap_crawl_due(cr[i].d);
+            if (got != cr[i].want) { printf("✗ ⑥c 停帧救场判据 30 秒 %llu 帧 → %d（期望 %d）\n", (unsigned long long)cr[i].d, got, cr[i].want); bad++; }
+            else printf("✓ ⑥c 停帧救场判据 30 秒 %llu 帧 → %d\n", (unsigned long long)cr[i].d, got);
         }
         // ⑥b 第 2 档提示时刻：退出时退出前 NOTICE_S 秒，但不早于「打完现场」（钳位）；不退出（s=0，缺省）时停满 NOTICE_IDLE_S 秒（q）提示（审计 P1-4），q=0 关
         int s2a_ap_stall_notice_after(int, int, int, int, int, int);

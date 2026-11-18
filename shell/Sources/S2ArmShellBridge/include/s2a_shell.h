@@ -26,16 +26,36 @@ int s2a_shell_play(const char *game_id);
 void *s2a_shell_library_vc(const char *catalogue_json_path);
 
 // 本款装机阶段（11-07 Duo「游戏没能启动」：库里对资源包不在机上的款仍给 Play；v0.2.3 装机蒙版：传着的款要显示进度）：
-//   s2a_shell_game_install_state：1 就绪 / 2 传完了只等解开 / 3 传输中（推包端写的 资源包/.transfer 在、推送没完）/ 0 没有（库里不显示）。
+//   s2a_shell_game_install_state：1 就绪 / 2 传完了只等解开 / 3 传输中（推送没完：有 资源包/.transfer 按它画进度，没有按文件改动判传断了）/ 0 没有（资源包不在或是空的，库里不显示）。
 //     实现在宿主 ios/app.m（按 Documents/games/<游戏号> 跑 pack_apply.c s2a_game_install_state，同起局导入闸门判据）；本包弱定义缺省 1（Swift 单测不链宿主）
 //   s2a_shell_install_game：库在后台解开阶段 2 的那款，解完宿主调 s2a_shell_refresh；同时只解一款，正在解（或游戏号不对）返回 0。弱缺省 0
 //   s2a_shell_install_progress：正在解的是这款 → 写已解开包数 / 总包数、返回 1；否则 0。弱缺省 0
 //   s2a_shell_pick_game_data：库里点「需要游戏数据」那款 → 宿主给导入说明（含「重新检查」）；弱定义缺省只记日志
 int s2a_shell_game_install_state(const char *game_id);
+// 这款程序是按别的宿主约定号出的（runtime s2a_launch_ctx_game_needs_update / 点开被拒 S2A_SELECT_NEEDS_UPDATE）→ 1：库卡片标「需要在电脑上更新」。
+//   实现在宿主 ios/app.m（每款读一次清单后缓存，点开被拒的也记上；库每秒重判只查缓存）；弱缺省 0
+int s2a_shell_game_needs_host_update(const char *game_id);
+// 这款程序包对不上本机这份 App（通用壳：签名 / 库校验不认、或程序库与清单 image_sha256 不符；点开被拒 S2A_SELECT_NEEDS_RESIGN）→ 1：库卡片标「需要在电脑上重装」。
+//   实现在宿主 ios/app.m（点开被拒时记下）；弱缺省 0
+int s2a_shell_game_needs_reinstall(const char *game_id);
 int s2a_shell_install_game(const char *game_id);
 int s2a_shell_install_progress(const char *game_id, int *done, int *total);
+// 库起解包被拒（s2a_shell_install_game 返回 0）时为什么：1 另一款正在解（同时只解一款）/ 2 正在整理游戏目录（首次清点容器、资源包挪位，ios/app.m img_scan_bg）/ 0 没有在等的事。
+//   库据此在卡片上说「等另一款装完」「正在整理游戏目录」，不再只写「安装中」（iOS 装机剃刀 #46 / #47）。主线程；弱缺省 0
+int s2a_shell_install_wait(void);
 // 库界面第一次出现（启动打点「游戏库界面可操作」）；弱定义缺省什么都不做
 void s2a_shell_library_appeared(void);
+// 单一 IMG 的分段安装进度（runtime/src/pack_apply.c s2a_pack_apply_phase）：正在解这一款时 1，*phase = 1 解开推送包 / 2 从 game.img 解小文件 /
+//   3 核对机上文件，*fraction = 这一段的完成比例（0–1，不知道总量时 < 0）；不在解这款返回 0。主线程
+int s2a_shell_install_phase(const char *game_id, int *phase, double *fraction);
+// 这一款最后一次解开失败的原因（按失败码查的「标题。下一步」一句人话，app.m install_error_text；原文与码只进日志）；没失败过 / 之后成功了返回 NULL。返回的指针到下次调用前有效。主线程
+const char *s2a_shell_install_failure(const char *game_id);
+// 主屏快捷操作「设置」冷启动时宿主记下的请求：1 = 游戏库出现时要打开游戏库设置（取走即清）；运行中宿主直接发通知 S2AShellOpenSettings
+int s2a_shell_take_open_settings(void);
+// 这次安装确定丢了「提高内存上限」权限（ios/iml_probe.m，读不到不算）：返回 {"title","body"}（已按 App 语言）的 JSON，调用方 free；没丢 / 读不到返回 NULL。主线程
+char *s2a_shell_iml_notice(void);
+/* 游戏库真画出了这条提示：记下，进游戏后起局提示不再重复弹（ios/iml_probe.m） */
+void s2a_shell_iml_notice_seen(void);
 void s2a_shell_pick_game_data(const char *game_id);
 // 宿主让库界面重判各款资源包（说明里「重新检查」后调）。库界面建好时登记；没登记时 s2a_shell_refresh 什么都不做
 typedef void (*s2a_shell_refresh_fn)(void *ctx);
@@ -48,13 +68,25 @@ void s2a_shell_refresh(void);
 //   cornerRadius 为区域短边比例，见 ios/layouts/layout.schema.json）。
 // 要编辑的布局：{"selected":"default|mine|touch|other","hasMine":bool,"holdLock":bool,"buttons":[{id,x,y,width,height,cornerRadius}…]}，
 //   有本款「我的布局」就是它，否则按这块区域现算的默认布局；malloc 出的 UTF-8，调用方 free。游戏号不合规返回 NULL
-char *s2a_shell_vpad_layout_json(const char *game_id, double safe_w, double safe_h);
+// split = 0 普通 / 1 分屏；布局、外观与固定摇杆设置分别保存；键/触模式、锁定和 App 级手感共用。
+char *s2a_shell_vpad_layout_json(const char *game_id, double safe_w, double safe_h, int split);
 // 存本款「我的布局」并选中：centers_json = {"A":[x,y],…}（区域坐标的点，只含挪过的键也行），返回 1 成功 / 0 失败
-int s2a_shell_vpad_save(const char *game_id, const char *centers_json, double safe_w, double safe_h);
+int s2a_shell_vpad_save(const char *game_id, const char *centers_json, double safe_w, double safe_h, int split);
 // 选方案：layout_id = "default" / "mine"，返回 1 成功 / 0 失败（「恢复默认」= 选 default，「我的布局」文件保留）
-int s2a_shell_vpad_select(const char *game_id, const char *layout_id);
+int s2a_shell_vpad_select(const char *game_id, const char *layout_id, int split);
+// iOS 主线程 UIView 预览：返回真实区域和已避让的按键框（点）；malloc / free，同生产布局。
+// {split:bool,area:[x,y,w,h],game:[x,y,w,h],division:[x,y,w,h]|null,buttons:[{id,x,y,width,height,cornerRadius}],stickRadius:number}
+char *s2a_shell_vpad_preview(const char *game_id, void *view, int split);
 // ZL / ZR 按住锁定开关（按游戏，与游戏内设置同一份数据），返回 1 成功 / 0 失败
 int s2a_shell_vpad_set_hold_lock(const char *game_id, int enabled);
+
+// 单款画面补丁与金手指（11-13 维护者：游戏库按住游戏的设置里也有帧率 / 满屏 / 金手指，记住选择）。实现在宿主 ios/game_options.m，
+//   与游戏内设置页、社区补丁页、金手指面板同一份存储。本包 s2a_shell.c 是弱定义缺省（读 NULL、写 0）。
+// {"fps":{"on","enabled","note"},"fullscreen":{"on","enabled","note"},"patches":[{"id","title","note","on"}],"cheats":[{"key","name","note","on"}]}，
+//   note 已按当前语言；malloc 出的 UTF-8，调用方 free。游戏号不合规返回 NULL
+char *s2a_shell_game_options_json(const char *game_id);
+// kind = "fps" / "fullscreen" / "patch" / "cheat"，key = 补丁编号 / 「文件名/条目名」（前两种不看），返回 1 存成 / 0 没存成
+int s2a_shell_game_option_set(const char *game_id, const char *kind, const char *key, int on);
 
 // iCloud 存档同步（新功能线 11-09；方案见 launchers/shared/SaveSync）：
 //   s2a_shell_save_context：本款存档作业的公共字段 {"game":<存档身份>,"dataRoot":…,"workRoot":…}，malloc 出的 UTF-8、调用方 free；
@@ -64,6 +96,12 @@ int s2a_shell_vpad_set_hold_lock(const char *game_id, int enabled);
 char *s2a_shell_save_context(void);
 char *s2a_shell_save_request(const char *json);
 void *s2a_shell_cloud_sync_vc(const char *game_id, void (*done)(void *ctx), void *ctx);
+//   s2a_shell_cloud_upload_background：实现在 S2ArmShellHost（Swift）。游戏进行中切后台时主线程调：开了云存档、本机比云端新才上传（要后台收尾时间、传完交还）；
+//     云端有更新 / 冲突不动，留给下次起局前的同步
+void s2a_shell_cloud_upload_background(const char *game_id);
+
+// 故障报修（游戏库设置页最下面）：实现在宿主 ios/diag.m（可不填的一句说明 → 打包上传、给短码）；本包弱定义缺省什么也不做
+void s2a_shell_report_problem(void);
 
 #ifdef __cplusplus
 }

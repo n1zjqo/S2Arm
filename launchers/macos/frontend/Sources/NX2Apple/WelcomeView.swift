@@ -23,11 +23,11 @@ struct WelcomeView: View {
         var isOK: Bool { if case .ok = state { return true }; return false }
     }
 
-    private static let appleTools: Set<String> = ["Xcode", "Metal 编译组件", "iOS 平台组件", "Apple ID 团队"]
+    private static let appleTools: Set<String> = ["xcode", "metal", "ios_platform", "apple_team"]   // 检查项稳定 id（剃刀 M11）
 
-    private var language: String { loc.lang == .zh ? "zh-Hans" : "en" }
+    private var language: String { loc.lang.sharedCode }
     private func w(_ id: String) -> String { BackendText.launcherText("welcome." + id, language: language) }
-    private func check(_ name: String) -> ToolCheck? { model.checks.first { $0.name == name } }
+    private func check(_ id: String) -> ToolCheck? { model.checks.first { $0.id == id } }
 
     private var macReady: Bool { model.environmentState == .ready || model.environmentState == .readyMac }
     private var keysReady: Bool { model.keysReady == true && !model.keysRejected }
@@ -37,16 +37,16 @@ struct WelcomeView: View {
     private func isDone(_ s: Step) -> Bool {
         switch s { case .mac: return macReady; case .games: return gamesChosen; case .keys: return keysSettled }
     }
-    private var xcodeNotInstalled: Bool { check("Xcode")?.action == "appStoreXcode" && check("Xcode")?.ok == false }
+    private var xcodeNotInstalled: Bool { check("xcode")?.action == "appStoreXcode" && check("xcode")?.ok == false }
 
     /// Xcode 还没走完首次设置时，后端把「打开 Xcode」挂在 Metal 这一项上；对玩家这是 Xcode 的事。
     private var tools: [Tool] {
-        let xcode = check("Xcode"), metal = check("Metal 编译组件"), ios = check("iOS 平台组件")
+        let xcode = check("xcode"), metal = check("metal"), ios = check("ios_platform")
         let firstLaunch = metal?.action == "openXcode"
         let hasXcode = xcode?.ok == true || firstLaunch
         let xcodeState: Tool.State = firstLaunch ? .needs(metal!) : (xcode.map { $0.ok ? .ok : .needs($0) } ?? .waiting)
         let metalState: Tool.State = !hasXcode || firstLaunch ? .waiting : (metal.map { $0.ok ? .ok : .needs($0) } ?? .waiting)
-        let appleState: Tool.State = !hasXcode || firstLaunch ? .waiting : (check("Apple ID 团队").map { $0.ok ? .ok : .needs($0) } ?? .waiting)
+        let appleState: Tool.State = !hasXcode || firstLaunch ? .waiting : (check("apple_team").map { $0.ok ? .ok : .needs($0) } ?? .waiting)
         let iosState: Tool.State = !hasXcode || firstLaunch ? .waiting : (ios.map { $0.ok ? .ok : .needs($0) } ?? .waiting)
         return [
             Tool(id: "xcode", symbol: "hammer", name: w("tool.xcode.name"), what: w(firstLaunch ? "tool.xcode.open" : "tool.xcode.what"),
@@ -59,7 +59,7 @@ struct WelcomeView: View {
 
     /// 苹果工具以外还没过的项（系统版本、游戏库放在云盘等）：不常见，照后端原话列出，不藏。
     private var otherFailing: [ToolCheck] {
-        model.checks.filter { !$0.ok && !Self.appleTools.contains($0.name) && ($0.required(for: "prepare") || $0.required(for: "ipa")) }
+        model.checks.filter { !$0.ok && !Self.appleTools.contains($0.id) && ($0.required(for: "prepare") || $0.required(for: "ipa")) }
     }
 
     /// 当前步骤里唯一配主按钮的那一项：第一个要动手的、且不是「只有 iPhone 才要」的。
@@ -80,19 +80,18 @@ struct WelcomeView: View {
                         Text(loc.backend(error)).font(.manrope(12.5)).foregroundStyle(LauncherPalette.danger)
                             .fixedSize(horizontal: false, vertical: true).padding(.leading, 46).padding(.top, 14)
                     }
+                    // 一键出包放在三步清单正下方（11-14 体验梳理：原先浮在窗口右下角、离清单很远；Windows 上一轮已同样挪到清单下）
+                    if macReady, model.welcomeGame != nil {
+                        Button { model.oneClickExport() } label: { LauncherHeroActionLabel(title: w("oneclick"), symbol: "shippingbox.fill") }
+                            .controllerButtonStyle(.plain).controllerID("welcome.oneclick").keyboardShortcut(.defaultAction).controllerShortcut(.rightTrigger).disabled(model.busy)
+                            .padding(.leading, 46).padding(.top, 26)
+                            .transition(.move(edge: .bottom).combined(with: .opacity))
+                    }
                 }
                 .padding(.vertical, 44).padding(.trailing, 48)
                 .frame(maxWidth: .infinity, minHeight: column.size.height, alignment: .leading)   // 内容短时和左栏一样垂直居中，长了再滚动
             } }
             .frame(width: 560)
-        }
-        .overlay(alignment: .bottomTrailing) {
-            if macReady, model.welcomeGame != nil {
-                Button { model.oneClickExport() } label: { LauncherHeroActionLabel(title: w("oneclick"), symbol: "shippingbox.fill") }
-                    .buttonStyle(.plain).keyboardShortcut(.defaultAction).disabled(model.busy)
-                    .padding(36)
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
-            }
         }
         .animation(.spring(response: 0.5, dampingFraction: 0.75), value: model.welcomeGame?.id)
         .background(alignment: .bottomLeading) {
@@ -125,11 +124,11 @@ struct WelcomeView: View {
         VStack(alignment: .leading, spacing: 0) {
             Spacer(minLength: 24)
             journey.padding(.bottom, 34)
-            Text(w("title")).font(.manrope(44, .heavy)).tracking(-1.4).lineSpacing(4)
-                .fixedSize(horizontal: false, vertical: true)
-            Text(w("lead")).font(.manrope(16)).foregroundStyle(.secondary).lineSpacing(5)
-                .frame(maxWidth: 440, alignment: .leading).fixedSize(horizontal: false, vertical: true)
-                .padding(.top, 20)
+            // 欢迎页的标题和说明都是整句，按页面宽度换行（#1416：原先和别的页一样用单行标题 LauncherHeadingLine，英文等长语言被截成「Put your Switch gam...」）
+            VStack(alignment: .leading, spacing: 18) {
+                Text(w("title")).font(.manrope(44, .heavy)).tracking(-1.4).fixedSize(horizontal: false, vertical: true)
+                Text(w("lead")).font(.manrope(16)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
             Text(w("soon")).font(.manrope(14, .semibold)).foregroundStyle(LauncherPalette.cream.opacity(0.75))
                 .padding(.top, 14)
             Spacer(minLength: 24)
@@ -219,6 +218,7 @@ struct WelcomeView: View {
                     if let job = downloading(tool) { InlineProgress(session: job).padding(.top, 8) }
                     if let failed = failure(of: tool) {
                         Text(loc.backend(failed)).font(.manrope(12.5)).foregroundStyle(LauncherPalette.danger).fixedSize(horizontal: false, vertical: true).padding(.top, 4)
+                        ReportHint()
                     }
                 }
             }
@@ -228,12 +228,12 @@ struct WelcomeView: View {
             case .waiting: Text(w("tool.waiting")).font(.manrope(12)).foregroundStyle(Color.white.opacity(0.58)).fixedSize()
             case .needs(let c):
                 if downloading(tool) != nil {
-                    Button(w("tool.cancel")) { model.stop() }.buttonStyle(LauncherSecondaryButtonStyle())
+                    Button(w("tool.cancel")) { model.stop() }.controllerButtonStyle(LauncherSecondaryButtonStyle())
                         .disabled(model.session?.phase == .stopping)
                 } else if tool.id == "apple" {
                     VStack(alignment: .trailing, spacing: 8) {
                         repairButton(c, primary: false)
-                        Button(loc.t("s2arm.env.recheck")) { model.checkEnvironment() }.buttonStyle(LauncherSecondaryButtonStyle()).disabled(model.checking)
+                        Button(loc.t("s2arm.env.recheck")) { model.checkEnvironment() }.controllerButtonStyle(LauncherSecondaryButtonStyle()).disabled(model.checking)
                     }
                 } else if model.repairQueue.contains(c) {
                     Text(w("tool.queued")).font(.manrope(12.5, .semibold)).foregroundStyle(.secondary).fixedSize()
@@ -326,15 +326,10 @@ struct WelcomeView: View {
     private func actionButton(_ title: String, primary: Bool, enabled: Bool, action: @escaping () -> Void) -> some View {
         Group {
             if primary {
-                Button(action: action) {
-                    Text(title).font(.manrope(14, .bold)).foregroundStyle(.black).fixedSize()
-                        .padding(.horizontal, 20).padding(.vertical, 10)
-                        .background(LauncherPalette.cream, in: Capsule()).contentShape(Capsule())
-                }
-                .buttonStyle(.plain)
+                Button(title, action: action).controllerButtonStyle(LauncherPrimaryButtonStyle()).controllerShortcut(.rightTrigger, focused: true)
             } else {
                 Button(action: action) { Text(title).font(.manrope(13, .semibold)).fixedSize() }
-                    .buttonStyle(LauncherSecondaryButtonStyle())
+                    .controllerButtonStyle(LauncherSecondaryButtonStyle())
             }
         }
         .disabled(!enabled).opacity(enabled ? 1 : 0.5)

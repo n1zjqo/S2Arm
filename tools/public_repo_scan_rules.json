@@ -1,5 +1,14 @@
 {
   "version": 1,
+  "reviewed_archives": [
+    {
+      "id": "sparkle_2_10_1_swiftpm",
+      "path": "launchers/macos/frontend/Vendor/Sparkle-2.10.1.zip",
+      "sha256": "4c2e48a3e50ebcc2c88a58a4c7264a1a99c3c31857ce754357afb9cdb323022a",
+      "reason": "Sparkle 2.10.1 官方 SwiftPM ZIP 原样离线依赖，MIT 许可见同目录 Sparkle-LICENSE.txt；SHA-256 与改为本地包前 Package.swift 的钉值一致。仅核对归档字节，不扫描正文。",
+      "source": "https://github.com/sparkle-project/Sparkle/releases/download/2.10.1/Sparkle-for-Swift-Package-Manager.zip"
+    }
+  ],
   "content_rules": [
     {
       "id": "home",
@@ -59,22 +68,6 @@
       "regex": "(?<![A-Za-z0-9_-])jhz(?![A-Za-z0-9_-])"
     },
     {
-      "id": "maintainer_alias",
-      "category": "internal_name",
-      "regex": "总指挥|天眼(?:（Windows 出包机）|\\(Windows 出包机\\))?"
-    },
-    {
-      "id": "internal_line_name",
-      "category": "internal_name",
-      "messages_only": true,
-      "regex": "(?:主线线|合入运维线|运维线|启动器线|出包修复线|质量线|新功能线|迁仓线|单壳线|Switch ?2 ?线|满屏补丁线|满屏线|普查线|帧率能耗线|能耗线|一次成功线|画质性能线|性能线|体验线|合入线|列车线|众包线|直连线|出包速度线|卡顿线|Windows ?出包线)(?![程性路索条框])"
-    },
-    {
-      "id": "internal_device_word",
-      "category": "internal_name",
-      "regex": "测试机"
-    },
-    {
       "id": "private_host_mini",
       "category": "internal_name",
       "regex": "(?<![A-Za-z0-9_./-])(?<!iPad )(?<!Mac )(?<!mac )mini(?![A-Za-z0-9_-])"
@@ -111,9 +104,11 @@
         "docs/validation/*",
         "docs/兼容性清单.md",
         "docs/名单_*",
-        "docs/名单_*/*", "docs/*.md"
+        "docs/名单_*/*",
+        "docs/*.md"
       ],
-      "messages": true, "reason_note": "11-09 维护者批统一规则：公开仓不出现任天堂第一方游戏名（11-10 jhz 定：第一方按「任天堂发行」算，不论哪家工作室开发，如猎天使魔女 2 / 3、异界锁链）；第三方只在说明性场合保留。先管给人看的文档与名单（11-09 晚起含 docs/ 下全部 Markdown，坑记录也算）与提交信息（messages: true），代码注释另议；pack/display_names.tsv 第一列是与 pack/oneclick/titles.tsv 对上的内部键，不在本规则内（显示名已是程序号）"
+      "messages": true,
+      "reason_note": "11-09 维护者批统一规则：公开仓不出现任天堂第一方游戏名（11-10 jhz 定：第一方按「任天堂发行」算，不论哪家工作室开发，如猎天使魔女 2 / 3、异界锁链）；第三方只在说明性场合保留。先管给人看的文档与名单（11-09 晚起含 docs/ 下全部 Markdown，坑记录也算）与提交信息（messages: true），代码注释另议；pack/display_names.tsv 第一列是与 pack/oneclick/titles.tsv 对上的内部键，不在本规则内（显示名已是程序号）"
     }
   ],
   "metadata_rules": [
@@ -171,9 +166,44 @@
       ],
       "paths": [
         "launchers/macos/Branding/AppIcon-1024.png",
-        "launchers/macos/Branding/wordmark-transparent.png"
+        "launchers/macos/Branding/AppIcon-iOS.png",
+        "launchers/macos/Branding/wordmark-transparent.png",
+        "launchers/macos/Branding/s-gold.png",
+        "shell/Sources/ShellUI/Resources/s-gold.png"
       ],
-      "reason": "自家 S2Arm 应用图标（同目录 AppIcon.svg 为源稿）和透明底字标。"
+      "reason": "自家 S2Arm 应用图标（同目录 AppIcon.svg 为源稿）、透明底字标，和由应用图标生成的金色 S（毛玻璃双色：香槟金 + 玫瑰金，make_s_gold.py）。"
+    },
+    {
+      "id": "own_feature_spotlight_art",
+      "categories": [
+        "game_screenshot"
+      ],
+      "paths": [
+        "docs/site/feature/*.jpg"
+      ],
+      "reason": "启动器新功能大窗的示意图（HTML 画的界面示意与抽象风景，生成脚本在维护者本机），不含任何游戏画面。"
+    },
+    {
+      "id": "own_installer_ui",
+      "categories": [
+        "game_screenshot"
+      ],
+      "paths": [
+        "launchers/windows/installer/*.bmp"
+      ],
+      "reason": "Windows 安装程序界面素材：同目录 make_header.py 生成的纯色底、圆角按钮 / 卡片 / 进度条、复选框和自家字标，不是游戏画面。"
+    },
+    {
+      "id": "inno_setup_dll_import",
+      "categories": [
+        "email"
+      ],
+      "paths": [
+        "launchers/windows/installer/*.iss"
+      ],
+      "regex": "^[A-Za-z0-9_]+@[A-Za-z0-9_]+\\.dll$",
+      "line_regex": "external '",
+      "reason": "Inno Setup 脚本里从系统库导入函数的外部声明（函数名、at 号、user32.dll 这样连写），形似邮箱、不是邮箱；只认 installer 目录下 .iss、整条命中为「名字@名字.dll」且所在行有 external 声明。"
     },
     {
       "id": "own_ui_docs",
@@ -227,6 +257,16 @@
         "compat/tree/src/Ryujinx.HLE/Homebrew.npdm"
       ],
       "reason": "上游 Ryujinx（MIT）原样提交的预编译 SPIR-V 着色器、JIT 支持库与自制程序 npdm，构建要用。"
+    },
+    {
+      "id": "generated_synthetic_systemdata_tar",
+      "categories": [
+        "uncovered_unreviewed_type"
+      ],
+      "paths": [
+        "services/S2A.Services/systemdata_synth.tar"
+      ],
+      "reason": "本库 tools/make_sysdata_synth_tar.py 从 pack/sysdata_synth.py 常量生成的空结构系统数据，不读取游戏、固件或密钥；tests/sysdata_synth_tar_test.py 逐字节重算核对。仅保留这一精确路径的未扫描正文边界，不泛化到其他 tar。"
     },
     {
       "id": "upstream_nuget_packages",
@@ -324,6 +364,7 @@
       "paths": [
         "graphics/metal/shaders/AA-LICENSE.txt",
         "runtime/rewriter/LICENSES/*",
+        "launchers/macos/frontend/Vendor/Sparkle-LICENSE.txt",
         "compat/tree/*/Smaa*.glsl",
         "compat/tree/*/SMAA*.glsl"
       ],
@@ -513,8 +554,8 @@
       "android/codecs/tests/vectors/*.h264",
       "android/codecs/tests/vectors/*.headers",
       "android/codecs/tests/vectors/*.pps-change",
+      "android/tests/fixtures/input-identity-v1/*.bin",
       "compat/tree/src/Ryujinx.Graphics.Vulkan/Effects/Textures/*.bin",
-      "graphics/tools/shbake/tests/refpso/*.gz",
       "launchers/windows/launcher/App/Assets/Fonts/*.ttf",
       "shell/Sources/ShellUI/Resources/*.ttf",
       "runtime/tests/cpatch_loader/module.nso",
@@ -541,11 +582,12 @@
       "runtime/fps/*.tsv",
       "runtime/tests/cpatch/*.tsv",
       "graphics/tools/shbake/tests/trlog_baseline.tsv",
-      "graphics/tools/shbake/tests/refpso/*.tsv",
       "android/codecs/tests/vectors/*.txt",
       "android/codecs/tests/vectors/*.json",
       "android/codecs/tests/vectors/*.hex",
       "android/tests/fixtures/storage-stages/*.hex",
+      "pack/jobs/tests/fixtures/progress_*.jsonl",
+      "pack/jobs/tests/fixtures/extract_hash_mismatch_*.log",
       "compat/tree/src/Ryujinx.HLE/HOS/Applets/SoftwareKeyboard/Resources/*.svg",
       "launchers/macos/adapter/Sources/S2ArmAppleAdapter/Resources/*.json",
       "launchers/windows/launcher/App/Assets/Fonts/*.txt",
@@ -578,7 +620,6 @@
       "graphics/widen/tables/*",
       "runtime/fps/*.tsv",
       "runtime/tests/cpatch/*.tsv",
-      "graphics/tools/shbake/tests/refpso/*",
       "graphics/tools/shbake/tests/trlog_baseline.tsv"
     ],
     "payload_directories": [
@@ -619,6 +660,8 @@
       ".ts"
     ],
     "text_suffixes": [
+      ".ets",
+      ".json5",
       ".spvasm",
       ".svg",
       ".lock",
@@ -699,7 +742,10 @@
       ".yaml",
       ".yml",
       ".patch",
-      ".diff"
+      ".diff",
+      ".iss",
+      ".isl",
+      ".ps1"
     ],
     "text_names": [
       "Makefile",

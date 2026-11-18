@@ -7,6 +7,7 @@
 #include <string.h>
 #include <dlfcn.h>
 #include "s2a_native.h"
+#include "s2a_lowva.h"   // S2A_VMTAG_*：宿主自有映射的虚存标签
 #include <pthread.h>
 // 给我方宿主线程起名（11-04 能耗线：「[能耗]」行的耗能前 6 线程只认名字，没名字的只剩线程号，Pokopia 一条吃半个核的宿主线程认不出是谁）。
 //   名字 ≤ 15 字节 ASCII（Linux / 安卓上限 16 含结尾），苹果 / 非苹果签名不同
@@ -40,6 +41,7 @@ __attribute__((weak)) void s2a_logcon_flush(void) {}
 #ifdef S2A_LOGCAP_IMPL
 void s2a_log_out(int fd, const char *p, size_t n);
 #else
+#define S2A_LOG_OUT_WEAK 1   // 本编译单元已有弱定义（单测把多份源码拼进同一单元时，后面的强定义要让位，见 runtime/tests/t_thread.c）
 __attribute__((weak)) void s2a_log_out(int fd, const char *p, size_t n) { ssize_t w = write(fd, p, n); (void)w; }
 #endif
 // 一行日志一次写出：多线程同时打不穿插（旧库 sw.h 同做法）
@@ -67,21 +69,33 @@ __attribute__((format(printf, 1, 2))) static inline void s2a_log_line2(const cha
 // Android 地址窗口：平台实现先按最大值整块保留（platform/vawin_android.inc），起局时
 // svc_mem 用 s2a_layout_need 算出本款跨度再 s2a_window_trim 收缩。非 Android 由 vawin.c
 // 直接按本款跨度预留，不再使用这个最大值常量。
-#define S2A_WIN_SIZE (68ull << 30)
+#define S2A_WIN_SIZE (72ull << 30)   // 63 GiB 别名区 + 栈区 2 GiB（Horizon 真值）+ 堆 + 模块放得下（layout_android.inc）
 #endif
 void s2a_log_session_start(void);   // iOS 主线程：正式激活才轮换日志 / 切 fd / 起控制台副本；幂等
 // energy.c：进程能耗分账（快照单位：纳秒 / 纳焦；s2a_energy_log 打「上次调用以来」一行）
-typedef struct { uint64_t wall, cpu, pcpu, nj, pnj, cyc, pcyc, intr, idle; double gpu_ms; int ok_g; } s2a_esnap;   // gpu_ms：直连层 GPU 忙累计毫秒（时间，非能耗；ok_g = 有直连层）
+typedef struct { uint64_t wall, cpu, pcpu, nj, pnj, cyc, pcyc, intr, idle; double gpu_ms, gpu_clk_ms; int ok_g; } s2a_esnap;   // gpu_ms：直连层 GPU 忙累计毫秒（时间，非能耗；ok_g = 有直连层）
 int s2a_energy_snap(s2a_esnap *s);
+// 两次采样之间的 GPU 忙 ms/s：分母取 GPU 时钟差（gpu_clk_ms，已入账各帧最晚 GPU 结束），不取墙钟——GPU 忙晚 8 帧在 CPU 帧边界入账，墙钟窗口会把慢帧前的时间挤进来；
+//   读不到（没有直连层）返回 -1，这段时间没有帧入账返回 0
+double s2a_gpu_busy_rate(const s2a_esnap *a, const s2a_esnap *b);
 void s2a_energy_log(void);
 int s2a_energy_capture(char *out, size_t n);
 int s2a_spin_step(const uint64_t *tid, const char *const *name, const double *cores, int n, double sec, int lim);   // 游戏线程满核空转判定（energy.c）
 void s2a_spin_test_reset(void);
 // 初始启动/运行时仍按原规则中止。重启的纯 C 装载事务可以回到失败
 // 边界，保留失败现场并通知壳；该边界不包住 C#、GPU 或客体执行。
+// 静默致命退出：出包期的辅助运行（游戏 GLSLC / Oodle 工具模式、管线归档、帧回放）与作业层标了 S2A_CRASH_QUIET=1 的起局，
+//   出错只写日志、以退出码交回调用方，不 abort / 不按信号死——按信号死 macOS 会给 App 弹「意外退出」系统框，玩家看到的却是出包成功
+static inline int s2a_crash_quiet(void) {
+    const char *q = getenv("S2A_CRASH_QUIET");
+    return (q && q[0] == '1') || getenv("DM_GLSLC_JOB") || getenv("DM_OODLE_SERVE") || getenv("S2A_PSO_HARVEST") || getenv("S2A_FRAME_REPLAY");
+}
 __attribute__((noreturn)) static inline void s2a_native_fatal(void) {
+    { const char *(*wn)(void) = (const char *(*)(void))dlsym(RTLD_DEFAULT, "s2a_waived_note"); const char *w = wn ? wn() : NULL;   // waived.c：带着没过的校验跑到这里
+      if (w && *w) LOG("【红】之前这些校验没过（照常继续了）：%s", w); }
     void (*boot_abort)(void) = (void (*)(void))dlsym(RTLD_DEFAULT, "s2a_session_abort_boot");
     if (boot_abort) boot_abort();
+    if (s2a_crash_quiet()) _exit(70);
     abort();
 }
 #define die(...) do { LOG("FATAL " __VA_ARGS__); s2a_native_fatal(); } while (0)
@@ -94,6 +108,9 @@ void s2a_window_reserve(void);                 // 一次性预留；所有启动
 void s2a_window_get(uint64_t *base, uint64_t *size);
 uint64_t s2a_window_spare(void);              // 窗口之外还能给宿主大映射的地址（收尾还回 + 窗口所在空洞其余部分，vawin.c）
 void s2a_window_need(uint64_t *need, uint64_t *fit);   // 本款要的跨度、本机 2^39 以下最大能放的一块（自检提示用）
+uint64_t s2a_window_hole_top(void);   // 2^39 / 2^36 以下那次找空洞的上界（与系统地址上限取小；没算到 0）
+int s2a_window_hi36_tried(void);   // 36 位款是否在 2^36 以上按 2^36 对齐的各块里找过窗口（#1419）
+void s2a_window_fatal_msg(char *out, size_t cap, uint64_t need, uint64_t fit, uint64_t hole_top, int hi36);   // 窗口没占到时的 FATAL 文字（纯函数）
 // 客体窗口里在内存 / 已压缩换出的字节（mincore 扫整窗，心跳用）
 void s2a_window_resident(uint64_t *res, uint64_t *out);
 int s2a_guest_fd(void); int s2a_guest_zero(uint64_t a, uint64_t n); void *s2a_guest_map_any(uint64_t len);   // vawin.c：客体内存文件后备（S2A_GUEST_FILE）——文件 fd（-1 = 没开）；还页打洞 + 原偏移重映射成不可访问（不在窗口 / 没开 = 0）
@@ -129,6 +146,10 @@ int   s2a_tail_has(const void *p);
 void  s2a_tail_note(char *o, size_t cap);
 void s2a_fd_usage(int *open_n, uint64_t *soft, uint64_t *hard);   // 已开文件句柄数（探到 min(软上限, 4096)）+ RLIMIT_NOFILE 软 / 硬上限
 int s2a_gc_limit_pick(uint64_t largest); void s2a_gc_limit_apply(void);   // GC 上限自适应三档（gclimit.c）：0 不设 / 1 总 2 GB / 2 分堆
+uint64_t s2a_window_for_span(uint64_t learned);                     // vawin.c：按学到的跨度该给多大窗口（learned × 1.25 + 2 GiB，1 GiB 取整；0 = 没学到、不限）
+uint64_t s2a_window_host_below(uint64_t fit, uint64_t learned);   // vawin.c：放不下标准布局时窗口下方留给宿主多少（按学到的跨度，#783）
+uint64_t s2a_window_span_seen(uint64_t pid);                        // vawin.c：本款本机学到的地址跨度（wire/<程序号>/span_peak；没有 = 0）
+uint64_t s2a_mem_span_now(void);                                     // svc_mem.c：本局已碰到的地址跨度（碰到的最高地址 − 窗口基址）
 void s2a_low_holes(uint64_t *total, uint64_t *largest);   // 4 GB 到窗口底之间的空洞合计 / 最大块           // 布局只用前 size 字节时把尾部还给系统        // 打一行窗口探测：窗口内除自己的占位外还有没有别人的映射
 void s2a_lowva_start(void);   // 低区统一记账（lowva.c，接口 runtime/include/s2a_lowva.h）：起巡检线程
 int  s2a_lowva_tick(void);    // 巡检一拍，返回下一拍间隔秒数（单测直接调）
@@ -196,6 +217,11 @@ void s2a_envfile_log_flush(void);   // 启动单线程调用，输出后清空�
 uint64_t guest_ns(void);
 uint64_t guest_tick(void);      // 系统计数器（Switch 19.2 MHz / Switch 2 31.25 MHz，s2a_guest_tick_hz）
 uint64_t s2a_guest_tick_hz(void); uint64_t s2a_ns_to_tick(uint64_t ns);
+// 后端已校准的宿主时刻（plat_now_ns 域；安卓为 CLOCK_MONOTONIC）转游戏计数器。
+// 苹果 plat_now_ns 是 mach_absolute_time 域，不能直接传 CLOCK_MONOTONIC；首版 Metal 不宣告时间戳能力。
+// 仅接受当前冻结/运行映射区间内的非未来样本；跨冻结边界的历史样本无法还原，返回 0 且不改 out。
+// 成功返回 1，*out 可以为 0。任意线程可调；不以完成回调的 CPU 时刻替换输入。
+int s2a_guest_tick_from_host_ns(uint64_t host_ns, uint64_t *out);
 void s2a_thread_set_hw_cores(int n); int s2a_thread_hw_cores(void);   // thread.c：硬件核数（Switch 4、Switch 2 8）
 // 游戏时钟按原因冻结（1 后台会话、2 系统键盘、3 Mac 失焦、4 安卓退后台），全部解除才接着走（os.c）。
 void guest_clock_freeze_for(int reason, int on);
@@ -225,6 +251,7 @@ typedef struct {
     const Elf64_Dyn *dyn; const Elf64_Sym *symtab; const char *strtab; unsigned nsym;
     uint32_t *symh; unsigned symh_mask;
     uint64_t init;
+    uint64_t plt_stub, pltgot;   // rtld 懒绑定：JUMP_SLOT 槽的原值（PLT 表头）+ 基址、DT_PLTGOT 偏移（relocate 记，ro_handoff 交给游戏的 nn::ro；0 = 本模块没有）
 } module_t;
 extern module_t *g_mod;
 extern int g_nmod, g_mod_cap;
@@ -245,6 +272,45 @@ static inline int s2a_in_patch(const module_t *m, uint64_t a) {
     int64_t off = (int64_t)(a - (uint64_t)m->base);
     if (m->patch_off < 0 ? off >= m->patch_off && off < m->patch_off + (int64_t)m->patch_len : off >= m->patch_off && (uint64_t)off < m->size) return 1;
     return m->patch2_len && off >= m->patch2_off && off < m->patch2_off + (int64_t)m->patch2_len;
+}
+// 模块内偏移 off 落在哪个导出函数（或最近的前一个）：取 st_value 非 0 的函数符号里地址 ≤ off 的最大者（同址取长的、再取名字大的，同 tools/nso_sym.py sym）。
+//   *delta = off − 函数地址，*inside = off 在函数长度之内。没有符号表 / 在第一个导出函数之前 → NULL。
+//   符号表是装载器从模块动态段取的（loader.c parse_dynamic），游戏自带、已在内存里：不读文件、不分配，信号处理里可调；线性扫描，只在出事时用（#806）。
+//   写成内联：只用 module_t 字段，各单测 / 安卓测试宿主给 module_of 打的桩照旧够用，不引入新的链接符号
+static inline const char *module_func_at(const module_t *m, uint64_t off, uint64_t *delta, int *inside) {
+    if (!m || !m->symtab || !m->strtab || !m->nsym) return NULL;
+    const Elf64_Sym *best = NULL;
+    for (unsigned i = 1; i < m->nsym; i++) {
+        const Elf64_Sym *s = &m->symtab[i];
+        if (!s->st_value || (s->st_info & 0xF) != 2 || s->st_value > off) continue;   // 2 = STT_FUNC
+        if (best && (s->st_value < best->st_value || (s->st_value == best->st_value && (s->st_size < best->st_size
+            || (s->st_size == best->st_size && strcmp(m->strtab + s->st_name, m->strtab + best->st_name) <= 0))))) continue;
+        best = s;
+    }
+    if (!best) return NULL;
+    if (delta) *delta = off - best->st_value;
+    if (inside) *inside = off < best->st_value + best->st_size;
+    return m->strtab + best->st_name;
+}
+// 截断时去掉末尾不完整的 UTF-8 字符（日志里不留半个汉字 / 全角括号）
+static inline void s2a_utf8_trim(char *b, size_t n) {
+    size_t l = strnlen(b, n); if (!l) return;
+    size_t i = l; while (i > 0 && ((uint8_t)b[i - 1] & 0xC0) == 0x80) i--;   // 退到最后一个字符的首字节
+    if (!i) return;
+    uint8_t c = (uint8_t)b[i - 1]; size_t need = c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC0 ? 2 : 1;
+    if (l - (i - 1) < need) b[i - 1] = 0;
+}
+// 客体地址 → 「模块+偏移（导出名+偏移）」写进 b，返回 1；不在游戏模块内返回 0、不写。补丁区标「（补丁区）」不翻名；没有可翻的名字只打「模块+偏移」（老包 / 无符号同旧格式）
+static inline int s2a_guest_where(uint64_t a, char *b, size_t n) {
+    module_t *m = module_of((void *)(uintptr_t)a);
+    if (!m) return 0;
+    int64_t off = (int64_t)(a - (uint64_t)(uintptr_t)m->base);
+    if (off < 0 || s2a_in_patch(m, a)) { snprintf(b, n, "%s%s%#llx（补丁区）", m->name, off < 0 ? "-" : "+", (unsigned long long)(off < 0 ? -off : off)); return 1; }
+    uint64_t d = 0; int in = 0; const char *f = module_func_at(m, (uint64_t)off, &d, &in);
+    int w = f ? snprintf(b, n, "%s+%#llx（%.120s+0x%llx%s）", m->name, (unsigned long long)off, f, (unsigned long long)d, in ? "" : "，外")
+              : snprintf(b, n, "%s+%#llx", m->name, (unsigned long long)off);
+    if (w >= (int)n) s2a_utf8_trim(b, n);
+    return 1;
 }
 // brk 兜底点（改写器双岛模式下两岛都够不着的必改点）：种类与序号见 traps.c
 enum { S2A_TRAP_TPIDR_R, S2A_TRAP_TPIDRRO_R, S2A_TRAP_TPIDR_W, S2A_TRAP_CTR };

@@ -5,8 +5,8 @@
 #   ① 文件名 = sha256(控制段前 0x48 字节、+0x20..+0x27 与 +0x30..+0x33 置零 ‖ 代码区)[:16] → 退出 0；cs_rt.bin 一条记录（'BTCDBTCD' + 0x38 头，+0x28 控制段长、+0x2c 代码长，代码在前）；
 #      shader_map.tsv 追加「cs_rt.bin 0 compute <键> rt-dump:<键>」；答案表追加 {"local":[32,4,1],"shared":5104}（共享 5100 向上按 16 对齐）
 #   ② 再跑一次：已在表里，不重复追加（表行数不变），退出 0
-#   ③ 文件名与重算键不符 → 报红、退出非 0、不写包
-#   ④ 控制段 +0x44 与代码长不符 → 报红、退出非 0
+#   ③ 文件名与重算键不符 → 跳过这一支、打 [WARN]、退出 0、不写包（v0.3.1 拿不准不停 ⑭；原先报红退非 0、整个合并停）
+#   ④ 控制段 +0x44 与代码长不符 → 同 ③：跳过、[WARN]、退出 0
 set -u; H=$(cd "$(dirname "$0")/.." && pwd); T=$(mktemp -d); bad=0; trap 'rm -rf "$T"' EXIT
 PY=${S2A_PY:-python3}; TOOL=$H/translator/rt_dump_merge.py
 ck() { if eval "$2"; then echo "通 $1"; else echo "不通 $1"; bad=1; fi; }
@@ -33,8 +33,25 @@ n2=$(wc -l < $T/a/map.tsv); o2=$("$PY" "$TOOL" $T/a/dump $T/a/pkg $T/a/map.tsv $
 ck "② 再跑不重复：rc=${r2}、表行 ${n2} → $(wc -l < $T/a/map.tsv)、「${o2}」" "[ $r2 = 0 ] && [ $n2 = \$(wc -l < $T/a/map.tsv) ] && [[ \"\$o2\" == *'已在表里 1 支'* ]]"
 init $T/b; mk $T/b/dump 512 512 0123456789abcdef > /dev/null
 o3=$("$PY" "$TOOL" $T/b/dump $T/b/pkg $T/b/map.tsv $T/b/facts.tsv 2>&1); r3=$?
-ck "③ 键不符报红：rc=${r3}、「${o3}」" "[ $r3 != 0 ] && [[ \"\$o3\" == *'与文件名不符'* ]] && [ ! -e $T/b/pkg/cs_rt.bin ]"
+ck "③ 键不符跳过：rc=${r3}、「${o3}」" "[ $r3 = 0 ] && [[ \"\$o3\" == *'与文件名不符'*'跳过这一支'* ]] && [[ \"\$o3\" == *'坏了跳过 1 支'* ]] && [ ! -e $T/b/pkg/cs_rt.bin ]"
 init $T/c; mk $T/c/dump 512 256 > /dev/null
 o4=$("$PY" "$TOOL" $T/c/dump $T/c/pkg $T/c/map.tsv $T/c/facts.tsv 2>&1); r4=$?
-ck "④ 代码长不符报红：rc=${r4}、「${o4}」" "[ $r4 != 0 ] && [[ \"\$o4\" == *'+0x44'* ]] && [ ! -e $T/c/pkg/cs_rt.bin ]"
+ck "④ 代码长不符跳过：rc=${r4}、「${o4}」" "[ $r4 = 0 ] && [[ \"\$o4\" == *'+0x44'*'跳过这一支'* ]] && [ ! -e $T/c/pkg/cs_rt.bin ]"
+# ⑤ Switch 1 图形阶段（11-15 着色器补料）：合成顶点 / 像素各一支（控制段魔数 0x98761234、+0x20 自报 0x880、+0x704 代码长；代码区魔数 0x12345678、+0x30 SPH 字 0x0461 = 顶点、0x1400 = 像素），
+#   期望按 shader_split.py 公式手写：键 = sha256(控制段 0x880 ‖ 代码区)[:16]；vs_rt.bin / ps_rt.bin 各一条记录；表追加「vs_rt.bin 0 vertex <键>」「ps_rt.bin 0 pixel <键>」；答案表不加
+mk1() {   # mk1 <目录> <SPH 字>
+  "$PY" - "$@" <<'PY'
+import hashlib, os, struct, sys
+d, w = sys.argv[1], int(sys.argv[2], 0)
+code = bytearray(0x100); code[:4] = b'\x78\x56\x34\x12'; struct.pack_into('<I', code, 0x30, w)
+for i in range(0x80, 0x100): code[i] = (i * 5 + w) & 0xff
+ctl = bytearray(0x880); ctl[:4] = b'\x34\x12\x76\x98'; struct.pack_into('<I', ctl, 0x20, 0x880); struct.pack_into('<I', ctl, 0x704, len(code))
+k = hashlib.sha256(bytes(ctl) + bytes(code)).hexdigest()[:16]
+os.makedirs(d, exist_ok=True); open(f'{d}/{k}.ctl', 'wb').write(ctl); open(f'{d}/{k}.code', 'wb').write(code); print(k)
+PY
+}
+init $T/e; KV=$(mk1 $T/e/dump 0x0461); KP=$(mk1 $T/e/dump 0x1400)
+o5=$("$PY" "$TOOL" $T/e/dump $T/e/pkg $T/e/map.tsv $T/e/facts.tsv 2>&1); r5=$?
+ck "⑤ Switch 1 顶点 / 像素并入：rc=${r5}、「${o5}」、表「$(tail -2 $T/e/map.tsv | tr '\n' '|')」" \
+  "[ $r5 = 0 ] && grep -qxF \"\$(printf 'vs_rt.bin\t0\tvertex\t%s\trt-dump:%s' $KV $KV)\" $T/e/map.tsv && grep -qxF \"\$(printf 'ps_rt.bin\t0\tpixel\t%s\trt-dump:%s' $KP $KP)\" $T/e/map.tsv && [ -s $T/e/pkg/vs_rt.bin ] && [ -s $T/e/pkg/ps_rt.bin ] && [ \$(grep -vc '^#' $T/e/facts.tsv) = 0 ]"
 [ $bad = 0 ] && echo "rt_dump_merge 单测全过" || { echo "rt_dump_merge 单测有不通"; exit 1; }

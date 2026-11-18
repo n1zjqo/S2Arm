@@ -69,6 +69,42 @@ class LongPathTest(unittest.TestCase):
         self.assertEqual(sr.to_long(link + "\\work", t), long + "\\work")
         self.assertEqual(sr.to_long("C:\\x", t), "C:\\x")
 
+    def test_show_maps_leftover_entry_to_long_path(self):
+        # #1173 / 诊断#0e3bd5：oneclick_win 结果事件里的 ipa 路径还是 …\S2A\j\gkam\…，父进程在入口拆掉后拷 → WinError 3。
+        #   show 先按表换（不分大小写），表没覆盖的残留入口按联接真实目标换；读不出联接就原样
+        from pack.orch import shortroot as sr
+        from unittest import mock
+        lib = "D:\\Games\\Lib"
+        link = "C:\\Users\\Flacko\\AppData\\Local\\S2A\\j\\gkam"
+        ipa = "\\s2arm\\games\\re4\\build\\ios\\work\\pkg\\t0100.ipa"
+        env = {"LOCALAPPDATA": "C:\\Users\\Flacko\\AppData\\Local", sr.ENV: f"{lib}\t{link}"}
+        with mock.patch.dict(os.environ, env, clear=False):
+            self.assertEqual(sr.show(link + ipa), lib + ipa, "表里有：照旧换")
+            self.assertEqual(sr.show(link.replace("Flacko", "flacko") + ipa), lib + ipa, "大小写不同也换")
+        env2 = {"LOCALAPPDATA": "C:\\Users\\Flacko\\AppData\\Local", sr.ENV: ""}
+        with mock.patch.dict(os.environ, env2, clear=False):
+            seen = []
+            def readlink(p):
+                seen.append(p); return "\\??\\" + lib + "\\"
+            self.assertEqual(sr.show(link + ipa, readlink=readlink), lib + ipa, "表没覆盖：按联接真实目标换")
+            self.assertEqual(seen, [link])
+            def gone(p): raise OSError(2, "gone")
+            self.assertEqual(sr.show(link + ipa, readlink=gone), link + ipa, "联接读不出：原样")
+            self.assertEqual(sr.show("C:\\x\\y"), "C:\\x\\y", "不相干路径不动")
+
+    def test_remap_env_moves_tool_cache_vars_under_short_root(self):
+        # v0.3.0 win_cases deep：工具缓存 <库>/tool-cache 经环境变量传给出包链，库在深目录时要一并换成短入口。期望手写
+        from pack.orch import shortroot
+        lib = 'T:\\deep\\' + 'p' * 200 + '\\DefaultLibrary'
+        env = {'S2A_RUN_ROOT': lib + '\\tool-cache\\run', 'S2A_CS_CACHE': lib + '\\tool-cache\\cache\\nxaot',
+               'S2A_PROGRESS': 'C:\\Users\\u\\AppData\\Local\\S2Arm\\logs\\t.tsv', 'PATH': 'C:\\Windows', 'X': lib + '\\tool-cachex', 'EMPTY': ''}
+        changed = shortroot.remap_env(env, lib + '\\tool-cache', 'C:\\L\\S2A\\j\\ab12\\tool-cache')
+        self.assertEqual(sorted(changed), ['S2A_CS_CACHE', 'S2A_RUN_ROOT'])
+        self.assertEqual(env['S2A_RUN_ROOT'], 'C:\\L\\S2A\\j\\ab12\\tool-cache\\run')
+        self.assertEqual(env['S2A_CS_CACHE'], 'C:\\L\\S2A\\j\\ab12\\tool-cache\\cache\\nxaot')
+        self.assertEqual(env['X'], lib + '\\tool-cachex', '同名前缀的兄弟目录不动')
+        self.assertTrue(env['S2A_PROGRESS'].startswith('C:\\Users'), '不在工具缓存下的不动')
+
     def test_short_codes_are_stable_four_chars_and_probe(self):
         from pack.orch import shortroot as sr
         a = list(sr.codes("R:\\lib"))
@@ -80,6 +116,60 @@ class LongPathTest(unittest.TestCase):
         from pack.orch import shortroot as sr
         self.assertEqual(sr.group_targets(["R:\\lib\\iPhone\\g\\work", "R:\\lib\\cache\\g\\extract"]), ["R:\\lib"])
         self.assertEqual(sorted(sr.group_targets(["R:\\lib\\w", "D:\\x"])), ["D:\\x", "R:\\lib\\w"])
+
+    def test_target_never_holds_entry_dir(self):
+        # 公共上级把短入口目录自己包进去 → 联接指向自己的上级、遍历绕圈（Windows 单测：工作区在 Temp、工具缓存已是 S2A\j\<短号> 下的短路径，
+        #   公共上级 = AppData\Local → 入口 i8wr 指向 Local，WinError 1921、600 秒超时）。期望手写：不合并、各建各的；已在入口下的不再套
+        from pack.orch import shortroot as sr
+        local = r"R:\profile\AppData\Local"   # 应用数据目录（LOCALAPPDATA）
+        j = local + r"\S2A\j"
+        tmp, short = local + r"\Temp\t1\out", j + r"\zqgx\s2a_run"
+        self.assertEqual(sr.group_targets([tmp, short], j), [tmp])
+        lib = r"R:\profile"   # 游戏库设在用户目录：工作区与工具缓存的公共上级 = 用户目录，包住 AppData\Local\S2A\j
+        work, cache = lib + r"\iPhone\g\work", lib + r"\tool-cache"
+        self.assertEqual(sr.group_targets([work, cache], j), [work, cache])
+        self.assertEqual(sr.group_targets([r"R:\lib\w", r"R:\lib\c"], j), [r"R:\lib"])   # 不包入口的照旧合并
+        self.assertEqual(sr.junction_targets([tmp, short], j), [tmp])
+
+    def test_unc_share_is_not_used_as_junction_target(self):
+        from pack.orch import shortroot as sr
+        local = r"R:\lib\iPhone\g\work"
+        unc = r"\\server\share\lib\cache\g\extract"
+        self.assertEqual(sorted(sr.junction_targets([local, unc])), [r"R:\lib\iPhone\g\work"])
+        self.assertTrue(sr.is_network_path(unc))
+        self.assertFalse(sr.is_network_path(local))
+
+    def test_mapped_network_drive_is_not_used_as_junction_target(self):
+        # NAS 映射成盘符（11-14 Windows 实机实测：联接建得出、一访问 WinError 123）：和 UNC 一样不建联接；本地盘照建
+        from unittest.mock import patch
+        from pack.orch import shortroot as sr
+        mapped, local = r"Q:\lib\games\g\build\ios", r"R:\lib\iPhone\g\work"
+        with patch.object(sr, "_remote_drive", lambda d: d.upper() == "Q:"):
+            self.assertTrue(sr.is_network_path(mapped))
+            self.assertFalse(sr.is_network_path(local))
+            self.assertEqual(sr.junction_targets([local, mapped]), [local])
+
+    def test_enter_keeps_unc_paths_unchanged_without_junction(self):
+        import types
+        from unittest.mock import Mock, patch
+        from pack.orch import shortroot as sr
+        unc = r"\\server\share\lib\games\title\build\ios"
+        create = Mock()
+        real_makedirs = sr.os.makedirs
+        def local_makedirs(path, **kwargs):
+            if ntpath.splitdrive(os.fspath(path))[0].startswith("\\\\"):
+                return None
+            return real_makedirs(path, **kwargs)
+        with tempfile.TemporaryDirectory() as t, \
+             patch.object(sr, "entry_dir", return_value=os.path.join(t, "j")), \
+             patch.object(sr, "_is_ntfs", return_value=True), \
+             patch.object(sr, "sweep", return_value=0), \
+             patch.object(sr.os, "makedirs", side_effect=local_makedirs), \
+             patch.dict(sys.modules, {"_winapi": types.SimpleNamespace(CreateJunction=create)}), \
+             patch.dict(os.environ, {"LOCALAPPDATA": t}, clear=False):
+            got = sr.enter(unc)
+            self.assertEqual(got, {ntpath.abspath(unc): ntpath.abspath(unc)})
+            create.assert_not_called()
 
     def test_sweep_removes_orphan_pid_without_junction(self):   # 审计 P2-217：写了 .pid、联接没建成就被杀，残留 .pid 要被扫掉；进程还活着的不动
         from pack.orch import shortroot as sr

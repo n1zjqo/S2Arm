@@ -15,6 +15,9 @@ struct nvn_vk_bcdec;
 // 建四条族的全部管线变体；任何一族失败返回非零，why 写明族名（整局不进直连的上层凭此报红）。
 int nvn_vk_bcdec_create(struct s2a_vk_device *d, struct nvn_vk_bcdec **out, char *why, size_t why_size);
 void nvn_vk_bcdec_destroy(struct s2a_vk_device *d, struct nvn_vk_bcdec *bc);
+// 等所有未证明完成的解码并回收内部资源；0 = 全部完成，-1 = 未证明完成（对象与目标图继续由调用方保活）。
+// destroy 内部也会尝试等待；未完成时保留对象，调用方可稍后再调 wait / destroy。
+int nvn_vk_bcdec_wait(struct s2a_vk_device *d, struct nvn_vk_bcdec *bc, uint64_t timeout_ns);
 
 // nvn 格式 → 解码路由。返回 1 时给出：dst 存储视图格式、采样（逻辑）格式、物理建图格式、
 // BC 族名、每块字节数。sRGB 格式物理图是 UNORM（移动端 sRGB+STORAGE 普遍不支持），SRGB 只放视图。
@@ -27,3 +30,16 @@ int nvn_vk_bcdec_decode(struct nvn_vk_bcdec *bc, struct s2a_vk_device *d,
                         VkImage dst, uint32_t nvn_format, uint32_t w, uint32_t h,
                         uint32_t mip, uint32_t layer, const void *blocks, size_t bytes,
                         char *why, size_t why_size);
+
+// 缓冲 → BC 贴图的段内解码（#697）：游戏把压缩字节从 GPU 缓冲拷进 BC 贴图，字节往往是同一段里前面的命令刚写的，
+// 录制时 CPU 上拿不到，不能走上面那条一次性提交。这里只建资源（输入图、视图、描述符集，挑好管线），**不录命令**：
+// 命令由调用方用自己的 vkCmd* 录（后端开两级回放时 vkCmd* 走包装进录制线程，模块里直接调会和段里其它命令乱序）。
+// 输入图 8 字节块用 RG32_UINT、16 字节块用 RGBA32_UINT（一个纹素一块；S3TC / RGTC 的 8 字节块着色器只读 .xy）。
+// 调用方要录的：in 从 UNDEFINED 转 TRANSFER_DST → 源（16 字节对齐的紧凑块）CopyBufferToImage 到 in（bw×bh）→ in 转 GENERAL
+// → dst 子资源 UNDEFINED 转 GENERAL → 绑 pipe / ds（布局 pl）→ 推 {w, h} 8 字节 → Dispatch((w+7)/8, (h+7)/8, 1)。
+// 资源要等段执行完才能 nvn_vk_bcdec_rec_free；返回非 0 时 rec 已清空。
+struct nvn_vk_bcdec_rec { VkImage in; VkDeviceMemory in_mem; VkImageView in_view, out_view; VkDescriptorPool pool;
+                          VkDescriptorSet ds; VkPipeline pipe; VkPipelineLayout pl; uint32_t bw, bh; };
+int nvn_vk_bcdec_prepare(struct nvn_vk_bcdec *bc, struct s2a_vk_device *d, VkImage dst, uint32_t nvn_format,
+                         uint32_t w, uint32_t h, uint32_t mip, uint32_t layer, struct nvn_vk_bcdec_rec *rec, char *why, size_t why_size);
+void nvn_vk_bcdec_rec_free(struct s2a_vk_device *d, struct nvn_vk_bcdec_rec *rec);

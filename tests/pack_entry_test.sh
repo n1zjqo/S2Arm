@@ -22,6 +22,12 @@ for f in files:
 need = {'pack/jobs/build.py': 'pack/refresh.sh', 'pack/ipa.sh': 'refresh.sh', 'pack/oneclick/oneclick.sh': 'refresh.sh', 'pack/jobs/ipa.py': 'pack/oneclick/oneclick.sh'}
 for f, s in need.items():
     if s not in open(f'{h}/{f}', encoding='utf-8').read(): bad.append(f'{f} 不经过 {s}')
+# 出包收尾当场修剪（11-17 补 #338 的收尾缺口，#1471：多余版本 + .trash + 无主身份滞留到下次取现行）：
+#   refresh.sh 两条成功尾巴都要跑 tail_gc；roots.sh 的 root_gc 要认越过 10 分钟节流的 S2A_ROOT_GC_FORCE（越界口子只许这一个）
+rs = open(f'{h}/pack/roots.sh', encoding='utf-8').read()
+if 'S2A_ROOT_GC_FORCE' not in rs: bad.append('pack/roots.sh：root_gc 不认 S2A_ROOT_GC_FORCE（出包收尾的强制回收没了）')
+rf = open(f'{h}/pack/refresh.sh', encoding='utf-8').read()
+if rf.count('tail_gc') < 3: bad.append(f'pack/refresh.sh：出包收尾的强制回收只剩 {rf.count("tail_gc")} 处 tail_gc（定义 + 安卓 / 苹果两条成功尾巴，要 3 处）')
 # 启动器 Mac 打包调 refresh.sh 时必须自带原始包目录与读取工具：不给 S2A_GAME_SRC 就去扫 ~/Downloads（玩家机上弹授权框），
 #   不给 S2A_NX_UNPACK 就按源码现编（启动器只带运行时、没有 SDK）——10-26 侍魂晓新流程第一次就停在 aoc
 bp = open(f'{h}/pack/jobs/build.py', encoding='utf-8').read()
@@ -31,7 +37,7 @@ sys.path.insert(0, f'{h}/pack/jobs'); import milestones as ms
 ids = {m for m, *_ in ms.MILESTONES}
 for k, plan in ms.PLANS.items():
     if not set(plan) <= ids: bad.append(f'进度计划 {k} 有不存在的步骤：{set(plan) - ids}')
-if set(ms.PLANS) != {'ipa_dual', 'build_dual'}: bad.append(f'进度计划应只有直连两种，实有 {sorted(ms.PLANS)}')
+if set(ms.PLANS) != {'ipa_dual', 'build_dual', 'ipa_downstream'}: bad.append(f'进度计划应只有直连两种加下游方案一种（ipa_downstream，pack/jobs/downstream.py），实有 {sorted(ms.PLANS)}')
 for b in bad: print('不通', b)
 print(f'pack_entry：扫 {len(files)} 个脚本，{len(bad)} 处不符' if bad else f'pack_entry 单测全过（扫 {len(files)} 个脚本，4 个入口经 refresh.sh，计划 {len(ms.PLANS)} 份）')
 sys.exit(1 if bad else 0)

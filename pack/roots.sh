@@ -10,17 +10,20 @@
 #   root_stage_done <现行目录> <阶段> <键>   现行版本里记的该阶段键 = <键> 时返回 0（阶段已做过、且就在现行这一版里）；各阶段提交前写 .stage_<阶段>
 #   root_abort <款> <提交>        出包失败：删 W.tmp，现行不动
 #   root_cur <款>                 打印现行版本的实际目录（读方一律先解析成实际目录再读，别跟着软链读到一半被切换）
-# 每款只留现行 + 上一版（10-19 维护者：磁盘）。根目录 S2A_ROOTS，缺省 ~/.s2arm/run/s2arm/roots。
+#   root_gc <款>                  取现行时自动调（root_cur）：修剪旧版 + 清无主 RomFS 身份 + 死持有者 .tmp / .trash 残余；提交锁被占就跳过
+#                                 S2A_ROOT_GC_FORCE=1 越过 10 分钟节流（出包收尾当场收，pack/refresh.sh 的 tail_gc：开工的取现行刚写过节流戳）
+# 每款只留现行 + 上一版（10-19 维护者：磁盘；commit、取现行与出包收尾都修剪，#338）。根目录 S2A_ROOTS，缺省 ~/.s2arm/run/s2arm/roots。
 # RomFS 共享存储（11-03 维护者「火纹冷出包 30 分钟」：Switch 2 火纹 RomFS 27.4 万条目，每个阶段开工克隆整棵根、提交后删旧版，Spare-host 上各约 14 秒、7 个阶段累计 3–4 分钟）：
 #   RomFS 是不可变的游戏输入，只有播种与界面布局阶段换它的内容。各版本的 romfs 是指向 $S2A_ROOTS/.romfs_store/<款>/<身份>/ 的相对软链（../.romfs_store/<款>/<身份>），
-#   身份目录整棵只读（chmod a-w：阶段往 romfs 写 / 删 / 建都会 EACCES 响亮失败，改不到共享份）；root_begin 克隆时跳过 romfs、照抄这条软链（不再逐条目克隆），
+#   开发 / 门禁机（S2A_ROMFS_SEAL=1，tools/gate.sh 设）身份目录整棵只读（chmod a-w：阶段往 romfs 写 / 删 / 建都会 EACCES 响亮失败，改不到共享份）；
+#   玩家机缺省不设只读：存储在玩家看得见的游戏库里，只读会让玩家在访达 / 资源管理器里删不掉旧产物（11-12 维护者转玩家反馈：玩家可见目录不能用权限做保护）；root_begin 克隆时跳过 romfs、照抄这条软链（不再逐条目克隆），
 #   提交时 W 里的 romfs 若是真目录（播种、ROOT_OWN_ROMFS=1 开工的阶段、旧格式根克隆来的）就整棵搬进存储成新身份（rename，不拷）；
 #   修剪版本后删没有任何版本（含 .tmp / 重放中的 .tmp.rb）再指向的身份（root_romfs_sweep）。整根往别处复制的读方（tools/clonedir.py 的快照、私有根起步、
 #   ipa.sh 只出程序、rsync 推远端）跟随这条软链拿到真目录，内容与原先逐字节相同。要改 RomFS 的阶段用 ROOT_OWN_ROMFS=1 root_begin 拿一份自己的真目录。
 # 禁止原地覆盖：已提交的版本目录不许再写（root_begin 对已存在的 <款>@<提交> 报红）。
 # 共享根只代表 origin/main（10-20 维护者拍板）：往共享根开新版本前核本树 HEAD 在 origin/main 上（不是分支）、阶段相关目录（runtime ios graphics translator services compat pack）干净、
 #   且不比现行的来源提交（.root_src）旧，否则拒绝——分支树按各自代码算阶段键，会和别的树轮流刷共享现行（10-20 01006F8002326000现行被三棵树乒乓，在途出包反复被并发保护作废），分支版本还会冒充现行。
-#   分支树用私有根：S2A_ROOTS=~/.s2arm/run/s2arm/roots_priv/<名>（约定放这里，gc 24 小时没动就清）；某款在私有根里还没有现行时，从共享现行 clonefile 起步，只重做键变了的阶段。
+#   分支树用私有根：S2A_ROOTS=~/.s2arm/run/s2arm/roots_priv/<名>（约定放这里，维护方内部清扫器 24 小时没动就清）；某款在私有根里还没有现行时，从共享现行 clonefile 起步，只重做键变了的阶段。
 S2A_ROOTS_SHARED=${S2A_ROOTS_SHARED:-${S2A_RUN_ROOT:-$HOME/.s2arm/run}/s2arm/roots}; S2A_ROOTS_PRIV=${S2A_ROOTS_PRIV:-${S2A_RUN_ROOT:-$HOME/.s2arm/run}/s2arm/roots_priv}   # 单测可覆盖
 S2A_ROOTS=${S2A_ROOTS:-$S2A_ROOTS_SHARED}
 # macOS 保留 clonefile 复制；Linux 使用保留元数据的独立拷贝，错误直接上报。
@@ -79,6 +82,18 @@ _root_identity_shared() {
   shared=$(_root_resolve_dir "$S2A_ROOTS_SHARED") || return 1
   [ "$actual" = "$shared" ]
 }
+# 本树提交号（.root_src）：发布快照不带 .git，读打包时写进 engine.json 的 commit；快照只有那一个提交，「a 是 b 的祖先」只在两者都是它时成立（与原先在快照库里跑 merge-base 结果相同）
+_root_snap_commit() {
+  local e; e=$(dirname "${BASH_SOURCE[0]}")/../engine.json; [ -f "$e" ] || return 1
+  "${S2A_PYTHON:-${S2A_PY:-python3}}" -B -I -c 'import json, sys
+c = json.load(open(sys.argv[1], encoding="utf-8")).get("commit")
+if not c: sys.exit(1)
+print(c)' "$e"
+}
+_root_head() { _root_snap_commit || git -C "$(dirname "${BASH_SOURCE[0]}")/.." rev-parse HEAD 2> /dev/null; }
+_root_is_ancestor() {
+  local h; if h=$(_root_snap_commit); then [ "$1" = "$h" ] && [ "$2" = "$h" ]; else git -C "$(dirname "${BASH_SOURCE[0]}")/.." merge-base --is-ancestor "$1" "$2" 2> /dev/null; fi
+}
 _root_tree_ok() {   # 本树能不能改共享现行（$1 = 款）：HEAD 是 origin/main 上的提交（不是分支）、阶段相关目录干净、不比现行的来源提交旧（只许往前，不乒乓）
   local r why= src cur; r=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
   # 不联网：main 的每个提交都是本机列车合出来再推上去的，origin/main 本机已是最新（11-02 维护者「咱们是唯一的合并者」）
@@ -106,7 +121,7 @@ _root_rm() {
 #   删产物根 / 它的克隆 / 临时副本的收尾点都走它（11-04 只出程序 pack/ipa.sh 的临时克隆 romfs 只读、裸 rm -rf 删不掉，逐文件报 Permission denied）
 # 被取代的整根 / 重放后丢弃的工作根：同卷改名挪进 $S2A_ROOTS/.trash/（瞬间完成），再由脱离本进程的后台删（不占出包时间、不在提交锁里删）。
 #   11-05 一次成功线：0400486024DEC000资源包 18.7 万文件，出包收尾「重放 + 修剪」在提交锁里把整根逐文件删 / 拷了 2–3 遍，出包 331 秒里约 234 秒没计时。
-#   后台删被打断（进程被杀）留下的残余由 tools/gc.sh 按名字里的 pid 已不在清掉。挪不动（跨卷等）退回当场删
+#   后台删被打断（进程被杀）留下的残余由 root_gc 按名字里的 pid 已不在清掉。挪不动（跨卷等）退回当场删
 _root_trash() {
   [ -L "$1" ] && { rm -f "$1"; return; }; [ -e "$1" ] || return 0
   local t="$S2A_ROOTS/.trash/$(basename "$1").$$.$RANDOM"
@@ -137,16 +152,20 @@ _root_romfs_intern() {
   st=$(dirname "$w")/$_ROOT_STORE/$g; mkdir -p "$st" || return 1
   id=$(basename "$w"); id=${id#*@}; id=${id%%.tmp*}-$(date +%s); while [ -e "$st/$id" ] || [ -L "$st/$id" ]; do n=$((n + 1)); id=${id%~*}~$n; done
   # 跨目录 rename 一个目录要它自己可写（改 ..）：开工时已只读的（_root_romfs_seal）先只给顶层加回写位，搬完再整棵只读（同权限不动文件 ctime）
-  _root_rm "$w/.romfs.intern"; chmod u+w "$w/romfs" && mv "$w/romfs" "$w/.romfs.intern" && ln -s "../$_ROOT_STORE/$g/$id" "$w/romfs" && chmod u+w "$w/.romfs.intern" && mv "$w/.romfs.intern" "$st/$id" && chmod -R a-w "$st/$id" || return 1
+  _root_rm "$w/.romfs.intern"; chmod u+w "$w/romfs" && mv "$w/romfs" "$w/.romfs.intern" && ln -s "../$_ROOT_STORE/$g/$id" "$w/romfs" && chmod u+w "$w/.romfs.intern" && mv "$w/.romfs.intern" "$st/$id" && _root_romfs_lock "$st/$id" || return 1
+}
+# _root_romfs_lock <身份目录>：S2A_ROMFS_SEAL=1 整棵只读；否则把旧版本留下的只读项加回写位（只动没写位的，已可写的不碰、ctime 不变）
+_root_romfs_lock() {
+  if [ "${S2A_ROMFS_SEAL:-0}" = 1 ]; then chmod -R a-w "$1"; else find "$1" ! -type l ! -perm -u+w -exec chmod u+w {} + ; fi
 }
 # _root_romfs_seal <W.tmp>：从旧格式现行（romfs 是真目录）克隆来的 romfs 开工时就整棵只读（ROOT_OWN_ROMFS=1 的阶段除外）：
 #   阶段照样写不进 RomFS；放在资源键克隆交接之前，交接记下的 ctime 就是只读之后的，提交时收进存储只是 rename、不再改文件，资源键缓存不失效
 _root_romfs_seal() {
-  [ -z "${ROOT_OWN_ROMFS:-}" ] && [ -d "$1/romfs" ] && [ ! -L "$1/romfs" ] || return 0
+  [ "${S2A_ROMFS_SEAL:-0}" = 1 ] && [ -z "${ROOT_OWN_ROMFS:-}" ] && [ -d "$1/romfs" ] && [ ! -L "$1/romfs" ] || return 0   # 只在开发 / 门禁机（见文件头）
   chmod -R a-w "$1/romfs"
 }
 # root_romfs_sweep [款…]：删存储里没有任何版本（现行、旧版、.tmp、重放中的 .tmp.rb）再指向的身份；不给款 = 存储里全部款。
-#   修剪 / gc 删版本之后调。钉住的旧版本没删，它指向的身份照样留着。
+#   修剪 / root_gc 删版本之后调。钉住的旧版本没删，它指向的身份照样留着。
 #   root_commit 在持提交锁时调（审计 #1508 P1-108：原先放锁后清扫，名单拍下之后并行阶段拿锁收纳的新身份不在名单里、被删，现行 romfs 断链）；
 #   删每个身份前再读一次全部版本链接，名单之后新出现的指向照样算
 _root_romfs_used() { local d; for d in "$S2A_ROOTS/$1"@*; do [ ! -L "$d/romfs" ] || readlink "$d/romfs"; done; }
@@ -174,15 +193,16 @@ root_romfs_sweep() {
   rmdir "$base" 2> /dev/null || :; return 0
 }
 # 取现行时顺手「钉」住它（11-02 体验线 Tools Up! 一键出包：刷新的 aoc / sysdata 阶段连续 commit 两次，root_commit 的「只留现行 + 上一版」把改写阶段刚取到、正在读的
-#   播种根 @oc 删了 → 改写读不出输入）：每个取了现行的进程在 $S2A_ROOTS/.pin.<根名>.<pid>（普通文件，不是目录）记「pid 进程起始时间」，修剪（root_commit / gc）见到有活着的钉就不删这个根；
+#   播种根 @oc 删了 → 改写读不出输入）：每个取了现行的进程在 $S2A_ROOTS/.pin.<根名>.<pid>（普通文件，不是目录）记「pid 进程起始时间」，修剪（root_commit / root_gc）见到有活着的钉就不删这个根；
 #   钉在产物根目录之外（不进克隆 / 指纹），持有者进程死了钉自己失效、下次修剪顺手清掉。$$ 在 $(…) 里仍是调用脚本本身。
 _root_pin() { local b; b=$(basename "$1"); [ -d "$S2A_ROOTS" ] && printf '%s %s\n' "$$" "$(_root_lstart $$)" > "$S2A_ROOTS/.pin.$b.$$" 2> /dev/null; return 0; }
 _root_pinned() { local b f p l; b=$(basename "$1"); for f in "$S2A_ROOTS/.pin.$b".*; do [ -f "$f" ] || continue
     read -r p l < "$f"; [ "$p" = "$$" ] && continue   # 自己的钉不算：自己 commit 之后不会再读自己取过的旧根（并行的别的阶段才会）
     [ -n "$p" ] && [ "$(_root_lstart "$p")" = "$l" ] && return 0; rm -f "$f"; done; return 1; }
 # 修剪被取代的版本：只留现行 + 上一版，被钉住（有进程正在把它当输入）的不删。$1 = 款，$2 = 现行目录名
-_root_prune() { ls -dt "$S2A_ROOTS/$1"@* 2>/dev/null | grep -v -e '@现行$' -e '\.tmp$' | while read -r d; do [ "$(basename "$d")" = "$2" ] || echo "$d"; done | tail -n +2 | while read -r d; do _root_pinned "$d" || _root_trash "$d"; done; }
-root_cur() { local r; r=$(_root_cur_raw "$@"); [ -n "$r" ] && [ -z "${S2A_ROOT_CUR:-}" ] && _root_pin "$r"; [ -z "$r" ] || echo "$r"; }
+#   .tmp / .tmp.rb 是在途事务，不当版本候选：root_gc 与别的进程的重放可以并行（11-02 类别：在途重放被当成「最新备份」剪掉或挤掉真上一版）
+_root_prune() { ls -dt "$S2A_ROOTS/$1"@* 2>/dev/null | grep -v -e '@现行$' -e '\.tmp$' -e '\.tmp\.rb$' | while read -r d; do [ "$(basename "$d")" = "$2" ] || echo "$d"; done | tail -n +2 | while read -r d; do _root_pinned "$d" || _root_trash "$d"; done; }
+root_cur() { local r; r=$(_root_cur_raw "$@"); if [ -z "${S2A_ROOT_CUR:-}" ]; then root_gc "$1"; [ -n "$r" ] && _root_pin "$r"; fi; [ -z "$r" ] || echo "$r"; }
 _root_cur_raw() {
   [ -n "${S2A_ROOT_CUR:-}" ] && { echo "$S2A_ROOT_CUR"; return; }   # 只算键（pack/stage_keys.sh）：各阶段对指定产物根算键，不碰现行
   [ -n "${S2A_ROOTS_NO_BOOT:-}" ] && { (cd -P "$S2A_ROOTS/$1@现行" 2>/dev/null && pwd); return; }   # 全新状态（tools/oneshot.sh）：不从共享现行起步
@@ -225,8 +245,8 @@ root_begin() {
     { find "$w.tmp" -mindepth 1 -type l | grep -vxF -- "$w.tmp/romfs" | grep -q . || ! _root_romfs_link "$w.tmp" > /dev/null; } && { _root_rm "$w.tmp"; echo "【红】现行版本里有软链（romfs 指向本款 RomFS 存储的那一条除外）：克隆后写入会顺链改到别处（旧库 10-18 改坏过原版 romfs），先清掉软链" >&2; return 1; }
   else mkdir -p "$w.tmp"; fi
   ( cd "$w.tmp" && for f in .stage_*; do [ -f "$f" ] && printf '%s\t%s\n' "$f" "$(cat "$f")"; done ) > "$w.tmp/.root_base_stages" 2> /dev/null   # 开工时各阶段键（root_commit 判别的树动没动过同一阶段）
-  _root_owner > "$w.tmp/.root_pid"   # 持有者（tools/gc.sh 只删持有者已死的 .tmp；10-23 排烘焙道 2 小时的 .tmp 被按时间删掉、出包中途失败）
-  basename "${cur:-无}" > "$w.tmp/.root_base"; git -C "$(dirname "${BASH_SOURCE[0]}")/.." rev-parse HEAD > "$w.tmp/.root_src" 2> /dev/null   # 来源提交：护栏判「只许往前」
+  _root_owner > "$w.tmp/.root_pid"   # 持有者（root_gc 只删持有者已死的 .tmp；10-23 排烘焙道 2 小时的 .tmp 被按时间删掉、出包中途失败）
+  basename "${cur:-无}" > "$w.tmp/.root_base"; _root_head > "$w.tmp/.root_src"   # 来源提交：护栏判「只许往前」
   echo "$w.tmp"
 }
 _root_shards() {   # _root_shards <目录> <标签>：记一行直连库分片清点（11-01 究极4 分片丢在出包之后某步，要能定位）；记不成不影响提交。日志 ${S2A_SHARD_LOG}（缺省 ${S2A_ROOTS}/.shard_inventory.log）
@@ -253,7 +273,8 @@ _root_replay() {   # _root_replay <W.tmp> <新现行> <路径…>：新现行克
   python3 "$(dirname "${BASH_SOURCE[0]}")/../tools/clonedir.py" "$now" "$r" $sk $mvp > /dev/null || { _root_rm "$r"; return 1; }
   [ -z "$sk" ] || ln -s "$rl" "$r/romfs" || { _root_rm "$r"; return 1; }
   [ -n "$own" ] || _root_romfs_seal "$r" || { _root_rm "$r"; return 1; }
-  _root_resource_clone "$now" "$r"
+  _root_resource_clone "$now" "$r"   # 资源键交接要求此刻还没有 .root_pid（inherit_cache 的 before_owner 检查）
+  _root_owner > "$r/.root_pid"   # 重放也要持有者记录：root_gc 只按它判死在途的 .tmp.rb（没有记录的一律不碰）
   _root_shards "$r" "replay·克隆新现行"
   for p in "$@"; do case $p in '!'*) continue;; esac
     case " $mvp " in *" $p "*) [ -e "$w/$p" ] || [ -L "$w/$p" ] || continue; mv "$w/$p" "$r/$p" || { _root_rm "$r"; return 1; }; continue;; esac   # 上面克隆时跳过的：整个挪过来
@@ -266,7 +287,7 @@ _root_replay() {   # _root_replay <W.tmp> <新现行> <路径…>：新现行克
   done
   # 来源提交取两边较新的：新现行来自更新的 main 时留它的（旧树重放一个没被动过的阶段，不把共享现行的来源退回旧提交）
   local ns ms; ns=$(cat "$r/.root_src" 2> /dev/null); ms=$(cat "$w/.root_src" 2> /dev/null)
-  { [ -z "$ns" ] || git -C "$(dirname "${BASH_SOURCE[0]}")/.." merge-base --is-ancestor "$ns" "$ms" 2> /dev/null; } && cp "$w/.root_src" "$r/.root_src" 2> /dev/null
+  { [ -z "$ns" ] || _root_is_ancestor "$ns" "$ms"; } && cp "$w/.root_src" "$r/.root_src" 2> /dev/null
   basename "$now" > "$r/.root_base"
   _root_shards "$r" "replay·换完路径后"
   _root_trash "$w" && mv "$r" "$w"
@@ -285,7 +306,7 @@ root_commit() {
     if _root_shared && [ "$now" != 无 ]; then local ns ms st touched=; ns=$(cat "$(root_cur "$g")/.root_src" 2> /dev/null); ms=$(cat "$w.tmp/.root_src" 2> /dev/null)
       for st in ${ROOT_REPLAY:-}; do case $st in .stage_*) [ "$(cat "$(root_cur "$g")/$st" 2> /dev/null)" = "$(awk -F'\t' -v k="$st" '$1 == k { print $2 }' "$w.tmp/.root_base_stages" 2> /dev/null)" ] || touched=$st;; esac; done
       [ -z "${ROOT_REPLAY:-}" ] && touched=整份   # 不声明产物路径的阶段本来就不重放
-      if [ -n "$touched" ] && [ -n "$ns" ] && [ -n "$ms" ] && ! git -C "$(dirname "${BASH_SOURCE[0]}")/.." merge-base --is-ancestor "$ns" "$ms" 2> /dev/null; then
+      if [ -n "$touched" ] && [ -n "$ns" ] && [ -n "$ms" ] && ! _root_is_ancestor "$ns" "$ms"; then
         _root_unlock "$g"; _root_rm "$w.tmp"
         echo "【红】$g 现行在本阶段期间已由更新的 main ${ns:0:9} 刷过（本树 ${ms:0:9}）：共享现行只许往前，丢弃 $(basename "$w")、不重放；要用本树产物走私有根 S2A_ROOTS=${S2A_RUN_ROOT:-$HOME/.s2arm/run}/s2arm/roots_priv/<名>" >&2; return 1; fi
     fi
@@ -315,26 +336,51 @@ root_tmp_live() {
   [ -n "$p" ] && kill -0 "$p" 2> /dev/null && [ "$(_root_lstart "$p")" = "$(awk '{$1 = $1} 1' <<< "$t")" ]
 }
 root_abort() { local w; w=$(_root_dir "${1:?款}" "${2:?提交}"); _root_rm "$w.tmp"; }
+# 取现行时顺手回收（#338：修剪原先只在 commit 触发，进程死后 pin 过期、不再 commit 就没有第二个触发点，过期根一直攒着）。
+#   同一款 10 分钟内最多一次（$S2A_ROOTS/.gc.<款>.stamp）：root_cur 一次刷新要调几十次，整套扫描不能每次都跑。
+#   拿不到提交锁 = 有 commit 在跑，跳过（它收尾自己修剪）；拿到则串行做：修剪旧版 → RomFS 清扫（P1-108：与收纳同一把锁）→ 死持有者 .tmp / .tmp.rb。
+#   .tmp / .tmp.rb 只删「有 .root_pid 记录且持有者已死」的，没有记录的一律不碰：目录 mtime 只看顶层增删，长重放深层一直在写、
+#   顶层可以一个多小时不动，按 mtime 判会删掉在途的（10-23 事故）。重放两个入口（_root_replay / roots.py _replay）创建时就写记录。
+#   .trash 残余按名字里的 pid 判死（挪它的进程死了，后台删要么完成要么被打断），锁外清。
+root_gc() {
+  local g=${1:?款} d p t hold now stamp
+  [ -d "$S2A_ROOTS" ] || return 0
+  [ -z "${_ROOT_LOCK_PID:-}" ] || return 0   # 自己持着提交锁（root_commit 里取现行）：commit 收尾自己修剪，不再试锁
+  stamp="$S2A_ROOTS/.gc.$g.stamp"
+  [ -z "${S2A_ROOT_GC_FORCE:-}" ] && [ -n "$(find "$stamp" -mmin -10 2> /dev/null)" ] && return 0   # 节流：同一款 10 分钟内最多回收一次；出包收尾的强制回收（S2A_ROOT_GC_FORCE=1，pack/refresh.sh tail_gc）越过节流——最后一笔提交时并行段进程还活着钉着各自的根，只剪得动一部分，收尾各段已退出才收得全
+  type plock_take > /dev/null 2>&1 || source "$(dirname "${BASH_SOURCE[0]}")/../tools/plock.sh" || return 0
+  # 有 commit 在跑：它收尾会修剪；同样记一次节流，别让并行的 root_cur 反复起锁进程试锁
+  plock_take "$S2A_ROOTS/.$g.commit.lock" 0 > /dev/null 2>&1 || { touch "$stamp" 2> /dev/null; return 0; }
+  _ROOT_LOCK_PID=$PLOCK_PID; _ROOT_LOCK_GAME=$g   # 登记成本进程持锁：root_romfs_sweep 同一款不再重复拿（同 root_commit）
+  hold=$PLOCK_PID
+  touch "$stamp" 2> /dev/null
+  now=$(readlink "$S2A_ROOTS/$g@现行" 2> /dev/null); now=${now##*/}
+  _root_prune "$g" "$now"
+  root_romfs_sweep "$g"
+  for d in "$S2A_ROOTS/$g"@*.tmp "$S2A_ROOTS/$g"@*.tmp.rb; do
+    [ -d "$d" ] && [ ! -L "$d" ] || continue
+    [ -e "$d/.root_pid" ] || continue   # 没记录：可能是在途（克隆到写记录之间 / 旧格式），一律不碰
+    root_tmp_live "$d" && continue
+    _root_trash "$d"
+  done
+  _root_unlock
+  for d in "$S2A_ROOTS"/.trash/*; do
+    [ -e "$d" ] || [ -L "$d" ] || continue
+    t=${d%.*}; p=${t##*.}
+    case $p in ''|*[!0-9]*) continue;; esac
+    kill -0 "$p" 2> /dev/null || _root_rm "$d"
+  done
+  return 0
+}
 # 追加内容阶段记下的没解出的原始包（pack/stages/aoc.sh 写进 aoc.log 的「追加内容缺<TAB>文件名<TAB>原因」行）：
 #   root_aoc_missing <产物根> → 文件名一行一个；root_aoc_note <产物根> → 出包完成行 / 登记说明后缀「；🟡 追加内容 <文件名> 未能解出，包内不含」（有几份写几份，没有则空）
-root_aoc_missing() { awk -F'\t' '$1 == "追加内容缺" && $2 != "" {print $2}' "${1:?产物根}/aoc.log" 2> /dev/null; }
+root_aoc_missing() { LC_ALL=C awk -F'\t' '$1 == "追加内容缺" && $2 != "" {print $2}' "${1:?产物根}/aoc.log" 2> /dev/null; }
 root_aoc_note() { root_aoc_missing "$1" | while IFS= read -r f; do printf '；🟡 追加内容 %s 未能解出，包内不含' "$f"; done; }
 root_tag() { local t=${2:?标签} n=1 c; c=$t; while [ -e "$(_root_dir "${1:?款}" "$c")" ] || [ -e "$(_root_dir "$1" "$c").tmp" ]; do n=$((n + 1)); c=$t-$n; done; echo "$c"; }
 root_stage_done() {   # S2A_STAGE_KEYS=<文件>：只算键模式——记「阶段<TAB>键」后当作已是该键（阶段脚本随即退出，不出任何产物）
   if [ -n "${S2A_STAGE_KEYS:-}" ]; then printf '%s\t%s\n' "${2:?阶段}" "${3:?键}" >> "$S2A_STAGE_KEYS"; return 0; fi
   [ -n "${1:-}" ] && [ "$(cat "$1/.stage_${2:?阶段}" 2>/dev/null)" = "${3:?键}" ]; }
-# 管线归档 0 KB 判据（10-21 维护者：d2r / d3 / mhrise 管线归档全片失败、0 KB 照样当部分包成了现行并登记，玩家首遇的管线全部现编）：
-#   root_pso0 <产物根或其 shaders 的上一级>：有管线分片（shader_pack.json 的 pso.chunks > 0）而归档 0 KB → 打印分片数、返回 0（= 是坏的）；
-#   没有分片（程序 0）、没有 shader_pack.json、旧版没有这两个字段 → 返回 1（不算 0 KB）
-#   直连款（包里有直连库，root_has_direct）→ 返回 1：双轨口径下通用段本来就不出管线归档（pack/refresh.sh S2A_SHADER_NO_PSO=1），
-#   shader_pack.json 照记计划分片数、归档 0 KB 是有意的（10-25 01006F8002326000 3.0.3 正式包「4000 片全部失败」误红、没登记）；直连库没出成时通用走全量、照判
 # root_has_direct <产物根>：现行有直连库——keys.tsv 非空，或离线 0 支的三种形态：OpenGL 只有 gl/gl_shaders.tsv 表头、Vulkan 只有 vk/vk_shaders.tsv 表头
 #   （运行时生成 SPIR-V、出包不起局，11-05）、抽取缺口的运行时现编空库 runtime_only.txt。与 pack/stage_direct.sh「算出了库」同一口径
 #   （11-05：原先只认 keys.tsv 非空，这三种都会被当成通用款去查管线归档 0 KB、登记闸门误红）
 root_has_direct() { local d=${1:?根}/shaders/direct; [ -s "$d/keys.tsv" ] || [ -s "$d/gl/gl_shaders.tsv" ] || [ -s "$d/vk/vk_shaders.tsv" ] || [ -f "$d/runtime_only.txt" ]; }
-root_pso0() { root_has_direct "${1:?根}" && return 1; local n; n=$(python3 -c "import json,sys;d=json.load(open(sys.argv[1]));n=(d.get('pso') or {}).get('chunks') or 0;print(n if n > 0 and d.get('pso_archive_kb') == 0 else '')" "${1:?根}/shaders/shader_pack.json" 2> /dev/null); [ -n "$n" ] && echo "$n"; }
-# 登记前闸门：root_pso0_gate <产物根> <款>：不是 0 KB → 返回 0（放行，不打印）；0 KB → 打【红】返回 1；
-#   例外只能显式开：S2A_ALLOW_PSO0=<原因>（10-21 维护者：暗黑3 录按键包只录制、不评流畅度，例外登记一次）→ 打 🟡 一行、返回 0，调用方把原因写进登记说明
-root_pso0_gate() { local n; n=$(root_pso0 "${1:?根}") || return 0
-  if [ -n "${S2A_ALLOW_PSO0:-}" ]; then echo "🟡 ${2:-?} 管线归档 0 KB（${n} 片全部失败）：按 S2A_ALLOW_PSO0 例外登记——${S2A_ALLOW_PSO0}"; return 0; fi
-  echo "【红】${2:-?} 管线归档 0 KB（${n} 片全部失败）：包已出、不登记（只录制等确需例外时显式设 S2A_ALLOW_PSO0=<原因>）"; return 1; }

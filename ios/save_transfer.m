@@ -1,7 +1,10 @@
 // 弱链接[ios]：S2A_SaveTransfer（C# 存档迁移入口；未链服务层时向用户报错）
 // 弱链接[ios]：S2A_SaveTransferFree（释放 C# 存档迁移返回的字符串）
 #import "save_transfer.h"
+#import "app_settings.h"   // s2a_top_presenter
 #import "s2a_l10n.h"
+#import "settings.h"
+#import "play_layout.h"
 #include "save_gate.h"
 #include "s2a_launch_ctx.h"
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
@@ -15,17 +18,22 @@ static NSString *const ManageKey = @"S2ASaveManageOnOpen";
 // 「下次打开先进存档管理」分两级：ManageKey 是 App 级（iOS 设置开关、主屏快捷操作冷启动置，下次开哪款都进）；
 //   游戏内「退出并管理存档」只记这一款：多款容器按游戏号另起一个键，开别的游戏不弹；单款包一个进程只一款，就是 ManageKey 本身
 static NSString *game_manage_key(void) {
-    const s2a_launch_ctx *c = s2a_launch_ctx_container() ? s2a_launch_ctx_get() : NULL;
+    // 启动上下文里有本款模块目录就用它（多款容器选了游戏；或直接按 S2A_LAUNCH_CTX 起的那一款——那时 s2a_launch_ctx_container() 判「不是容器」，
+    //   原先就去包根找 save-identity.json，多款容器包根没有，存档页 / iCloud 同步 / 测试开关都取不到本款身份）
+    const s2a_launch_ctx *c = s2a_launch_ctx_get();
     return c && c->game_id[0] ? [ManageKey stringByAppendingFormat:@".%s", c->game_id] : ManageKey;
 }
 
 // 存档位置 SaveData（services/S2A.Services/SaveFolder.cs，11-09 维护者定）：本款文档根下的 SaveData（多款容器 Documents/games/<游戏号>/SaveData，
 //   单款包 Documents/SaveData），里面是原生存档格式；放进去下次开始游戏就读，退出时写回最新进度。这里按同一规则算出「文件」App 里的路径给玩家看
 //   （文件夹先建出来，「文件」App 里马上看得到），上次没读进来的原因（数据根 savedata-problem.txt，服务层写）接在后面
+//   本地玩家（#623）：存档位置是当前玩家的那个文件夹（第一个玩家 SaveData，同 settings.m s2a_ios_local_player），没读进来的原因也按玩家分文件
+//   （services/S2A.Services/SaveFolder.cs ProblemPath）；页上写明当前玩家，以及导出 / 导入 / iCloud 是这款所有玩家的存档一起
 static NSString *save_location(NSString *root) {
     NSString *documents = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    NSDictionary<NSString *, NSString *> *player = s2a_ios_local_player(NSUserDefaults.standardUserDefaults);
     const char *f = getenv("S2A_SAVE_FOLDER"), *d = getenv("S2A_DOCS");   // 同 ios/settings.m 起局时给服务层的那条；存档页在起局前打开时按同一规则算
-    NSString *folder = f && *f ? @(f) : [(d && *d ? @(d) : documents) stringByAppendingPathComponent:@"SaveData"];
+    NSString *folder = f && *f ? @(f) : [(d && *d ? @(d) : documents) stringByAppendingPathComponent:player ? player[@"folder"] : @"SaveData"];
     [NSFileManager.defaultManager createDirectoryAtPath:folder withIntermediateDirectories:YES attributes:nil error:nil];
     char *rd = realpath(documents.fileSystemRepresentation, NULL), *rf = realpath(folder.fileSystemRepresentation, NULL);
     NSString *base = rd ? @(rd) : documents, *full = rf ? @(rf) : folder; free(rd); free(rf);
@@ -33,7 +41,9 @@ static NSString *save_location(NSString *root) {
     NSString *path = [[[full substringFromIndex:base.length + 1] pathComponents] componentsJoinedByString:@" → "];
     NSString *name = NSBundle.mainBundle.infoDictionary[@"CFBundleDisplayName"] ?: @"S2Arm";
     NSString *text = [NSString stringWithFormat:S2AL(@"save.location"), name, path, name];
-    NSString *why = root ? [[NSString stringWithContentsOfFile:[root stringByAppendingPathComponent:@"savedata-problem.txt"] encoding:NSUTF8StringEncoding error:nil]
+    if (player) text = [[NSString stringWithFormat:S2AL(@"save.players"), player[@"name"].length ? player[@"name"] : S2AL(@"save.player.first")] stringByAppendingFormat:@"\n\n%@", text];
+    NSString *problem = player && player[@"uid"].length ? [NSString stringWithFormat:@"savedata-problem-%@.txt", player[@"uid"]] : @"savedata-problem.txt";
+    NSString *why = root ? [[NSString stringWithContentsOfFile:[root stringByAppendingPathComponent:problem] encoding:NSUTF8StringEncoding error:nil]
                                stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] : nil;
     return why.length ? [text stringByAppendingFormat:@"\n\n%@", [NSString stringWithFormat:S2AL(@"save.location.problem"), why]] : text;
 }
@@ -63,9 +73,12 @@ static NSString *work_root(void) {
 // 这款的存档身份：多款容器在本款随行目录 games/<游戏号>/save-identity.json（pack/ship_ext.py 放的），单款包在 App 包根。
 //   原先一律读包根：容器里读不到，存档管理页报「缺少游戏身份」，容器玩家没有存档入口（审计 P2-170 壳那一半）
 static NSDictionary *game_identity(void) {
-    const s2a_launch_ctx *c = s2a_launch_ctx_container() ? s2a_launch_ctx_get() : NULL;
-    NSURL *url = c && c->module_dir[0] ? [NSURL fileURLWithPath:[@(c->module_dir) stringByAppendingPathComponent:@"save-identity.json"]]
-                                       : [NSBundle.mainBundle URLForResource:@"save-identity" withExtension:@"json"];
+    // 启动上下文里有本款模块目录、且目录里有 save-identity.json 就用它：多款容器选了游戏，或直接按 S2A_LAUNCH_CTX 起的那一款（那时 s2a_launch_ctx_container()
+    //   判「不是容器」，原先就去包根找、多款容器包根没有，存档页 / iCloud 同步 / 测试开关都取不到本款身份）；单款包模块目录里没有它，照旧取包根那份
+    const s2a_launch_ctx *c = s2a_launch_ctx_get();
+    NSString *mod = c && c->module_dir[0] ? [@(c->module_dir) stringByAppendingPathComponent:@"save-identity.json"] : nil;
+    NSURL *url = mod && [NSFileManager.defaultManager fileExistsAtPath:mod] ? [NSURL fileURLWithPath:mod]
+                                                                         : [NSBundle.mainBundle URLForResource:@"save-identity" withExtension:@"json"];
     NSData *data = url ? [NSData dataWithContentsOfURL:url] : nil;
     id game = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
     return [game isKindOfClass:NSDictionary.class] ? game : nil;
@@ -87,6 +100,37 @@ char *s2a_shell_save_request(const char *json) {
     char *copy = raw ? strdup(raw) : NULL;
     if (raw) S2A_SaveTransferFree(raw);
     return copy;
+}
+// 测试开关 S2A_TEST_SAVE_OP（真机验收「导出存档 → 删除重装 S2Arm → 导回存档」，维护者 11-15 定的 #569 处理要求这条路真能走通；无人点存档页）：
+//   export:<路径> = 把本款当前存档导出成 .s2asave；restore:<路径>（相对路径按 App 容器根） = 先 inspect 再按它给的指纹 restore（同界面「检查 → 确认」两步）。
+//   起局前（ios/app.m startHost 开头：游戏已选定、宿主还没起）跑一次，走与存档页同一个服务层入口；结果一行进日志。只认环境变量，玩家从图标打开不带
+static NSString *test_save_call(NSDictionary *extra) {
+    char *ctx = s2a_shell_save_context();
+    if (!ctx) return [NSString stringWithFormat:@"no save context: dataRoot=%@ game=%@ S2A_SaveTransfer=%s", data_root() ?: @"nil", game_identity() ? @"ok" : @"nil",
+                      S2A_SaveTransfer && S2A_SaveTransferFree ? "linked" : "missing"];
+    NSMutableDictionary *req = [[NSJSONSerialization JSONObjectWithData:[NSData dataWithBytes:ctx length:strlen(ctx)] options:NSJSONReadingMutableContainers error:nil] mutableCopy]; free(ctx);
+    [req addEntriesFromDictionary:extra];
+    NSData *json = [NSJSONSerialization dataWithJSONObject:req options:0 error:nil]; NSString *js = [[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding];
+    char *raw = s2a_shell_save_request(js.UTF8String); NSString *r = raw ? @(raw) : @"(no response)"; free(raw); return r;
+}
+void s2a_ios_test_save_op(void) {
+    const char *e = getenv("S2A_TEST_SAVE_OP"); if (!e || !*e) return;
+    @autoreleasepool {
+        NSString *op = @(e); NSRange c = [op rangeOfString:@":"]; if (c.location == NSNotFound) { fprintf(stderr, "[S2A 测试存档] 开关格式不对：%s\n", e); return; }
+        NSString *kind = [op substringToIndex:c.location], *path = [op substringFromIndex:c.location + 1];
+        if (![path hasPrefix:@"/"]) {   // 相对路径按 App 容器根（电脑端经 devicectl 推拉用的就是容器内相对路径）；容器根取 realpath：/var 是指向 /private/var 的链接，服务层拒收含链接的路径
+            char *home = realpath(NSHomeDirectory().fileSystemRepresentation, NULL);
+            path = [(home ? @(home) : NSHomeDirectory()) stringByAppendingPathComponent:path]; free(home);
+        }
+        if ([kind isEqualToString:@"export"]) { fprintf(stderr, "[S2A 测试存档] 导出 → %s：%s\n", path.UTF8String, test_save_call(@{@"operation": @"export", @"path": path}).UTF8String); return; }
+        if (![kind isEqualToString:@"restore"]) { fprintf(stderr, "[S2A 测试存档] 不认识的操作：%s\n", e); return; }
+        NSString *ins = test_save_call(@{@"operation": @"inspect", @"path": path});
+        NSDictionary *r = [NSJSONSerialization JSONObjectWithData:[ins dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil];
+        NSDictionary *res = [r isKindOfClass:NSDictionary.class] && [r[@"ok"] boolValue] ? r[@"result"] : nil;
+        if (!res) { fprintf(stderr, "[S2A 测试存档] 导回 %s：检查没过：%s\n", path.UTF8String, ins.UTF8String); return; }
+        fprintf(stderr, "[S2A 测试存档] 导回 %s：%s\n", path.UTF8String,
+                test_save_call(@{@"operation": @"restore", @"path": path, @"archiveSha256": res[@"archiveSha256"] ?: @"", @"targetFingerprint": res[@"targetFingerprint"] ?: @""}).UTF8String);
+    }
 }
 // 列不出事务目录时记下原因（审计 P2-9：原先读不到也当「有未完成事务」，恢复再失败时提示说的是事务，玩家无从下手）。
 //   仍进存档页、仍先试恢复（服务层能读到就照常恢复）；恢复失败时提示写明是「读不到操作记录目录」及系统原因
@@ -114,7 +158,7 @@ int s2a_ios_save_management_requested(void) {
 @property(copy) void (^startGame)(void);
 @property(strong) NSDictionary *game;
 @property(strong) UILabel *status;
-@property(strong) UIButton *importButton, *exportButton, *backupButton, *startButton, *overrideButton;
+@property(strong) UIButton *importButton, *exportButton, *backupButton, *startButton, *overrideButton, *quitButton;
 @property(strong) UIActivityIndicatorView *spinner;
 @property(strong) NSDictionary *preview;
 @property(copy) NSString *importPath, *backupPath, *temporaryExportPath;
@@ -126,7 +170,7 @@ int s2a_ios_save_management_requested(void) {
 @end
 
 @implementation S2ASaveManager
-- (UIInterfaceOrientationMask)supportedInterfaceOrientations { return UIInterfaceOrientationMaskLandscape; }
+- (UIInterfaceOrientationMask)supportedInterfaceOrientations { return s2a_ios_play_orientations(); }
 - (UILabel *)label:(NSString *)text style:(UIFontTextStyle)style {
     UILabel *label = [UILabel new]; label.text = text; label.numberOfLines = 0;
     label.font = [UIFont preferredFontForTextStyle:style]; label.adjustsFontForContentSizeCategory = YES;
@@ -175,7 +219,9 @@ int s2a_ios_save_management_requested(void) {
     self.startButton = [self button:S2AL(@"save.start") action:@selector(start)];
     // 恢复失败时才出现：单独确认后放开「开始游戏」（审计 P0-1：失败分支不放开，玩家这次安装就再也进不了游戏）
     self.overrideButton = [self button:S2AL(@"save.override") action:@selector(confirmOverride)];
-    for (UIButton *button in @[self.exportButton, self.importButton, self.backupButton, self.startButton, self.overrideButton]) [stack addArrangedSubview:button];
+    // #1206「退出」：清掉「下次先进存档管理」直接退出，下次打开照常进游戏（多款容器进游戏库）；有待恢复事务时不出
+    self.quitButton = [self button:S2AL(@"save.leave") action:@selector(quitManagement)];
+    for (UIButton *button in @[self.exportButton, self.importButton, self.backupButton, self.startButton, self.overrideButton, self.quitButton]) [stack addArrangedSubview:button];
     [stack addArrangedSubview:where];
     self.dataRoot = data_root();
     where.text = save_location(self.dataRoot);
@@ -200,7 +246,7 @@ int s2a_ios_save_management_requested(void) {
     struct s2a_save_buttons b = s2a_save_buttons(self.phase, self.recoveryOverridden, self.game != nil, self.hasSave, self.busy);
     self.importButton.enabled = b.import; self.exportButton.enabled = b.export_;
     self.backupButton.enabled = !self.busy && self.backupPath.length;
-    self.startButton.enabled = b.start; self.overrideButton.hidden = !b.override;
+    self.startButton.enabled = b.start; self.overrideButton.hidden = !b.override; self.quitButton.hidden = !b.quit;
     if (self.busy) [self.spinner startAnimating]; else [self.spinner stopAnimating];
 }
 // 恢复失败：说清楚数据在哪、怎么拷走，并给「仍要开始游戏」（单独确认）。事务记录原样保留，下次打开照常先试恢复（新版本可能恢复得了）
@@ -306,11 +352,20 @@ int s2a_ios_save_management_requested(void) {
         }];
     } else [self finishManagement];
 }
-- (void)finishManagement {
+- (void)clearManageFlags {
     [NSUserDefaults.standardUserDefaults setBool:NO forKey:ManageKey];
     [NSUserDefaults.standardUserDefaults setBool:NO forKey:game_manage_key()];
     [NSUserDefaults.standardUserDefaults synchronize];
+}
+- (void)finishManagement {
+    [self clearManageFlags];
     self.startGame();
+}
+// 宿主还没起（这页在起宿主之前）：没有游戏状态要收，不走 s2a_host_shutdown 的收局流程，复位开关后直接结束进程
+- (void)quitManagement {
+    if (!s2a_save_buttons(self.phase, self.recoveryOverridden, self.game != nil, self.hasSave, self.busy).quit) return;
+    [self clearManageFlags];
+    exit(0);
 }
 - (void)presentExport:(NSString *)path {
     UIDocumentPickerViewController *picker = [[UIDocumentPickerViewController alloc] initForExportingURLs:@[[NSURL fileURLWithPath:path]] asCopy:YES];
@@ -319,8 +374,9 @@ int s2a_ios_save_management_requested(void) {
     [self presentViewController:picker animated:YES completion:nil];
 }
 - (void)exportSave {
+    // 11-13 维护者「不许堵门」：上次的临时副本删不掉不挡这次（新副本用新名字，互不冲突）；只记一行日志，下次再清
     NSString *warning = [self clearExport];
-    if (warning) { [self showError:warning]; return; }
+    if (warning) fprintf(stderr, "[S2A 存档] 上次的临时副本没删掉，照常继续：%s\n", warning.UTF8String);
     NSString *name = [NSString stringWithFormat:@"%@-%@.s2asave", self.game[@"id"], NSUUID.UUID.UUIDString];
     NSString *path = [[[self.dataRoot stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"save-exports"] stringByAppendingPathComponent:name];
     NSError *error = nil;
@@ -332,8 +388,9 @@ int s2a_ios_save_management_requested(void) {
 }
 - (void)exportBackup { if (self.backupPath.length) [self presentExport:self.backupPath]; }
 - (void)importSave {
+    // 11-13 维护者「不许堵门」：上次的临时副本删不掉不挡这次（新副本用新名字，互不冲突）；只记一行日志，下次再清
     NSString *warning = [self clearImport];
-    if (warning) { [self showError:warning]; return; }
+    if (warning) fprintf(stderr, "[S2A 存档] 上次的临时副本没删掉，照常继续：%s\n", warning.UTF8String);
     UIDocumentPickerViewController *picker = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[UTTypeData] asCopy:YES];
     picker.directoryURL = [NSFileManager.defaultManager URLsForDirectory:NSDocumentDirectory inDomains:NSUserDomainMask].firstObject;
     picker.allowsMultipleSelection = NO; picker.delegate = self;
@@ -384,6 +441,9 @@ int s2a_ios_save_management_requested(void) {
     NSString *users = [manifest[@"users"][@"ids"] componentsJoinedByString:@"\n"];
     NSString *size = [NSByteCountFormatter stringFromByteCount:[self.preview[@"totalBytes"] longLongValue] countStyle:NSByteCountFormatterCountStyleFile];
     NSString *message = [NSString stringWithFormat:S2AL(@"save.restore.message"), manifest[@"game"][@"name"], manifest[@"game"][@"version"], manifest[@"createdAt"], users.length ? users : S2AL(@"save.deviceSave"), self.preview[@"fileCount"], size];
+    // 版本 / DLC 组合、账号归属对不上：服务层不再拒绝，给出提示句（已按界面语言），确认前放在说明最前面
+    NSArray *warnings = [self.preview[@"warnings"] isKindOfClass:NSArray.class] ? self.preview[@"warnings"] : @[];
+    if (warnings.count) message = [NSString stringWithFormat:@"⚠️ %@\n\n%@", [warnings componentsJoinedByString:@"\n⚠️ "], message];
     self.status.text = S2AL(@"save.inspected");
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:S2AL(@"save.restore.title") message:message preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:S2AL(@"common.cancel") style:UIAlertActionStyleCancel handler:^(UIAlertAction *action) {
@@ -412,7 +472,8 @@ UIViewController *s2a_ios_save_manager(void (^start_game)(void)) {
 // 游戏内「存档管理」确认框：「退出游戏」只收尾退出；「退出并管理存档」才记下次先进存档管理（只记这一款）。
 //   原先只有一个「已保存，退出游戏」且必置开关：v0.2.2 起游戏里只有它写着「退出游戏」，玩家拿它当退出，之后每次打开都先进存档页
 void s2a_ios_save_present(UIViewController *presenter) {
-    if (!presenter || presenter.presentedViewController) return;
+    if (!presenter) return;
+    presenter = s2a_top_presenter(presenter);
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:S2AL(@"save.quit.title") message:S2AL(@"save.quit.message") preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:S2AL(@"save.quit.back") style:UIAlertActionStyleCancel handler:nil]];
     [alert addAction:[UIAlertAction actionWithTitle:S2AL(@"save.quit.only") style:UIAlertActionStyleDestructive handler:^(UIAlertAction *item) {

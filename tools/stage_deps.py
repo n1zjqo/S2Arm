@@ -15,7 +15,9 @@
   （缺省由 pack/stage_keyfiles.sh 给社区补丁目录）；不记：给定前缀（产物根等）、S2A_DEPS_KEYED 里阶段已更细进键的文件、本阶段自己写过的、字节码、
   解释器自身（标准库 / site-packages / 钩子，采集端按各进程自己的解释器排）。
 已知边界：只看 Python 进程；os.path.exists 这类只查存在不读的判断看不到（读到的索引表变了照样会变）。"""
+import functools
 import hashlib
+import json
 import os
 import subprocess
 import sys
@@ -32,6 +34,44 @@ def _digest(kind, p, keep=None):
         return '缺'
 
 
+# 产物等价表（pack/stage_inputs/equiv.tsv；登记命令 tools/stage_equiv.py add）。读表写在本文件里、不 import 旁边的模块：
+#   本工具会被单独拷进各种隔离引擎目录（阶段单测、门禁机的假引擎都只拷 stage_deps.py），多一个同目录依赖就整条算键失败、缓存永不命中（11-11 列车红）
+EQUIV_TABLE = os.path.join('pack', 'stage_inputs', 'equiv.tsv')
+
+
+def equiv_load(repo):
+    """→ {(路径, 新 sha16): (旧对象号, 旧 sha16)}；没有表 → {}"""
+    out = {}
+    try:
+        for ln in open(os.path.join(repo, EQUIV_TABLE), encoding='utf-8'):
+            if ln.startswith('#') or not ln.strip(): continue
+            c = ln.rstrip('\n').split('\t')
+            if len(c) >= 4: out[(c[0], c[1])] = (c[2], c[3])
+    except FileNotFoundError:
+        pass
+    return out
+
+
+_equiv = {}
+def equiv_canon(repo, rel, h):
+    """登记过等价的「路径 + 新内容」→ 旧版本的 sha16，否则原样"""
+    t = _equiv.get(repo)
+    if t is None: t = _equiv[repo] = equiv_load(repo)
+    return t.get((rel, h), (None, h))[1]
+
+
+# 算键 / 记清单的基础设施本身（阶段表里归「外」：只读输入算键、不改产物）：照记进实际读入清单（编排层 pack/orch/stages.py 要求清单里有这几行，
+#   缺了就判清单无效、永不跳过——11-11 第一版把它们从清单里去掉，列车上各阶段缓存测试全红）；重算时这几行原样沿用记录值，
+#   改了它们（如加产物等价）不让老游戏重跑（11-11 实测：同根换代码再出，抽取曾因清单里 stage_keyfiles.sh / stage_deps.py 对不上被判重跑）
+#   采集钩子 tools/stage_deps_hook/sitecustomize.py 同属这一类（编排层 MECHANISM 三件之一；11-14 修它的重入，产物与清单行都不变，不该让全部老游戏各阶段重跑一遍）
+INFRA = {'R:pack/stage_keyfiles.sh', 'R:tools/stage_deps.py', 'R:tools/stage_deps_hook/sitecustomize.py', 'R:tools/stage_equiv.py', 'R:pack/stage_inputs/equiv.tsv'}
+
+
+def _eq(repo, k, n, h):
+    """仓库内文件登记过产物等价：记成旧版本的内容哈希（只提速、不改产物的改动不让老游戏重跑，11-11）"""
+    return equiv_canon(repo, n[2:], h) if k == 'f' and n.startswith('R:') else h
+
+
 def _real(repo, name):
     return (repo if name == 'R:.' else os.path.join(repo, name[2:])) if name.startswith('R:') else name
 
@@ -42,13 +82,33 @@ def _git(args, **kw):
     return subprocess.run(['git', *args], env=env, **kw)
 
 
+# 发布快照（App 内置引擎）不带 .git：打包时把 git ls-files -co --exclude-standard 的结果写进 engine.json 的 listed（launchers/macos/bundle_engine.py snapshot_fields）；
+#   装好的副本里 git 还会列出安装后才有的这几个（作业层 pack/jobs/embedded.py 写的安装标记 / 最近使用时刻），在就照算
+SNAPSHOT_RUNTIME = ('.installed.json', '.last-used')
+
+
+@functools.lru_cache(maxsize=None)
+def _snapshot(repo):
+    """→ 快照 engine.json 里的 listed（列表）；开发树 / 旧快照没有 → None"""
+    try:
+        with open(os.path.join(repo, 'engine.json'), encoding='utf-8') as f:
+            listed = json.load(f).get('listed')
+    except FileNotFoundError:
+        return None
+    return tuple(listed) if isinstance(listed, list) and listed else None
+
+
 def _listed(repo):
     """仓库里算输入的文件：git 跟踪的 + 未跟踪但没被忽略的（构建产物 / 缓存被 .gitignore 挡掉）；不是 git 仓库 → None（全收）"""
-    try:
-        out = _git(['-C', repo, 'ls-files', '-co', '--exclude-standard', '-z'], capture_output=True, check=True).stdout
-    except (OSError, subprocess.CalledProcessError):
-        return None, None
-    files = {f for f in out.decode('utf-8', 'surrogateescape').split('\0') if f}
+    listed = _snapshot(os.path.realpath(repo))
+    if listed is not None:
+        files = set(listed) | {f for f in SNAPSHOT_RUNTIME if os.path.isfile(os.path.join(repo, f))}
+    else:
+        try:
+            out = _git(['-C', repo, 'ls-files', '-co', '--exclude-standard', '-z'], capture_output=True, check=True).stdout
+        except (OSError, subprocess.CalledProcessError):
+            return None, None
+        files = {f for f in out.decode('utf-8', 'surrogateescape').split('\0') if f}
     dirs = {''}
     for f in files:
         d = os.path.dirname(f)
@@ -71,6 +131,8 @@ def _keep(kids, name):
 
 
 def _ignored(repo, rel):
+    if _snapshot(os.path.realpath(repo)) is not None:
+        return False   # 快照没有 .git 判不了忽略：读不到的路径一律记「缺」（只多记几行，之后照样稳定）
     return _git(['-C', repo, 'check-ignore', '-q', '--', rel], capture_output=True).returncode == 0
 
 
@@ -83,6 +145,9 @@ def collect(raw, repo, excl):
     files, dirs = _listed(repo)
     rows, wrote = set(), set()
     for fn in sorted(os.listdir(raw)):
+        # 只读本机制写的记录（钩子的 <pid>-<纳秒>.tsv、stage_deps_save / orch 的 scripts.tsv）：记录目录在游戏库卷上，
+        #   exFAT / FAT 上 macOS 把扩展属性存成旁边的 ._<名>（AppleDouble 二进制，含 NUL），还有 .DS_Store（#812 exFAT 出包报 embedded null character）
+        if fn.startswith('.') or not fn.endswith('.tsv'): continue
         with open(os.path.join(raw, fn), encoding='utf-8', errors='surrogateescape') as f:
             for ln in f:
                 k, _, p = ln.rstrip('\n').partition('\t')
@@ -104,7 +169,7 @@ def collect(raw, repo, excl):
         elif any((rp + os.sep).startswith(e) for e in ext):
             out.add((k, rp))
     kids = _children(files, dirs) if files is not None else None
-    return [(k, n, _digest(k, _real(repo, n), _keep(kids, n))) for k, n in sorted(out)]
+    return [(k, n, _eq(repo, k, n, _digest(k, _real(repo, n), _keep(kids, n)))) for k, n in sorted(out)]   # 算键基础设施照记（pack/orch/stages.py 要求清单里有这几行才认）
 
 
 def rehash(manifest, repo):
@@ -113,9 +178,10 @@ def rehash(manifest, repo):
         for ln in f:
             c = ln.rstrip('\n').split('\t')
             if len(c) != 3: continue
+            if c[1] in INFRA: res.append((c[0], c[1], c[2])); continue   # 老清单里记了基础设施：原样沿用，不让它改键
             if c[0] == 'd' and kids is False:   # 有目录项才列一次仓库（git ls-files）
                 files, dirs = _listed(repo); kids = _children(files, dirs) if files is not None else None
-            res.append((c[0], c[1], _digest(c[0], _real(repo, c[1]), _keep(kids, c[1]) if c[0] == 'd' else None)))
+            res.append((c[0], c[1], _eq(repo, c[0], c[1], _digest(c[0], _real(repo, c[1]), _keep(kids, c[1]) if c[0] == 'd' else None))))
     return res
 
 

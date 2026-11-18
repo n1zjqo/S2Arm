@@ -39,9 +39,26 @@ public enum SaveSyncOutcome: Equatable, Sendable {
     case conflictSkipped
 }
 
+/// 存版本的地方（「云端」）：iCloud 云盘文件夹（CloudSaveFolder），或 Apple TV 上的本机偏好存储（DeviceSaveStore）。
+///   引擎只经这五件事读写；快照写完核过才写 head，head 没写成别人看不到这份快照
+public protocol SaveSyncStore: Sendable {
+    /// 所有设备的 head；读不懂的跳过
+    func heads() throws -> [SaveHead]
+    /// 把 head 指的快照取到 destination（不能已存在），核 sha256，不符报 SaveSyncError.corrupt
+    func download(_ head: SaveHead, to destination: URL) throws
+    /// 发布第一步：存下快照 snapshot，核 sha256
+    func putSnapshot(_ archive: URL, as snapshot: String, sha256: String) throws
+    /// 发布第二步：整份替换本设备的 head
+    func putHead(_ head: SaveHead) throws
+    /// 清本设备不再用的快照；删不掉不算失败
+    func prune(device: String, keep: Int, heads: [SaveHead])
+}
+
+extension CloudSaveFolder: SaveSyncStore {}
+
 public final class SaveSyncEngine: Sendable {
     public static let keepOwnSnapshots = 3
-    let folder: CloudSaveFolder
+    let folder: any SaveSyncStore
     let device: String
     let deviceName: String
     let platform: String?
@@ -52,7 +69,7 @@ public final class SaveSyncEngine: Sendable {
     let now: @Sendable () -> Date
 
     /// device：本设备固定的 uuid；work：本次可用的临时目录（同步完删掉）；loadBase / storeBase：这款这个文件夹上次同步后的状态（SaveBase 的 JSON）
-    public init(folder: CloudSaveFolder, device: String, deviceName: String, platform: String? = nil, work: URL, ports: SaveSyncPorts,
+    public init(folder: any SaveSyncStore, device: String, deviceName: String, platform: String? = nil, work: URL, ports: SaveSyncPorts,
                 loadBase: @escaping @Sendable () -> String?, storeBase: @escaping @Sendable (String) -> Void,
                 now: @escaping @Sendable () -> Date = Date.init) {
         self.folder = folder; self.device = device; self.deviceName = deviceName; self.platform = platform; self.work = work; self.ports = ports
@@ -121,6 +138,35 @@ public final class SaveSyncEngine: Sendable {
             }
             try publish(localArchive, content: local!, clock: bump(all), heads: heads)
             return .keptLocal
+        }
+    }
+
+    /// 只上传（游戏进行中切到后台时用）：本机比基线新、云端没有更新的版本才发布；云端有更新或有冲突时什么都不动，回 nil，
+    ///   留给下次起局前的完整同步（游戏在跑，不能把存档换掉，也没有页面让玩家选）
+    public func uploadIfAhead() async throws -> SaveSyncOutcome? {
+        let fm = FileManager.default
+        let scratch = work.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try fm.createDirectory(at: scratch, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: scratch) }
+
+        let localArchive = scratch.appendingPathComponent("local.s2asave")
+        let hasLocal = try await ports.export(localArchive)
+        let local = hasLocal ? saveContentID(try await ports.inspect(localArchive)) : nil
+        let base = Self.decodeBase(loadBase())
+        let seen = base?.clock ?? [:]
+        let heads = try folder.heads()
+
+        switch decideSaveSync(local: local, base: base, heads: heads, device: device) {
+        case .upToDate:
+            return .upToDate
+        case .adopt(let same):
+            store(SaveBase(content: local!, clock: saveClockMerged([seen] + same.map(\.clock))))
+            return .upToDate
+        case .upload:
+            try publish(localArchive, content: local!, clock: bump(seen), heads: heads)
+            return .uploaded
+        case .download, .conflict:
+            return nil
         }
     }
 

@@ -15,7 +15,33 @@ int s2a_autoplay_on(void) __attribute__((weak_import));   // tests/autoplay（S2
 int thread_selfcounts(int type, void *buf, size_t nbytes);
 uint32_t nvn_be_tex_live_n(void); int nvn_be_tex_is_live(uint64_t ser);   // nvn_mtl.m：活着的贴图对象数、这个序号还活着
 static int g_wd_prof = -1; static uint64_t g_wd_prof_t, g_wd_prof_n;   // S2A_WIDEN_PROF=1：挂点指令数（读数行报每次提交 / 每笔的指令数）
-static int g_wd_3d;   // 上次上屏以来有没有开深度测试 / 深度写的绘制（满屏判据用，g_wd_mu 护）
+// 满屏判据「游戏自己出宽图的纯 2D 帧」免判（种类 4）按内容来历认（同通用模式 WidenTexture.Scene3D）：贴图序号 → 内容里有 3D 场景。g_wd_mu 护。
+//   被开了深度测试 / 深度写的绘制画过、被采样了带此标记贴图的绘制画过、计算着色器写过（保守）→ 标；整张拷入随源；颜色清屏作废。上屏贴图不带标记 = 这一帧全是 2D 合成。
+//   原先按帧记「上次上屏以来有没有深度绘制」：11-13 旷野之息 Pro Max 读盘提示页每帧都有 64×64 离屏 3D 小图（Mac 局 YI3D 打点 3641 / 2863 次首笔深度绘制在 64×64 / 1280×720），
+//   纯 2D 的读盘页被判成有 3D，两侧原比例黑边报「出图未满屏」红（玩家看到的也只是这一页，局内铺满）
+#define WD_S3D 8192
+static uint64_t g_wd_s3d[WD_S3D]; static int g_wd_s3d_n;   // 开放寻址：存「内容里有 3D」的贴图序号（没有 = 没标）
+static unsigned wd_s3d_slot(uint64_t ser) { return (unsigned)((ser * 0x9E3779B97F4A7C15ull) >> 51) & (WD_S3D - 1); }
+static int wd_s3d_has(uint64_t ser) {
+    if (!ser) return 0; unsigned k = wd_s3d_slot(ser);
+    for (int i = 0; i < WD_S3D && g_wd_s3d[k]; i++, k = (k + 1) & (WD_S3D - 1)) if (g_wd_s3d[k] == ser) return 1;
+    return 0;
+}
+static void wd_s3d_set(uint64_t ser, int on) {
+    if (!ser) return; unsigned k = wd_s3d_slot(ser);
+    for (int i = 0; i < WD_S3D && g_wd_s3d[k]; i++, k = (k + 1) & (WD_S3D - 1)) if (g_wd_s3d[k] == ser) {
+        if (on) return;
+        g_wd_s3d[k] = 0; g_wd_s3d_n--;   // 删：后面同簇的项往回挪（同 wd_release_now）
+        for (unsigned j = (k + 1) & (WD_S3D - 1); g_wd_s3d[j]; j = (j + 1) & (WD_S3D - 1)) {
+            unsigned h = wd_s3d_slot(g_wd_s3d[j]);
+            if ((j > k && (h <= k || h > j)) || (j < k && h <= k && h > j)) { g_wd_s3d[k] = g_wd_s3d[j]; g_wd_s3d[j] = 0; k = j; }
+        }
+        return;
+    }
+    if (!on) return;
+    if (g_wd_s3d_n >= WD_S3D * 3 / 4) { static int once; if (!once++) MLOG("【红】 S2Arm widen: 3D-content table full (%d textures); further ones are not marked (the fit check may skip a 2D-only frame exemption wrongly)", g_wd_s3d_n); return; }
+    g_wd_s3d[k] = ser; g_wd_s3d_n++;
+}
 static uint64_t g_wd_rs_gpu;   // 本笔片元阶段的支持缓冲副本（render_scale[0] = 片元坐标倍率），0 = 用静态那份（wd_rscale）
 static const uint8_t *g_wd_rs_data;   // CPU view of that same completed arena block; never survives submission/reset
 static float g_wd_fsc = 1.0f, g_wd_fsyc = 1.0f;   // 本笔片元坐标倍率（横 / 纵；wd_rscale 记，内部分辨率 rs_support 在它上面乘本遍比例）
@@ -402,6 +428,7 @@ static void wd_widen_resolve_dst(const tex_t *src, const tex_t *dst) {
                       ok ? "widened to" : "could not be widened to", r, rh, (unsigned long long)src->serial);
 }
 static void wd_release_now(uint64_t ser) {   // 持 g_wd_mu 调。开放寻址删除：后面同簇的项往回挪
+    wd_s3d_set(ser, 0);
     unsigned k = wd_slot(ser);
     for (int i = 0; i < WD_T && g_wd_t[k].ser; i++, k = (k + 1) & (WD_T - 1)) if (g_wd_t[k].ser == ser) {
         s2a_widen_release((uint32_t)ser); g_wd_t[k].ser = 0; g_wd_nt--;
@@ -583,14 +610,14 @@ static int wd_emit_stage(int st, int64_t gen, int no_emit, int *skipped) {
 static int wd_fmt_ds(MTLPixelFormat f) { return f == MTLPixelFormatDepth16Unorm || f == MTLPixelFormatDepth32Float || f == MTLPixelFormatDepth32Float_Stencil8 || f == MTLPixelFormatStencil8 || f == MTLPixelFormatX32_Stencil8; }
 static int wd_samples_wide(const NvShader *sh, int st) {
     if (!sh) return 0;
-    int hit = 0; pthread_mutex_lock(&g_rmu);
+    int hit = 0; os_unfair_lock_lock(&g_rmu);
     for (int i = 0; i < sh->rf.nb && !hit; i++) { const nvn_rbind *b = &sh->rf.b[i]; if (b->kind != NVN_RB_TEX) continue;
         int tid = (int)(tex_slot_h(S.tex[st], S.img[st], b->reg) & 0xfffff);
         if (tid < 0 || tid >= g_ntreg || !g_treg[tid].ok || !g_treg[tid].t.d.width) continue;
         void *tv = NULL; tex_fast_rid(tid, &tv);
         id<MTLTexture> m = (__bridge id<MTLTexture>)tv;   // 横向放宽或窄屏加高过（11-07 小小梦魇3 Duo：源只加高不加宽，原先只认宽，泛光链从没进 LayerWiden）
         hit = m && (rs_cw(m) > g_treg[tid].t.d.width || rs_ch(m) > g_treg[tid].t.d.height) && !wd_fmt_ds(m.pixelFormat); }
-    pthread_mutex_unlock(&g_rmu);
+    os_unfair_lock_unlock(&g_rmu);
     return hit;
 }
 static void wd_layer_widen(NvProg *pr) {
@@ -653,7 +680,7 @@ static int wd_tex_scales_locked(const NvShader *fs, float tk, uint8_t *ix, float
     return n;
 }
 static int wd_tex_scales(const NvShader *fs, float tk, uint8_t *ix, float *v, float tky, float *vy) {
-    pthread_mutex_lock(&g_rmu); int n = wd_tex_scales_locked(fs, tk, ix, v, tky, vy); pthread_mutex_unlock(&g_rmu); return n;
+    os_unfair_lock_lock(&g_rmu); int n = wd_tex_scales_locked(fs, tk, ix, v, tky, vy); os_unfair_lock_unlock(&g_rmu); return n;
 }
 // 计算派发（nvn_mtl.m dispatch()，编参数块之前、没有开着的遍）：同通用模式 WidenRenderer.DispatchCompute。
 //   ① 程序写的存储图像登记给核心、16:9 一族的换成放宽的存储（tex_widen，同开遍时的渲染目标）——只靠计算写的图原先从不登记，一直是游戏的宽；
@@ -663,11 +690,11 @@ static int wd_tex_scales(const NvShader *fs, float tk, uint8_t *ix, float *v, fl
 static void wd_dispatch(NvShader *cs, uint32_t *gx, uint32_t *gy, int indirect) {   // gy：窄屏加高的图像同样补 Y 组数
     if (wd_on() <= 0 || !cs) return;
     tex_t im[8]; int nim = 0;
-    pthread_mutex_lock(&g_rmu);
+    os_unfair_lock_lock(&g_rmu);
     for (int i = 0; i < cs->rf.nb && nim < 8; i++) { const nvn_rbind *b = &cs->rf.b[i]; if (b->kind != NVN_RB_IMG || b->reg >= 32) continue;
         int tid = (int)(S.img[5][b->reg] & 0xfffff);
         if (tid >= 0 && tid < g_ntreg && g_treg[tid].ok && g_treg[tid].t.serial) im[nim++] = g_treg[tid].t; }
-    pthread_mutex_unlock(&g_rmu);
+    os_unfair_lock_unlock(&g_rmu);
     int on_wide = 0, nx = -1, ny = -1;
     uint32_t wide_ser[8]; int nwide = 0;
     for (int i = 0; i < nim; i++) {
@@ -682,6 +709,7 @@ static void wd_dispatch(NvShader *cs, uint32_t *gx, uint32_t *gy, int indirect) 
     pthread_mutex_lock(&g_wd_mu);
     // 组数补到放宽宽度的派发整张写了放宽图像（含两侧带）：报给核心，本帧两侧有确定内容（S2A_WIDEN_DRAW_WRITES 的约定；没补到的派发两侧没写，不报）
     if (nx > 0) for (int i = 0; i < nwide; i++) s2a_widen_gpu_wrote(wide_ser[i], 0);
+    if (g_wd == S2A_WIDEN_UI) for (int i = 0; i < nim; i++) wd_s3d_set(im[i].serial, 1);   // 满屏判据：计算着色器写过的图像保守算有 3D（同通用模式 WidenTexture.Scene3D）
     g_wd_disp++;
     if (on_wide) { if (nx > 0 || ny > 0) { if (nx > 0) *gx = (uint32_t)nx; if (ny > 0) *gy = (uint32_t)ny; g_wd_disp_wide++; } else g_wd_disp_flat++; }
     wd_bind_stage(5, cs);
@@ -713,6 +741,25 @@ static int wd_frag_tex(__unsafe_unretained NvShader *fs, s2a_widen_tex *tx, tex_
             const tex_t *t = &g_treg[tid].t; tx[ntx] = (s2a_widen_tex){(uint32_t)t->serial, (int32_t)t->d.width, (int32_t)t->d.height, 1.0f, wd_tex_flags(h) | wd_flat_flags(t->serial)}; txt[ntx++] = *t; } }
     return ntx;
 }
+// 一笔绘制的内容来历（持 g_wd_mu 调，Ui 模式）：开了深度测试 / 写深度，或片元采样了带 3D 标记的贴图 → 这笔的各颜色目标标 3D（同通用模式 WidenRenderer s3d：只标不清）
+static void wd_s3d_draw(NvProg *pr, int depth) {
+    int on = depth;
+    __unsafe_unretained NvShader *fs = pr ? pr->sh[1] : nil;
+    if (!on && fs && g_wd_s3d_n) {
+        os_unfair_lock_lock(&g_rmu);
+        for (int i = 0; !on && i < fs->rf.nb; i++) { const nvn_rbind *b = &fs->rf.b[i]; if (b->kind != NVN_RB_TEX && b->kind != NVN_RB_TEXU) continue;
+            for (int k = 0; !on && k < (b->kind == NVN_RB_TEXU && b->n ? b->n : 1); k++) {
+                int tid;
+                if (b->kind == NVN_RB_TEX) tid = (int)(tex_slot_h(S.tex[1], S.img[1], b->reg) & 0xfffff);
+                else tid = ubo_tex_id(b->n ? ubo_handle(1, b->reg, b->off + 8 * k) : ubo_packed(1, b));
+                if (tid >= 0 && tid < g_ntreg && g_treg[tid].ok && wd_s3d_has(g_treg[tid].t.serial)) on = 1; } }
+        os_unfair_lock_unlock(&g_rmu);
+    }
+    if (on && R.has_rt) for (int i = 0; i < R.rt.n && i < 8; i++) if (R.rt.color[i]) wd_s3d_set(R.rt.color[i]->serial, 1);
+}
+// 回放层的颜色清屏 / 整张拷贝 / 计算写图像报来（持 g_wd_mu 调）：清屏作废，拷贝随源，计算写保守算 3D（同通用模式）
+static void wd_s3d_cleared(uint64_t ser) { if (g_wd == S2A_WIDEN_UI) wd_s3d_set(ser, 0); }
+static void wd_s3d_copied(uint64_t dst, uint64_t src) { if (g_wd == S2A_WIDEN_UI) wd_s3d_set(dst, wd_s3d_has(src)); }
 static void wd_draw_(NvProg *pr) {
     g_wd_fskey = pr && pr->sh[1] ? pr->sh[1]->key : "-";
     const tex_t *c0 = R.has_rt && R.rt.n > 0 ? R.rt.color[0] : NULL, *d0 = R.has_rt ? R.rt.depth : NULL;
@@ -724,13 +771,13 @@ static void wd_draw_(NvProg *pr) {
     float vpr = in.vp_x + fabsf(in.vp_w), vpb = in.vp_y + fabsf(in.vp_h); wd_tex(c0, vpr, vpb); wd_tex(d0, vpr, vpb);   // 视口右边 / 下边：存储放不宽的目标按它定登不登记成可放宽（见 wd_tex）
     if (cs != g_wd_c0 || ds != g_wd_d0) { s2a_widen_targets((uint32_t)cs, (uint32_t)ds); g_wd_c0 = cs; g_wd_d0 = ds; }
     g_wd_draws++;
-    if (d0 && (S.ds.dt || S.ds.dw)) g_wd_3d = 1;   // 满屏判据：这一帧有 3D 场景（同通用模式 WidenTexture.Scene3D 的「开了深度测试 / 深度写的绘制画过」，按帧记）
+    if (g_wd == S2A_WIDEN_UI) wd_s3d_draw(pr, d0 && (S.ds.dt || S.ds.dw));   // 满屏判据：画进去的内容有没有 3D 场景（按内容来历，见 g_wd_s3d）
     if (!s2a_widen_viewport(in.vp_x, in.vp_w, in.vp_h, 1.0f)) {   // 没画在放宽 / 原生宽区域：核心只会原样，整笔跳过（各槽零拷贝绑游戏内存）
         g_wd_mode = S2A_WIDEN_KEEP; wd_uvx_set(g_wd_mode); wd_rscale(1.0f, 0, NULL, NULL, 1.0f, NULL); wd_trace("target not widened", &in, 0, NULL); wd_skip_note(c0, d0, &in);
         // 铺满整张颜色目标 0 的笔：只交采样表登记整屏副本来历（核心 WidenSession.NoteFill），不改画法。11-02 塞尔达直连菜单：模糊缩图链 782×360 → 320×180 的 16:9 一环
         //   在 Ui 模式下不进核心，菜单底图采样 320×180 认不出是整屏副本，按界面层收进中间 16:9、右侧 213 列黑
         if (c0 && pr->sh[1] && fabsf(in.vp_x) < 0.5f && fabsf(in.vp_w) >= c0->d.width - 0.5f && fabsf(in.vp_h) >= c0->d.height - 0.5f) {
-            static s2a_widen_tex ftx[64]; static tex_t ftxt[64]; pthread_mutex_lock(&g_rmu); int fn = wd_frag_tex(pr->sh[1], ftx, ftxt); pthread_mutex_unlock(&g_rmu);
+            static s2a_widen_tex ftx[64]; static tex_t ftxt[64]; os_unfair_lock_lock(&g_rmu); int fn = wd_frag_tex(pr->sh[1], ftx, ftxt); os_unfair_lock_unlock(&g_rmu);
             if (fn > 0) s2a_widen_note_fill((uint32_t)c0->serial, (int)c0->d.width, (int)c0->d.height, ftx, fn); }
         for (int st = 0; st < 5; st++) if (g_wd_had[st]) { for (int r = 0; r < 16; r++) g_wd_gpu[st][r] = 0; g_wd_had[st] = 0; g_args_dirty[st] = 1; }
         return;
@@ -740,8 +787,8 @@ static void wd_draw_(NvProg *pr) {
     //   本回放层把颜色清屏（OP_CLEAR_COLOR → s2a_widen_target_cleared）、贴图拷贝（copy_t2t）、计算写图像（wd_dispatch）都报给核心：核心据此判放宽目标两侧带本帧有没有确定内容（S2A_WIDEN_DRAW_WRITES）；
     //   颜色目标 0 不混合、四通道全写 = 不透明（S2A_WIDEN_DRAW_OPAQUE：本帧第一笔不透明铺满全宽就不用先清两侧）
     static s2a_widen_tex tx[64]; static tex_t txt[64]; int ntx = 0; __unsafe_unretained NvShader *fs = pr->sh[1];   // 片元实际采样的贴图：核心据此认「采样了放宽 / 原生宽图」与上屏的合成源
-    if (fs) { pthread_mutex_lock(&g_rmu); ntx = wd_frag_tex(fs, tx, txt);
-        pthread_mutex_unlock(&g_rmu);
+    if (fs) { os_unfair_lock_lock(&g_rmu); ntx = wd_frag_tex(fs, tx, txt);
+        os_unfair_lock_unlock(&g_rmu);
         // 共享存储的另一个序号（回放层 g_alias：同池同偏移同描述 = 同一张 MTLTexture）：存储已被放宽（比游戏给的宽宽）、这个序号却没登记过——它就是放宽过的 GPU 内容，
         //   补登记成渲染目标（核心据此认「采样了放宽图」，不当 CPU 供图起 16:9 原比例页）。10-26 八方2：场景图 1802（896 宽）与放宽到 1094 的目标共用存储，
         //   采样它的那笔被起成页、按原宽 896 平移 99 画，清晰层只铺中间、右侧拉丝
@@ -849,7 +896,8 @@ static void wd_present(const tex_t *t, int crop[4]) {   // 上屏：核心定下
     s2a_widen_crop c = {0, 0, 0, 0, 16, 9};
     if (crop[2] || crop[3]) { c.left = crop[0]; c.right = crop[0] + crop[2]; c.top = crop[1]; c.bottom = crop[1] + crop[3]; }
     else { c.right = (int32_t)t->d.width; c.bottom = (int32_t)t->d.height; }
-    s2a_widen_crop c_in = c; int pr = s2a_widen_present((uint32_t)t->serial, &c), pil = pr == 1 || pr == 2 || pr == 5 ? pr : g_wd == S2A_WIDEN_UI && !g_wd_3d ? 4 : 0; g_p2_fb = pr == 5; g_wd_3d = 0; atomic_store(&g_fit_pillar, pil);
+    s2a_widen_crop c_in = c; int pr = s2a_widen_present((uint32_t)t->serial, &c), pil = pr == 1 || pr == 2 || pr == 5 ? pr : g_wd == S2A_WIDEN_UI && !wd_s3d_has(t->serial) ? 4 : 0; g_p2_fb = pr == 5; atomic_store(&g_fit_pillar, pil);
+    { static int last = -1, n; if (pil != last && n < 64) { n++; MLOG("[画] 满屏判据免判种类 %d → %d（第 %llu 次出图起，上屏贴图 ser=%llu %ux%u；4 = 游戏自己出宽图且上屏内容没有 3D 来历）", last, pil, (unsigned long long)g_wd_frame, (unsigned long long)t->serial, (unsigned)t->d.width, (unsigned)t->d.height); } last = pil; }
     if (wd_tr_on()) MLOG("S2Arm widen trace: frame %llu present tex %llu %ux%u crop [%d,%d) -> [%d,%d) rows [%d,%d)", (unsigned long long)g_wd_frame, (unsigned long long)t->serial, (unsigned)t->d.width, (unsigned)t->d.height, c_in.left, c_in.right, c.left, c.right, c.top, c.bottom);
     g_wd_frame++;
     if (crop[2] || crop[3] || pr == 5) { crop[0] = c.left; crop[2] = c.right - c.left; crop[1] = c.top; crop[3] = c.bottom - c.top; }   // 竖向：窄屏加高的出图按加高换算行（宽屏时核心原样返回）；回退（5）收了裁剪框的游戏没给也要交

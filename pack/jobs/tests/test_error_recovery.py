@@ -14,6 +14,7 @@ import tempfile
 import threading
 import time
 import unittest
+from types import SimpleNamespace
 import zipfile
 from unittest.mock import Mock, patch
 
@@ -64,6 +65,16 @@ class ErrorRecoveryTests(JobCase):
         invalid = self.root / "invalid.keys"; invalid.write_bytes(b"\xff\xfe\x00")
         _, failed = self.worker("keys", path=str(invalid))
         self.assert_failure(failed, "keys_invalid")
+        self.assertEqual(self.c.keys.read_bytes(), before)
+
+    def test_missing_keys_file_is_keys_invalid_not_our_file_missing(self):
+        # 诊断#c719ce：选的 prod.keys 已经不在（被移动 / 删除 / iCloud 没下载），原先 stat 抛 FileNotFoundError 落到 job_failed，
+        #   报成「S2Arm 自己的文件找不到了」。期望手写：报 keys_invalid、说是选的密钥文件找不到、让玩家重新选；原有密钥不变
+        self.import_keys()
+        before = self.c.keys.read_bytes()
+        _, failed = self.worker("keys", path=str(self.root / "gone" / "prod.keys"))
+        diagnostic = self.assert_failure(failed, "keys_invalid")
+        self.assertIn("找不到", json.dumps(diagnostic, ensure_ascii=False)); self.assertIn("重新选择", json.dumps(diagnostic, ensure_ascii=False))
         self.assertEqual(self.c.keys.read_bytes(), before)
 
     def test_specific_reader_error_replaces_tool_exit_and_preserves_evidence(self):
@@ -118,8 +129,13 @@ class ErrorRecoveryTests(JobCase):
     def test_reader_io_failure_propagates_after_child_exit(self):
         import winproc
         spawn = winproc.popen if os.name == 'nt' else subprocess.Popen
+        fixture = [sys.executable, "-c", "print('fixture')"]
         def unreadable_pipe(*args, **kwargs):
             child = spawn(*args, **kwargs)
+            # 只给被测的那个子进程装坏管道：Popen 是整个 subprocess 模块打的桩，收尾 reap_session 里的 /bin/ps 也走这里，
+            #   原先它也被等 5 秒、输出过管道缓冲（本机进程多时 ps -A 超 64 KB）就超时，两次收尾每例白等 10 秒、残留进程也没真收（11-14 门禁提速）
+            if list(args[0]) != fixture:
+                return child
             child.wait(timeout=5)
             child.stdout = Mock(wraps=child.stdout)
             child.stdout.readline.side_effect = OSError(errno.EIO, "synthetic pipe read failure")
@@ -187,22 +203,88 @@ raise SystemExit(main.main())
         self.assertEqual(library.requirement_errors(self.c, game)[0].code, "guest_isa_unsupported")
 
     def test_os_failures_use_errno_not_message_guessing(self):
-        for number, code in ((errno.ENOSPC, "disk_full"), (errno.EDQUOT, "disk_full"),
-                             (errno.EACCES, "permission_denied"), (errno.EROFS, "permission_denied"),
-                             (errno.ENOENT, "input_missing")):
+        for number, code in ((errno.ENOSPC, "disk_full"), (errno.EDQUOT, "disk_full")):
             with self.subTest(errno=number):
                 self.assertEqual(explain(OSError(number, "unrelated localized text")).code, code)
+        # 启动器剃刀 H8（11-11）：「原件不见了」「去系统设置授权」只给玩家侧路径。期望按路径手写：
+        #   原件下 ENOENT / EACCES → input_missing / permission_denied；游戏库下 EROFS → permission_denied；游戏库根整个不在 → input_missing；
+        #   私有目录（任务记录 / 日志）下 ENOENT / EACCES、不带路径的 → job_failed，原文与路径进 internal（旧代码一律归 input_missing / permission_denied）
+        src, lib, private = self.root / "h8-originals", self.root / "h8-lib", self.root / "h8-private"
+        src.mkdir(); lib.mkdir(); private.mkdir()
+        cases = ((errno.ENOENT, src / "game.nsp", "input_missing"), (errno.EACCES, src / "game.nsp", "permission_denied"),
+                 (errno.EROFS, lib / "games/x/build", "permission_denied"),
+                 (errno.ENOENT, private / "logs/t1-import.log", "job_failed"), (errno.EACCES, private / "jobs/t1.json", "job_failed"),
+                 (errno.ENOENT, None, "job_failed"))
+        for number, path, code in cases:
+            with self.subTest(errno=number, path=path):
+                error = OSError(number, "unrelated localized text", str(path)) if path else OSError(number, "unrelated localized text")
+                got = explain(error, sources=[src], library=lib)
+                self.assertEqual(got.code, code)
+                if code == "job_failed" and path:
+                    self.assertIn(str(path), got.internal)
+        self.assertEqual(explain(FileNotFoundError(errno.ENOENT, "x", str(lib / "catalog.json")), sources=[src], library=self.root / "unplugged").code,
+                         "input_missing")   # 游戏库根整个不在 = 外接盘没插
         self.assertEqual(explain(Failure("No space left on device")).code, "job_failed")
         self.assertEqual(explain(ValueError("Check keys")).code, "job_failed")
 
-    def test_pack_space_failure_then_recovery_preserves_old_runtime(self):
+    def test_unrecognized_volume_during_classification_does_not_mask_original_error(self):
+        lib = self.root / "classify-volume-lib"
+        src = self.root / "classify-volume-src"
+        lib.mkdir(); src.mkdir()
+        missing_cache = lib / "games" / "Absolum" / "build" / "extract"
+        original = FileNotFoundError(errno.ENOENT, "synthetic missing cache", str(missing_cache))
+
+        def unrecognized_volume(*args, **kwargs):
+            error = OSError(errno.EIO, "synthetic unrecognized volume")
+            error.winerror = 1005
+            raise error
+
+        with patch("errors.os.path.realpath", side_effect=unrecognized_volume):
+            got = explain(original, sources=[src], library=lib)
+        self.assertEqual(got.code, "job_failed")
+        self.assertIn(str(missing_cache), got.internal)
+
+    def test_unrecognized_volume_check_does_not_mark_library_as_missing(self):
+        lib = self.root / "classify-stat-lib"
+        src = self.root / "classify-stat-src"
+        lib.mkdir(); src.mkdir()
+        original_stat = os.stat
+
+        def stat_with_unrecognized_volume(path, *args, **kwargs):
+            if os.fspath(path) == str(lib):
+                error = OSError(errno.EIO, "synthetic unrecognized volume", str(lib))
+                error.winerror = 1005
+                raise error
+            return original_stat(path, *args, **kwargs)
+
+        missing_cache = lib / "games" / "fixture" / "build" / "extract"
+        original = FileNotFoundError(errno.ENOENT, "synthetic missing cache", str(missing_cache))
+        with patch("errors.os.stat", side_effect=stat_with_unrecognized_volume):
+            got = explain(original, sources=[src], library=lib)
+        self.assertEqual(got.code, "job_failed")
+
+    def test_non_os_error_keeps_type_message_and_location(self):
+        # #372 / #854（Windows 0.3.9 报修打包 AttributeError）：不是 OSError 的异常原先连原文一起丢，玩家复制的摘要里只剩「本地任务失败」。
+        #   期望手写：上屏原句不变、码 job_failed；internal 带「AttributeError: <原文>」和抛出处（本测试文件:那一行 in 函数名）
+        def boom():
+            return SimpleNamespace().st_mtime
+        try:
+            boom()
+        except AttributeError as e:
+            got = explain(e)
+        line = boom.__code__.co_firstlineno + 1
+        self.assertEqual((str(got), got.code), ("本地任务失败，请检查日志和输入。", "job_failed"))
+        self.assertIn("AttributeError: 'types.SimpleNamespace' object has no attribute 'st_mtime'", got.internal)
+        self.assertIn(f"（test_error_recovery.py:{line} in boom）", got.internal)
+
+    def test_pack_space_shortfall_warns_and_preserves_old_runtime(self):
+        # 11-14 不许堵门：预估不够只记一条 disk_full 警告、不拦；现有运行版本不动
         game = dict(packages=[])
         old = self.c.library / "games/working/keep"; old.parent.mkdir(parents=True); old.write_text("working")
         with patch("shutil.disk_usage") as usage:
             usage.return_value.free = 1
-            with self.assertRaises(Failure) as raised:
-                library.check_pack_space(self.c, game)
-            self.assertEqual(raised.exception.code, "disk_full")
+            library.check_pack_space(self.c, game)
+            self.assertEqual([(d["code"], d["severity"]) for d in self.c.job["diagnostics"]], [("disk_full", "warning")])
             usage.return_value.free = 100 << 30
             library.check_pack_space(self.c, game)
         self.assertEqual(old.read_text(), "working")
@@ -213,7 +295,8 @@ raise SystemExit(main.main())
         self.assertEqual(raised.exception.code, "tool_missing")
         with self.assertRaises(FileNotFoundError) as raised:
             self.c.run([sys.executable, "-c", "pass"], cwd=self.root / "missing-cwd")
-        self.assertEqual(explain(raised.exception).code, "input_missing")
+        # 启动器剃刀 H8：工作目录是 S2Arm 自己的，不是原件 → 本地任务失败（旧代码说「原件不见了、去接磁盘」）
+        self.assertEqual(explain(raised.exception, **self.c.failure_roots()).code, "job_failed")
         self.c.run([sys.executable, "-c", "print('fixed')"])
         self.assertIn("fixed", self.c.last_log.read_text())
 
@@ -226,7 +309,8 @@ raise SystemExit(main.main())
                 self.skipTest("Windows 无执行权限位")
             with self.assertRaises(PermissionError) as raised:
                 self.c.run([binary])
-            self.assertEqual(explain(raised.exception).code, "permission_denied")
+            # 启动器剃刀 H8：S2Arm 自己的工具没执行权限 → 本地任务失败，不指玩家去系统设置授权
+            self.assertEqual(explain(raised.exception, **self.c.failure_roots()).code, "job_failed")
         binary.chmod(0o700)
         self.c.run([sys.executable, binary] if os.name == "nt" else [binary])
 
@@ -309,11 +393,11 @@ raise SystemExit(main.main())
                                     ("applegpu_g17p", 17, 27, "target_unsupported")):   # 系统下限 iOS 18（10-26）：17 拒
             with self.subTest(code=code, arch=arch, os=osv):
                 self.c.r["target"] = dict(model="fixture", gpuArch=arch, os=osv)
-                with patch.object(target, "os_choices", return_value=[sdk]):
-                    with self.assertRaises(Failure) as raised:
-                        ipa.resolve_target(self.c)
-                self.assertEqual(raised.exception.code, code)
-                self.assertTrue(self.c.describe_failure(raised.exception)["suggestion"])
+                # 预检清单 #40 #41（11-13）：目标那台跑不了也照出包（一包通用），只记一条带码的提醒；码的处理建议照旧有
+                with patch.object(target, "os_choices", return_value=[sdk]), patch.object(self.c, "diagnostic") as warn:
+                    self.assertEqual(ipa.resolve_target(self.c)["gpuArch"], arch)
+                self.assertEqual((warn.call_args.kwargs["code"], warn.call_args.kwargs["severity"]), (code, "warning"))
+                self.assertTrue(self.c.describe_failure(Failure(warn.call_args.args[0], code=code))["suggestion"])
         self.c.r["target"]["os"] = 26
         with patch.object(target, "os_choices", return_value=[26]):
             self.assertEqual(ipa.resolve_target(self.c)["os"], 26)

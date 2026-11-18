@@ -9,7 +9,7 @@ import unittest
 import unittest.mock as um
 
 import test_jobs
-from test_jobs import ROOT, oneclick_done, shared_extract
+from test_jobs import ROOT, img_step, oneclick_done, shared_extract
 from core import Failure
 import ipa
 import target as tg
@@ -18,11 +18,12 @@ import target as tg
 class PackagedNoSdk(unittest.TestCase):
     # 借 test_jobs 的夹具方法（不继承：继承会把那边全部用例再跑一遍）
     setUp, tearDown = test_jobs.JobsTests.setUp, test_jobs.JobsTests.tearDown
-    catalogue, package, game = test_jobs.JobsTests.catalogue, test_jobs.JobsTests.package, test_jobs.JobsTests.game
+    catalogue, package, game, player_keys = test_jobs.JobsTests.catalogue, test_jobs.JobsTests.package, test_jobs.JobsTests.game, test_jobs.JobsTests.player_keys
 
     def prepare(self):
         base = self.package("base")
         self.catalogue([self.game(packages=[base])])
+        self.player_keys()   # 加密原件出包开头要 prod.keys（library.require_game，v0.3.1）
         res = self.root / "res"; (res / "Fonts").mkdir(parents=True); (res / "Fonts/a.bfttf").write_bytes(b"x")
         (res / "Shell/root").mkdir(parents=True); (res / "Shell/manifest.json").write_text("{}")
         self.c.r.update(resources=str(res), gameId="0100000000000000", engineBundle=str(ROOT))
@@ -32,13 +33,21 @@ class PackagedNoSdk(unittest.TestCase):
     def run_build(self, sdk=AssertionError("发版应用不许查外部 SDK")):
         seen = {}
         def run(args, log=None, env=None, cwd=None, on_line=None):
+            if img_step(args, cwd, env): return   # 出包收尾转单一 IMG（ipa.to_img 经 c.run）：真跑
             if not any("oneclick" in str(a) for a in args):   # 出包收尾组库根 S2Arm.ipa（refresh_library_ipa）：这条不测它，组装失败按设计只警告
                 raise Failure("这条测试不组装容器")
             seen.update(args=[str(a) for a in args], env=env)
             out = Path(args[args.index("--out") + 1]); (out / "x.ipa").write_bytes(b"ipa")
             oneclick_done(args, out / "x.ipa", build_id="b", graphics_mode="direct")
-        with um.patch.object(ipa, "dotnet_sdk", side_effect=sdk), um.patch.object(self.c, "run", run), \
-             um.patch.object(self.c, "engine", ROOT), um.patch("toolchain.reader", return_value=Path("/App/Engine/Binaries/Reader/nx_unpack.dll")):
+
+        with (
+            um.patch.object(ipa, "dotnet_sdk", side_effect=sdk),
+            um.patch.object(self.c, "run", run),
+            um.patch.object(self.c, "engine", ROOT),
+            um.patch(
+                "toolchain.reader", return_value=Path("/App/Engine/Binaries/Reader/nx_unpack")
+            ),
+        ):
             return ipa.build(self.c), seen
 
     @shared_extract
@@ -48,11 +57,11 @@ class PackagedNoSdk(unittest.TestCase):
         r, seen = self.run_build()
         env = seen["env"]
         self.assertEqual(env["S2A_SHELL"], str(res / "Shell"))
-        nxu = Path(env["S2A_NX_UNPACK"])
-        self.assertEqual(nxu.read_text(), '#!/bin/sh\nexec dotnet /App/Engine/Binaries/Reader/nx_unpack.dll "$@"\n')
-        self.assertTrue(os.access(nxu, os.X_OK))
+        # 读取器是发版预编的自包含单文件（NativeAOT），直接交给链上：不再包 dotnet 壳、不再要 .NET 运行时
+        self.assertEqual(env["S2A_NX_UNPACK"], "/App/Engine/Binaries/Reader/nx_unpack")
         self.assertEqual(env.get("DOTNET_ROOT"), before, "不换成外部 SDK")
-        self.assertTrue((Path(r["outputPath"]) / "kit" / "main.npdm").is_file())   # 交付件进了这款的 image/ios（不再留单款 ipa）
+        self.assertTrue((Path(r["outputPath"]) / ".pack" / "manifest.json").is_file())   # 资源包进了这款的 image/ios（不再留单款 ipa）
+        self.assertTrue(any((p / "recipe.tar.zst").is_file() for p in (self.c.library / ".programs").iterdir()))   # 程序件的配方进了程序常驻
 
     @shared_extract
     def test_packaged_missing_shell_is_reinstall(self):

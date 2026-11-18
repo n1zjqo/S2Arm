@@ -9,6 +9,7 @@
 #import <UIKit/UIKit.h>
 #import <CoreMotion/CoreMotion.h>
 #import <CoreHaptics/CoreHaptics.h>
+#include "haptic_safe.h"
 #include "native.h"
 #include "s2a_pad.h"
 #include "phone_axes.h"
@@ -24,14 +25,27 @@ static BOOL pref_on(NSString *key) {
     return v ? [v boolValue] : YES;
 }
 
-// ---------- 横屏朝向（主线程刷新，HID 线程读）----------
-static _Atomic int g_orient = (int)UIInterfaceOrientationLandscapeRight;
+// ---------- 屏幕朝向（主线程刷新，HID 线程读）----------
+// 屏幕「右」「上」在机身坐标（CoreMotion x、y）里的方向，由屏幕的界面坐标空间换算到它的固定坐标空间（= 原生面板，机身坐标与之对齐）得出，
+//   不按界面朝向枚举猜。折叠屏内屏例外：iPhone Duo 内屏原生面板其实是竖的（2007x2853），机身坐标却是内屏横放时的右 / 上，
+//   按面板算出的再差 90°（#804 D-KBVC：横端着交给游戏的加速度 (0.80, 0.01, 0.59)，重力落在左右轴上）→ s2a_phone_panel_fix 补转。
+//   普通 iPhone 原生面板是竖的，算出来与原来横屏左 / 右的写死换算相同。打包成一个整数：4 个分量各占 2 位（值 + 1）
+static int basis_pack(int rx, int ry, int ux, int uy) { return (rx + 1) | (ry + 1) << 2 | (ux + 1) << 4 | (uy + 1) << 6; }
+static _Atomic int g_basis = (0 + 1) | (-1 + 1) << 2 | (1 + 1) << 4 | (0 + 1) << 6;   // 缺省 = 竖屏面板横屏右（右 = −y、上 = x）
+static int unit(CGFloat v) { return v > 0.5 ? 1 : v < -0.5 ? -1 : 0; }
 static void orient_refresh(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         for (UIScene *s in UIApplication.sharedApplication.connectedScenes)
             if ([s isKindOfClass:UIWindowScene.class] && ![s.session.role isEqualToString:UIWindowSceneSessionRoleExternalDisplayNonInteractive]) {   // 朝向取手机屏的场景，不取外接屏的（extdisplay.m）
-                UIInterfaceOrientation o = ((UIWindowScene *)s).effectiveGeometry.interfaceOrientation;
-                if (o == UIInterfaceOrientationLandscapeLeft || o == UIInterfaceOrientationLandscapeRight) atomic_store(&g_orient, (int)o);
+                UIScreen *sc = ((UIWindowScene *)s).screen; id<UICoordinateSpace> cs = sc.coordinateSpace, fs = sc.fixedCoordinateSpace;
+                CGPoint o = [cs convertPoint:CGPointZero toCoordinateSpace:fs], r = [cs convertPoint:CGPointMake(1, 0) toCoordinateSpace:fs], d = [cs convertPoint:CGPointMake(0, 1) toCoordinateSpace:fs];
+                // 固定坐标 y 朝下、机身 y 朝上：右 =（Δx, −Δy）；屏幕上 = 界面 −y 方向 =（−Δx, +Δy）
+                int rx = unit(r.x - o.x), ry = -unit(r.y - o.y), ux = -unit(d.x - o.x), uy = unit(d.y - o.y);
+                { int rv[2] = {rx, ry}, uv[2] = {ux, uy}; s2a_phone_panel_fix((int)sc.nativeBounds.size.width, (int)sc.nativeBounds.size.height, UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPhone, rv, uv); rx = rv[0]; ry = rv[1]; ux = uv[0]; uy = uv[1]; }
+                if ((rx || ry) && (ux || uy)) {
+                    int nb = basis_pack(rx, ry, ux, uy), was = atomic_exchange(&g_basis, nb);
+                    if (was != nb) LOG("手机六轴：屏幕右 = 机身 (%d, %d)、上 = 机身 (%d, %d)（原生面板 %.0fx%.0f）", rx, ry, ux, uy, sc.nativeBounds.size.width, sc.nativeBounds.size.height);
+                }
                 break;
             }
     });
@@ -78,7 +92,8 @@ int s2a_phone_motion_read(s2a_pad_motion *out) {
     double acc[3] = {dm.gravity.x + dm.userAcceleration.x, dm.gravity.y + dm.userAcceleration.y, dm.gravity.z + dm.userAcceleration.z};
     double gyr[3] = {dm.rotationRate.x, dm.rotationRate.y, dm.rotationRate.z};
     float a[3], g[3];
-    s2a_phone_axes(atomic_load(&g_orient) == (int)UIInterfaceOrientationLandscapeRight, acc, gyr, a, g);
+    int b = atomic_load(&g_basis), right[2] = {(b & 3) - 1, (b >> 2 & 3) - 1}, up[2] = {(b >> 4 & 3) - 1, (b >> 6 & 3) - 1};
+    s2a_phone_axes_basis(right, up, acc, gyr, a, g);
     *out = (s2a_pad_motion){ (uint64_t)(dm.timestamp * 1e6), a[0], a[1], a[2], g[0], g[1], g[2] };
     return 1;
 }
@@ -173,7 +188,7 @@ static void hp_apply(const s2a_pad_vibration v[2], int kind) {
     if (atomic_exchange(&g_hp_stale, 0)) { g_player = nil; g_playing = 0; }   // 引擎被系统复位：下一次 hp_start 会重新 startAndReturnError
     if (kind == S2A_PHONE_RUMBLE_WARM) { hp_start(); pthread_mutex_unlock(&g_hp_mu); return; }
     if (kind == S2A_PHONE_RUMBLE_STOP || !v) {
-        if (g_player && g_playing) { [g_player stopAtTime:CHHapticTimeImmediate error:nil]; g_playing = 0; }
+        if (g_player && g_playing) { s2a_hp_stop(g_player); g_playing = 0; }
         g_zero_since_ns = 0;
         pthread_mutex_unlock(&g_hp_mu); return;
     }
@@ -190,8 +205,8 @@ static void hp_apply(const s2a_pad_vibration v[2], int kind) {
     uint64_t t = hp_now_ns();
     if (amp <= 0.01f) {
         if (!g_zero_since_ns) g_zero_since_ns = t;
-        if (g_player && g_playing && t - g_zero_since_ns > 1000000000ull) { [g_player stopAtTime:CHHapticTimeImmediate error:nil]; g_playing = 0; }
-        if (g_player && g_playing) [g_player sendParameters:@[[[CHHapticDynamicParameter alloc] initWithParameterID:CHHapticDynamicParameterIDHapticIntensityControl value:0 relativeTime:0]] atTime:CHHapticTimeImmediate error:nil];
+        if (g_player && g_playing && t - g_zero_since_ns > 1000000000ull) { s2a_hp_stop(g_player); g_playing = 0; }
+        if (g_player && g_playing) s2a_hp_send(g_player, @[[[CHHapticDynamicParameter alloc] initWithParameterID:CHHapticDynamicParameterIDHapticIntensityControl value:0 relativeTime:0]], NULL);
         pthread_mutex_unlock(&g_hp_mu); return;
     }
     g_zero_since_ns = 0;
@@ -199,10 +214,10 @@ static void hp_apply(const s2a_pad_vibration v[2], int kind) {
     g_last_ns = t;
     if (hp_start()) {
         NSError *e = nil;
-        if (!g_playing) { if ([g_player startAtTime:CHHapticTimeImmediate error:&e]) g_playing = 1; }
-        [g_player sendParameters:@[
+        if (!g_playing) { if (s2a_hp_start(g_player, &e)) g_playing = 1; }
+        s2a_hp_send(g_player, @[
             [[CHHapticDynamicParameter alloc] initWithParameterID:CHHapticDynamicParameterIDHapticIntensityControl value:amp relativeTime:0],
-            [[CHHapticDynamicParameter alloc] initWithParameterID:CHHapticDynamicParameterIDHapticSharpnessControl value:sharp - 0.5f relativeTime:0]] atTime:CHHapticTimeImmediate error:nil];
+            [[CHHapticDynamicParameter alloc] initWithParameterID:CHHapticDynamicParameterIDHapticSharpnessControl value:sharp - 0.5f relativeTime:0]], NULL);
         static int said; if (!said++) LOG("手机震动：首次 强度 %.2f 锐度 %.2f（%.0f Hz）", amp, sharp, hz);
     }
     pthread_mutex_unlock(&g_hp_mu);

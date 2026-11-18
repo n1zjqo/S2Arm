@@ -8,6 +8,27 @@
 
 // 弱链接[lab]：s2a_main_build_id（runtime/src/loader.c 主程序构建号；输入工作台不链原生核，取不到就不显示版本号提示）
 const char *s2a_main_build_id(void) __attribute__((weak_import));
+// 弱链接[lab]：s2a_program_id（runtime/src/svc_mem.c 本局程序号；输入工作台不链原生核，取不到就不分享）
+uint64_t s2a_program_id(void) __attribute__((weak_import));
+
+// 玩家分享（11-15 维护者：「支持玩家自己导入金手指，还能收集更多金手指文件」）：导入时开着「分享给其他玩家」就把原文 + 程序号 + 构建号传到
+//   诊断上传 Worker（diag.s2arm.com/v1/cheats，同 Mac / Windows pack/jobs/cheats.py share），收进补丁库「玩家分享」上游，别的玩家出包时带上（缺省关）。
+//   只传金手指原文和游戏版本，不带设备 / 账号信息。开关记在 App 级（所有游戏共用），缺省取 kS2ACheatsShareDefault（维护者定，改这一行）
+static const BOOL kS2ACheatsShareDefault = NO;   // 11-15 维护者「金手指分享缺省不勾」
+static BOOL cheats_share_on(void) { id v = [NSUserDefaults.standardUserDefaults objectForKey:@"S2ACheatsShare"]; return v ? [v boolValue] : kS2ACheatsShareDefault; }
+static void cheats_share(NSString *name, NSData *data) {
+    const char *b = s2a_main_build_id ? s2a_main_build_id() : NULL; uint64_t gid = s2a_program_id ? s2a_program_id() : 0;
+    NSString *text = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+    if (!b || strlen(b) < 16 || !gid || !text) { NSLog(@"金手指分享：缺程序号 / 构建号 / 不是 UTF-8，这份不传（%@）", name); return; }
+    NSDictionary *body = @{@"gid": [NSString stringWithFormat:@"%016llX", (unsigned long long)gid], @"bid": [@(b) substringToIndex:16].uppercaseString, @"name": name, @"text": text};
+    NSMutableURLRequest *rq = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"https://diag.s2arm.com/v1/cheats"]];
+    rq.HTTPMethod = @"POST"; rq.timeoutInterval = 20; rq.HTTPBody = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
+    [rq setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+    [rq setValue:[@"ios/" stringByAppendingString:[NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"0"] forHTTPHeaderField:@"X-S2Arm-Client"];
+    [[NSURLSession.sharedSession dataTaskWithRequest:rq completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {   // 传不上不打扰玩家：导入照常可用
+        NSLog(@"金手指分享 %@：%@", name, e ? e.localizedDescription : [NSString stringWithFormat:@"HTTP %ld %@", (long)((NSHTTPURLResponse *)r).statusCode, d ? [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] : @""]);
+    }] resume];
+}
 
 // s2a_cheats_parse 在 ios/cheats_parse.m（只依赖 Foundation，Mac 单测 runtime/tests/t_cheats_parse.m 能直接编）
 
@@ -20,22 +41,38 @@ static NSURL *cheats_dir(void) {   // 文档根唯一取法（s2a_docs.h），�
     return [NSURL fileURLWithPath:@(d) isDirectory:YES];
 }
 
+// 「导入金手指」的系统文件选择器：起始目录给本款的金手指文件夹（没有就建）。不给起始目录时选择器落在「最近项目」，
+//   那一页要汇总机上所有开了文件共享的 App，被大容器拖住时一直「正在加载」，玩家看着像卡死（11-11 真机复现：几分钟不出内容，App 主线程空闲）
+UIDocumentPickerViewController *s2a_cheats_import_picker(void) {
+    UIDocumentPickerViewController *p = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[UTTypePlainText, UTTypeText] asCopy:YES];
+    p.allowsMultipleSelection = YES;
+    NSURL *dir = cheats_dir();
+    [NSFileManager.defaultManager createDirectoryAtURL:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    p.directoryURL = dir;
+    return p;
+}
+
 @interface S2ACheatFile : NSObject
 @property (nonatomic, copy) NSString *file; @property (nonatomic, copy) NSArray<NSString *> *names; @property (nonatomic) BOOL bad;
+// 面板上逐行画的东西（11-13 ç»´æ¤è「排版很乱」）：分组标题（社区约定的 20000000 段，ios/cheats_parse.m folder 1）画成不带开关的小标题、按层级缩进，
+//   分组结束（folder 2）不画；其余是开关行。names 仍只装开关条目（开关键 / 状态查找用）
+@property (nonatomic, copy) NSArray<NSDictionary *> *rows;   // {name, header: BOOL, depth}
+@property (nonatomic, copy) NSSet<NSString *> *fixed;   // 写死地址的条目（ios/cheats_parse.m fixed_address）：条目下标「地址写死，可能不生效」
 @end
 @implementation S2ACheatFile
 @end
 
 // status.txt 的状态值是与服务层 Cheats.cs 约定的串（比对照原样用中文），显示时换成当前语言；认不出的原样显示
 static NSString *cheat_status_text(NSString *st) {
-    NSDictionary *t = @{@"生效中": S2AL(@"cheats.status.active"), @"地址未就绪": S2AL(@"cheats.status.addressNotReady"), @"执行出错": S2AL(@"cheats.status.execError"),
-        @"改代码，不支持": S2AL(@"cheats.status.modifiesCode"), @"格式不对": S2AL(@"cheats.status.badFormat"), @"版本不符": S2AL(@"cheats.status.versionMismatch"),
+    NSDictionary *t = @{@"生效中": S2AL(@"cheats.status.active"), @"生效中（编进游戏）": S2AL(@"cheats.status.packed"), @"地址未就绪": S2AL(@"cheats.status.addressNotReady"), @"执行出错": S2AL(@"cheats.status.execError"),
+        @"改代码，不支持": S2AL(@"cheats.status.modifiesCode"), @"改代码，没编进包": S2AL(@"cheats.status.notPacked"), @"格式不对": S2AL(@"cheats.status.badFormat"), @"版本不符": S2AL(@"cheats.status.versionMismatch"),
         @"关": S2AL(@"cheats.status.off"), @"游戏未装载": S2AL(@"cheats.status.gameNotLoaded"), @"指令有误": S2AL(@"cheats.status.badInstruction")};
     return st ? t[st] ?: st : nil;
 }
 
 @interface S2ACheatsPanel : UITableViewController <UIDocumentPickerDelegate>
 @property (nonatomic, copy) void (^closed)(void);
+@property (nonatomic) BOOL pushed;   // 推进设置的导航里（S 级优化组）：左上用返回键，不放「完成」
 @end
 @implementation S2ACheatsPanel {
     NSArray<S2ACheatFile *> *_files; NSMutableSet<NSString *> *_on; NSDictionary<NSString *, NSString *> *_status; NSTimer *_timer;
@@ -46,7 +83,7 @@ static NSString *cheat_status_text(NSString *st) {
 }
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone target:self action:@selector(done)];
+    if (!self.pushed) self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone target:self action:@selector(done)];
     self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:S2AL(@"cheats.import") style:UIBarButtonItemStylePlain target:self action:@selector(import)];
     self.navigationItem.rightBarButtonItem.accessibilityIdentifier = @"cheats.import";
     [self reload];
@@ -63,9 +100,16 @@ static NSString *cheat_status_text(NSString *st) {
         NSString *text = [NSString stringWithContentsOfURL:[dir URLByAppendingPathComponent:f] encoding:NSUTF8StringEncoding error:nil];
         NSArray *parsed = text ? s2a_cheats_parse(text) : nil;
         S2ACheatFile *cf = [S2ACheatFile new]; cf.file = f; cf.bad = parsed == nil;
-        NSMutableArray *names = [NSMutableArray array];
-        for (NSDictionary *e in parsed) if (![e[@"master"] boolValue]) [names addObject:e[@"name"]];
-        cf.names = names; [files addObject:cf];
+        NSMutableArray *names = [NSMutableArray array], *rows = [NSMutableArray array]; NSMutableSet *fixed = [NSMutableSet set]; NSInteger depth = 0;
+        for (NSDictionary *e in parsed) {
+            if ([e[@"master"] boolValue]) continue;
+            int folder = [e[@"folder"] intValue];
+            if (folder == 2) { depth = MAX(0, depth - 1); continue; }
+            if (folder == 1) { [rows addObject:@{@"name": e[@"name"], @"header": @YES, @"depth": @(depth)}]; depth++; continue; }
+            [names addObject:e[@"name"]]; [rows addObject:@{@"name": e[@"name"], @"header": @NO, @"depth": @(depth)}];
+            if ([e[@"fixed"] boolValue]) [fixed addObject:e[@"name"]];
+        }
+        cf.names = names; cf.rows = rows; cf.fixed = fixed; [files addObject:cf];
     }
     _files = files;
     NSString *en = [NSString stringWithContentsOfURL:[dir URLByAppendingPathComponent:@"enabled.txt"] encoding:NSUTF8StringEncoding error:nil];
@@ -95,19 +139,21 @@ static NSString *cheat_status_text(NSString *st) {
 }
 
 - (void)import {
-    UIDocumentPickerViewController *p = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[UTTypePlainText, UTTypeText] asCopy:YES];
-    p.allowsMultipleSelection = YES; p.delegate = self; [self presentViewController:p animated:YES completion:nil];
+    UIDocumentPickerViewController *p = s2a_cheats_import_picker(); p.delegate = self; [self presentViewController:p animated:YES completion:nil];
 }
 - (void)documentPicker:(UIDocumentPickerViewController *)c didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
     (void)c; NSFileManager *fm = NSFileManager.defaultManager; NSURL *dir = cheats_dir(); NSMutableArray *bad = [NSMutableArray array];
     [fm createDirectoryAtURL:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    // 11-13 维护者「不许堵门」：原先本地解析不出条目 / 不是 UTF-8 就不让导入；现在玩家选的文件一律原样拷进来，
+    //   认不认得、哪条生效以列表里的状态为准（解析不了的标「格式不认」，服务层读到再报它自己的状态）。只有拷贝真失败才报
     for (NSURL *u in urls) {
-        NSString *text = [NSString stringWithContentsOfURL:u encoding:NSUTF8StringEncoding error:nil];
         NSString *name = u.lastPathComponent;
         if (![name.pathExtension.lowercaseString isEqual:@"txt"]) name = [name stringByAppendingPathExtension:@"txt"];
-        if (!text || !s2a_cheats_parse(text).count || [name isEqual:@"enabled.txt"] || [name isEqual:@"status.txt"]) { [bad addObject:u.lastPathComponent]; continue; }
-        NSURL *dst = [dir URLByAppendingPathComponent:name]; NSError *e;
-        if (![text writeToURL:dst atomically:YES encoding:NSUTF8StringEncoding error:&e]) [bad addObject:[NSString stringWithFormat:S2AL(@"cheats.import.badItem"), u.lastPathComponent, e.localizedDescription]];
+        if ([name isEqual:@"enabled.txt"] || [name isEqual:@"status.txt"]) name = [@"cheat-" stringByAppendingString:name];   // 撞我们的两份记录文件：改个名照收
+        NSError *e = nil; NSData *data = [NSData dataWithContentsOfURL:u options:0 error:&e];
+        if (!data || ![data writeToURL:[dir URLByAppendingPathComponent:name] options:NSDataWritingAtomic error:&e])
+            [bad addObject:[NSString stringWithFormat:S2AL(@"cheats.import.badItem"), u.lastPathComponent, e.localizedDescription ?: @""]];
+        else if (cheats_share_on()) cheats_share(name, data);
     }
     [self reload];
     if (bad.count) [self alert:S2AL(@"cheats.import.failed") message:[NSString stringWithFormat:S2AL(@"cheats.import.failed.message"), [bad componentsJoinedByString:@"\n"]]];
@@ -115,8 +161,8 @@ static NSString *cheat_status_text(NSString *st) {
 
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)t { (void)t; return 1 + (NSInteger)_files.count; }
 - (NSInteger)tableView:(UITableView *)t numberOfRowsInSection:(NSInteger)s {
-    (void)t; if (s == 0) return 0;
-    S2ACheatFile *f = _files[s - 1]; return (f.bad ? 0 : (NSInteger)f.names.count) + 1;   // 末行「删除这份文件」
+    (void)t; if (s == 0) return 1;   // 第 0 组：「分享给其他玩家」开关（导入时生效）
+    S2ACheatFile *f = _files[s - 1]; return (f.bad ? 0 : (NSInteger)f.rows.count) + 1;   // 末行「删除这份文件」
 }
 - (NSString *)tableView:(UITableView *)t titleForHeaderInSection:(NSInteger)s {
     (void)t; if (s == 0) return nil;
@@ -135,21 +181,52 @@ static NSString *cheat_status_text(NSString *st) {
     return m;
 }
 - (UITableViewCell *)tableView:(UITableView *)t cellForRowAtIndexPath:(NSIndexPath *)ip {
+    if (ip.section == 0) {
+        UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
+        cell.textLabel.text = S2AL(@"cheats.share"); cell.detailTextLabel.text = S2AL(@"cheats.share.note"); cell.detailTextLabel.numberOfLines = 0;
+        cell.selectionStyle = UITableViewCellSelectionStyleNone;
+        UISwitch *sw = [UISwitch new]; sw.on = cheats_share_on(); sw.accessibilityIdentifier = @"cheats.share";
+        [sw addTarget:self action:@selector(shareToggled:) forControlEvents:UIControlEventValueChanged]; cell.accessoryView = sw;
+        return cell;
+    }
     (void)t; S2ACheatFile *f = _files[ip.section - 1];
     UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
-    if (ip.row >= (NSInteger)(f.bad ? 0 : f.names.count)) {
+    if (ip.row >= (NSInteger)(f.bad ? 0 : f.rows.count)) {
         cell.textLabel.text = S2AL(@"cheats.deleteFile"); cell.textLabel.textColor = UIColor.systemRedColor; return cell;
     }
-    NSString *name = f.names[ip.row], *key = [NSString stringWithFormat:@"%@/%@", f.file, name];
+    NSDictionary *row = f.rows[ip.row];
+    cell.indentationLevel = [row[@"depth"] integerValue]; cell.indentationWidth = 16;
+    if ([row[@"header"] boolValue]) {   // 分组标题：小号加粗、次要色，不带开关、点了没反应
+        cell.textLabel.text = row[@"name"]; cell.selectionStyle = UITableViewCellSelectionStyleNone;
+        cell.textLabel.font = [UIFontMetrics.defaultMetrics scaledFontForFont:[UIFont systemFontOfSize:13 weight:UIFontWeightSemibold]]; cell.textLabel.adjustsFontForContentSizeCategory = YES;
+        cell.textLabel.textColor = UIColor.secondaryLabelColor; cell.accessibilityTraits = UIAccessibilityTraitHeader;
+        return cell;
+    }
+    NSString *name = row[@"name"], *key = [NSString stringWithFormat:@"%@/%@", f.file, name];
     cell.textLabel.text = [name isEqual:@"未命名"] ? S2AL(@"cheats.unnamed") : name; cell.selectionStyle = UITableViewCellSelectionStyleNone;   // 「未命名」是与 Cheats.cs 共用的条目名标识（开关键里照原样用），只换显示
     BOOL on = [_on containsObject:key]; NSString *st = _status[key];
-    cell.detailTextLabel.text = on ? (st && ![st isEqual:@"关"] ? cheat_status_text(st) : S2AL(@"cheats.status.pending")) : nil;
-    cell.detailTextLabel.textColor = [st isEqual:@"生效中"] ? UIColor.systemGreenColor : UIColor.secondaryLabelColor;
+    NSString *detail = on ? (st && ![st isEqual:@"关"] ? cheat_status_text(st) : S2AL(@"cheats.status.pending")) : nil;
+    if ([f.fixed containsObject:name]) detail = detail ? [NSString stringWithFormat:@"%@ · %@", detail, S2AL(@"cheats.fixedAddress")] : S2AL(@"cheats.fixedAddress");
+    cell.detailTextLabel.text = detail; cell.detailTextLabel.numberOfLines = 0;
+    // 生效了（读数值的条目「生效中」、编进游戏的「生效中（编进游戏）」）都写绿色「已生效」（11-13 ç»´æ¤è：原来的字像还在等）
+    cell.detailTextLabel.textColor = on && ([st isEqual:@"生效中"] || [st isEqual:@"生效中（编进游戏）"]) ? UIColor.systemGreenColor : UIColor.secondaryLabelColor;
     UISwitch *sw = [UISwitch new]; sw.on = on; sw.accessibilityIdentifier = key;
     [sw addTarget:self action:@selector(toggled:) forControlEvents:UIControlEventValueChanged]; cell.accessoryView = sw;
     return cell;
 }
+- (void)shareToggled:(UISwitch *)sw { [NSUserDefaults.standardUserDefaults setBool:sw.on forKey:@"S2ACheatsShare"]; }
 - (void)toggled:(UISwitch *)sw {
+    NSString *key = sw.accessibilityIdentifier;
+    // 玩家分享、未验证的（补丁库「玩家分享」上游，文件名 <构建号>.player.txt）：打开前提示一句可能坏存档，不拦
+    if (sw.on && [[key componentsSeparatedByString:@"/"].firstObject hasSuffix:@".player.txt"]) {
+        UIAlertController *a = [UIAlertController alertControllerWithTitle:S2AL(@"cheats.shared.warn.title") message:S2AL(@"cheats.shared.warn.message") preferredStyle:UIAlertControllerStyleAlert];
+        [a addAction:[UIAlertAction actionWithTitle:S2AL(@"common.cancel") style:UIAlertActionStyleCancel handler:^(UIAlertAction *x) { (void)x; sw.on = NO; }]];
+        [a addAction:[UIAlertAction actionWithTitle:S2AL(@"cheats.shared.warn.on") style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) { (void)x; [self applyToggle:sw]; }]];
+        [self presentViewController:a animated:YES completion:nil]; return;
+    }
+    [self applyToggle:sw];
+}
+- (void)applyToggle:(UISwitch *)sw {
     NSString *key = sw.accessibilityIdentifier;
     if (sw.on) [_on addObject:key]; else [_on removeObject:key];
     if (![self writeEnabled]) { sw.on = !sw.on; if (sw.on) [_on addObject:key]; else [_on removeObject:key]; }
@@ -158,7 +235,7 @@ static NSString *cheat_status_text(NSString *st) {
 - (void)tableView:(UITableView *)t didSelectRowAtIndexPath:(NSIndexPath *)ip {
     [t deselectRowAtIndexPath:ip animated:YES];
     S2ACheatFile *f = _files[ip.section - 1];
-    if (ip.row < (NSInteger)(f.bad ? 0 : f.names.count)) return;
+    if (ip.row < (NSInteger)(f.bad ? 0 : f.rows.count)) return;
     UIAlertController *a = [UIAlertController alertControllerWithTitle:[NSString stringWithFormat:S2AL(@"cheats.delete.title"), f.file] message:S2AL(@"cheats.delete.message") preferredStyle:UIAlertControllerStyleAlert];
     [a addAction:[UIAlertAction actionWithTitle:S2AL(@"common.cancel") style:UIAlertActionStyleCancel handler:nil]];
     [a addAction:[UIAlertAction actionWithTitle:S2AL(@"common.delete") style:UIAlertActionStyleDestructive handler:^(UIAlertAction *x) { (void)x;
@@ -172,6 +249,7 @@ static NSString *cheat_status_text(NSString *st) {
 }
 @end
 
+UIViewController *s2a_cheats_controller(BOOL pushed) { S2ACheatsPanel *p = [S2ACheatsPanel new]; p.pushed = pushed; [p loadViewIfNeeded]; return p; }
 void s2a_cheats_present(UIViewController *host, void (^closed)(void)) {
     S2ACheatsPanel *p = [S2ACheatsPanel new]; p.closed = closed;
     UINavigationController *n = [[UINavigationController alloc] initWithRootViewController:p];

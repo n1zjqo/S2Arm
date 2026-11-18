@@ -8,7 +8,10 @@ public final class ShellSettingsStore: @unchecked Sendable {
     public static let suiteName = "shell-settings"
     public static let dataFolderKey = "globalDataBookmark"
     public static let cloudSavesKey = "globalCloudSavesBookmark"
-    public static let performanceHUDKey = "performanceHUD"       // true/false; a game's own row wins when set
+    /// The performance overlay: one switch for every game, the same one as the in-game gear menu (ios/vpad.m, ios/hud.m read
+    /// S2APerfHUD from the app's defaults). The shell's own key was never read by anything and is gone.
+    public static let performanceHUDKey = "S2APerfHUD"
+    static let retiredPerformanceHUDKey = "performanceHUD"
     public static let dataFolderNameKey = "globalDataFolderName"
     public static let cloudSavesNameKey = "globalCloudSavesFolderName"
     public static let touchSizeKey = "touchSize"                 // small, medium or large: DM_TOUCH_SIZE for every game
@@ -18,7 +21,17 @@ public final class ShellSettingsStore: @unchecked Sendable {
     /// Where the left stick sits, as the engine reads DM_TOUCH_STICK. The corner is the built-in place and is never stored.
     public static let touchStickPlaces = ["corner", "higher", "inward"]
     public static let touchLayoutKey = "touchLayout"             // the player's arrangement: DM_TOUCH_LAYOUT for every game
+    /// Game sound in Silent Mode: the same key as the system Settings app's S2Arm page (ios/Settings.bundle), read by ios/app.m
+    /// audio_category_apply from the app's defaults (Playback when on, SoloAmbient when off).
+    public static let playInSilentModeKey = "S2APlayInSilentMode"
+    /// S2Arm: 与其他 App 混音（宿主 ios/app.m audio_choice 读同一个键）；原只在系统设置 App 的 S2Arm 页（11-14 挪进游戏库设置）
+    public static let mixWithOthersKey = "S2AMixWithOthers"
     public static let liquidGlassKey = "liquidGlass"             // true/false; Liquid Glass on the floating surfaces, on unless turned off
+    /// S2Arm: the app's interface language, the same key as the in-game settings (ios/s2a_l10n.h S2AUILanguageKey). The host sets
+    /// the app's AppleLanguages from it when the process starts, so a change takes effect the next time S2Arm opens. "system" is never
+    /// stored: no value means follow the system.
+    public static let interfaceLanguageKey = "S2AUILanguage"
+    public static let interfaceLanguages = ["system", "zh-Hans", "zh-Hant", "en", "ja", "es", "fr"]
 
     /// The store the app reads and writes. Tests and previews swap it.
     nonisolated(unsafe) public static var current = ShellSettingsStore()
@@ -35,15 +48,28 @@ public final class ShellSettingsStore: @unchecked Sendable {
     /// The folders' names for the page, written by the host when the player picks them.
     public var dataFolderName: String? { defaults.string(forKey: Self.dataFolderNameKey) }
     public var cloudSavesFolderName: String? { defaults.string(forKey: Self.cloudSavesNameKey) }
-    public var performanceHUD: Bool? {   // nil: no shell-level choice, the game's own row decides
-        defaults.object(forKey: Self.performanceHUDKey) as? Bool
-    }
+    public var performanceHUD: Bool { UserDefaults.standard.bool(forKey: Self.performanceHUDKey) }
+    public var playInSilentMode: Bool { UserDefaults.standard.bool(forKey: Self.playInSilentModeKey) }
+    public var mixWithOthers: Bool { UserDefaults.standard.bool(forKey: Self.mixWithOthersKey) }
 
     public func storeDataFolderName(_ name: String) { defaults.set(name, forKey: Self.dataFolderNameKey) }
     public func storeCloudSavesFolderName(_ name: String) { defaults.set(name, forKey: Self.cloudSavesNameKey) }
     public func clearDataFolderName() { defaults.removeObject(forKey: Self.dataFolderNameKey) }
     public func clearCloudSavesFolderName() { defaults.removeObject(forKey: Self.cloudSavesNameKey) }
-    public func storePerformanceHUD(_ on: Bool) { defaults.set(on, forKey: Self.performanceHUDKey) }
+    public func storePlayInSilentMode(_ on: Bool) { UserDefaults.standard.set(on, forKey: Self.playInSilentModeKey) }
+    public func storeMixWithOthers(_ on: Bool) { UserDefaults.standard.set(on, forKey: Self.mixWithOthersKey) }
+    public var interfaceLanguage: String {
+        guard let v = UserDefaults.standard.string(forKey: Self.interfaceLanguageKey), Self.interfaceLanguages.contains(v) else { return "system" }
+        return v
+    }
+    public func storeInterfaceLanguage(_ value: String) {
+        guard Self.interfaceLanguages.contains(value) else { return }
+        if value == "system" { UserDefaults.standard.removeObject(forKey: Self.interfaceLanguageKey) } else { UserDefaults.standard.set(value, forKey: Self.interfaceLanguageKey) }
+    }
+    public func storePerformanceHUD(_ on: Bool) {
+        UserDefaults.standard.set(on, forKey: Self.performanceHUDKey)
+        defaults.removeObject(forKey: Self.retiredPerformanceHUDKey)
+    }
 
     /// The touch controls' size for every game: small, medium (the built-in size) or large.
     public var touchSize: String {
@@ -103,7 +129,7 @@ public final class ShellSettingsStore: @unchecked Sendable {
     /// DM_PAD_MAP is deliberately excluded. The host merges it per button at launch.
     /// The shell's value for each `DM_*` switch a game's own settings leave alone.
     public var gameDefaults: [String: String] {
-        var values = performanceHUD.map { ["DM_METAL_HUD": $0 ? "1" : "0"] } ?? [:]
+        var values: [String: String] = [:]
         if touchSize != "medium" { values["DM_TOUCH_SIZE"] = touchSize }
         if touchStick != "corner" { values["DM_TOUCH_STICK"] = touchStick }
         let layout = touchLayout.encoded

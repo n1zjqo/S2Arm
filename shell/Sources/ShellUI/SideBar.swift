@@ -22,6 +22,8 @@ public struct SideBar: Equatable, Sendable {
     /// A chip in the column: this wide, and the Controllers chip a little taller for its count under the symbol.
     public static let chipWidth: CGFloat = 52
     public static let heights: [CGFloat] = [56, 44]
+    /// S2Arm (#623): the player chip above them when the host has players, its symbol over the name's first letters.
+    public static let playerHeight: CGFloat = 56
     /// The one chip at the top of the column: the game's settings, or Back.
     public static let topHeights: [CGFloat] = [44]
     public static let gap: CGFloat = 10
@@ -100,7 +102,7 @@ struct SideBarProbe: View {
     let report: (SideBar) -> Void
     var body: some View {
         #if canImport(SwiftUI, _version: 8.1)
-        if #available(iOS 27.1, macOS 27.1, *) { SideBarReader(report: report) } else { Color.clear }
+        if #available(iOS 27.1, macOS 27.1, tvOS 27.1, *) { SideBarReader(report: report) } else { Color.clear }
         #else
         Color.clear
         #endif
@@ -108,7 +110,7 @@ struct SideBarProbe: View {
 }
 
 #if canImport(SwiftUI, _version: 8.1)
-@available(iOS 27.1, macOS 27.1, *)
+@available(iOS 27.1, macOS 27.1, tvOS 27.1, *)
 private struct SideBarReader: View {
     let report: (SideBar) -> Void
     @Environment(\.toolbarVerticalEdge) private var edge
@@ -121,6 +123,7 @@ private struct SideBarReader: View {
 }
 #endif
 
+#if !os(tvOS)   // tvOS：侧边条（iPhone Duo）的按钮依赖触屏库界面的 ControllerChip / ShellSettingsChip，电视上不编
 /// The Controllers and Settings chips stacked in the side column.
 struct SideBarChips: View {
     let controllers: Int
@@ -128,6 +131,7 @@ struct SideBarChips: View {
     let openShellSettings: () -> Void
     var body: some View {
         VStack(spacing: SideBar.gap) {
+            PlayerChip(vertical: true)   // S2Arm (#623); draws nothing without players
             ControllerChip(count: controllers, vertical: true, action: openControllers)
             ShellSettingsChip(vertical: true, action: openShellSettings)
         }
@@ -153,6 +157,7 @@ struct SideBarTopChip: View {
         .shellTarget(target, radius: 22, action: action)
     }
 }
+#endif   // !os(tvOS)
 
 extension View {
     /// Puts a side-column chip at `frame`, given in the screen's coordinates, inside a view laid out in the safe area.

@@ -8,7 +8,9 @@ reviewable JSON table. A finding is a candidate, never a claim of ownership.
 Exit 0: no blocking candidates/boundaries; 1: candidates or unapproved full-scan
 boundaries; 2: invalid/incomplete changed scan. Full scan never treats unread
 content as scanned: only the existing reasoned allowlist can acknowledge an
-ordinary boundary, and never credentials, payloads or non-regular Git entries.
+ordinary boundary. A separate exact-path, pinned-SHA rule may verify reviewed
+third-party ZIP bytes without scanning their contents; credentials, game paths
+and non-regular Git entries remain protected.
 --base gates content findings on added
 lines and metadata findings on new/renamed files; old findings do not block.
 """
@@ -16,13 +18,18 @@ import argparse
 import codecs
 from collections import Counter
 import fnmatch
+import hashlib
 import json
+import os
 from pathlib import Path, PurePosixPath
 import re
 import subprocess
 import sys
 
 RULES_PATH = Path(__file__).with_name('public_repo_scan_rules.json')
+# 私有规则（只在维护方机器上）：内部称呼的词表不能明文放进公开仓，放在仓外由入车快检查和门禁读；读不到（外部贡献者）就跳过。
+#   只判新增行：存量不计命中，也不计存量（改了扫描器 / 规则表时的全量模式同样只看新增行）。环境变量 S2A_PRIVATE_SCAN_RULES 可改路径
+PRIVATE_RULES_PATH = Path(os.environ.get('S2A_PRIVATE_SCAN_RULES') or Path.home() / '.config' / 's2arm' / 'scan_private_rules.json')
 MAX_BYTES = 16 * 1024 * 1024
 # 可执行 / 库文件头（Mach-O、Mach-O fat、ELF、PE、ar）：白名单外的一律记 build_artifact（构建产物不入仓）
 ARTIFACT_MAGIC = (b'\xcf\xfa\xed\xfe', b'\xce\xfa\xed\xfe', b'\xca\xfe\xba\xbe', b'\x7fELF', b'MZ', b'!<arch>')
@@ -59,9 +66,45 @@ def load_rules():
                 row['compiled'] = re.compile(row['regex'])
             if 'line_regex' in row:
                 row['line_compiled'] = re.compile(row['line_regex'])
+        archive_paths = set()
+        for row in rules.get('reviewed_archives', []):
+            if not isinstance(row, dict) or any(
+                    not isinstance(row.get(key), str) or not row[key]
+                    for key in ('id', 'path', 'sha256', 'reason')):
+                raise ValueError
+            path = row['path']
+            if (not row['id'] or not row['reason'] or not path or path.startswith('/') or
+                    '..' in PurePosixPath(path).parts or str(PurePosixPath(path)) != path or
+                    any(c in path for c in '*?[]') or path in archive_paths or
+                    not re.fullmatch(r'[0-9a-f]{64}', row['sha256'])):
+                raise ValueError
+            archive_paths.add(path)
+        rules['added_only_rules'] = load_private_rules()
         return rules
     except (OSError, ValueError, KeyError, TypeError, re.error):
         raise ScanError('invalid_rules_table') from None
+
+
+def load_private_rules():
+    """私有规则：{"version": 1, "content_rules": [{"id", "category", "regex"}…]}；文件不在 → []（跳过）；在但坏了 → 报错（别静默漏扫）"""
+    try:
+        text = PRIVATE_RULES_PATH.read_text(encoding='utf-8')
+    except FileNotFoundError:
+        return []
+    except OSError:
+        raise ScanError('invalid_private_rules') from None
+    try:
+        data = json.loads(text)
+        if data['version'] != 1:
+            raise ValueError
+        out = []
+        for row in data['content_rules']:
+            if not row['id'] or not row['category']:
+                raise ValueError
+            out.append(dict(row, compiled=re.compile(row['regex'])))
+        return out
+    except (ValueError, KeyError, TypeError, re.error):
+        raise ScanError('invalid_private_rules') from None
 
 
 def matches(path, globs):
@@ -80,8 +123,8 @@ def allowed(category, value, line, path, rules):
     return False
 
 
-def content_hits(line, path, rules):
-    for row in rules['content_rules']:
+def content_hits(line, path, rules, key='content_rules'):
+    for row in rules.get(key, ()):
         if 'context_compiled' in row and not row['context_compiled'].search(line):
             continue
         if row.get('messages_only'):   # 只扫提交信息的规则（内部线名：文件存量待 v0.2.0 后一次清完再打开）
@@ -174,6 +217,19 @@ def classify(path, mode, kind, size, rules, read_blob=None):
                 return 'unreviewed_type', []
             return 'text', []
     return 'unreviewed_type', []
+
+
+def reviewed_archive(path, mode, kind, rules):
+    """Exact metadata eligibility only. Never probe protected data for its hash."""
+    boundary = rules['boundaries']
+    protected = (boundary['credential_directories'] + boundary['protected_directories'] +
+                 boundary['payload_directories'])
+    if (mode not in ('100644', '100755') or kind != 'blob' or
+            PurePosixPath(path).suffix.lower() != '.zip' or
+            matches(path.lower(), boundary['credential_globs']) or
+            any(p.lower() in protected for p in PurePosixPath(path).parts)):
+        return None
+    return next((row for row in rules.get('reviewed_archives', []) if row['path'] == path), None)
 
 
 class Blobs:
@@ -286,6 +342,9 @@ def scan(repo, ref, paths, list_only=False, base=None):
         except ScanError:
             raise ScanError('cannot_resolve_baseline') from None
     matched_paths = {p for p in paths if p == '.'}
+    # 增量门禁（给了 --base）只有改动文件会阻挡；没改的文件扫出来只计「存量命中」、不影响结论（钉了摘要的压缩包只在规则表变了时结论才会变）。
+    #   所以规则表与扫描器自己都没改时只读改动文件（11-16 门禁提速：全树读一遍本机约 117 秒，每支都跑）；它俩改了照旧全树
+    changed_only = base is not None and not ({str(RULES_PATH.name), Path(__file__).name} & {PurePosixPath(c).name for c in changed if c.startswith('tools/')})
     findings, manifest, uncovered = [], [], []
     uncovered_blocking, uncovered_allowed = [], []
     counts = Counter()
@@ -296,6 +355,9 @@ def scan(repo, ref, paths, list_only=False, base=None):
             matched_paths.update(matching)
             if not matching:
                 counts['outside_selection'] += 1
+                continue
+            if changed_only and path not in changed:
+                counts['unchanged_not_read'] += 1
                 continue
             decision, meta_categories = classify(
                 path, mode, kind, size, rules,
@@ -336,12 +398,14 @@ def scan(repo, ref, paths, list_only=False, base=None):
                         decision = 'unreviewed_binary_or_encoding'
                     else:
                         for number, line in enumerate(text.split('\n'), 1):
+                            added = path in changed and (ranges is None or any(start <= number < start + count
+                                                                               for start, count in ranges))
                             for category in sorted({c for c, _ in content_hits(line, path, rules)}):
-                                findings.append({**location, 'status': 'changed' if path in changed and
-                                                 (ranges is None or any(start <= number < start + count
-                                                                        for start, count in ranges))
-                                                 else 'existing',
+                                findings.append({**location, 'status': 'changed' if added else 'existing',
                                                  'line': number, 'category': category})
+                            if added:   # 私有规则只判新增行（不计存量）
+                                for category in sorted({c for c, _ in content_hits(line, path, rules, 'added_only_rules')}):
+                                    findings.append({**location, 'status': 'changed', 'line': number, 'category': category})
                 else:
                     # strings -a semantics, without executing or decoding the binary.
                     seen = set()
@@ -359,8 +423,17 @@ def scan(repo, ref, paths, list_only=False, base=None):
             counts[decision] += 1
             if decision not in ('text', 'binary_ascii', 'metadata_only'):
                 item = {**location, 'reason': decision}
+                archive = reviewed_archive(path, mode, kind, rules) if decision == 'excluded_payload' else None
+                verified = archive is not None and size <= MAX_BYTES and \
+                    hashlib.sha256(reader.read(oid, size)).hexdigest() == archive['sha256']
+                if verified:
+                    item['reviewed_archive'] = archive['id']
                 uncovered.append(item)
-                if base is None:
+                if archive is not None:
+                    # Hash verification is not content coverage. A changed pinned
+                    # archive must fail too, rather than becoming a delta warning.
+                    (uncovered_allowed if verified else uncovered_blocking).append(item)
+                elif base is None:
                     # Reuse the one reviewed policy table, without opening the
                     # blob or changing its coverage classification. Protected
                     # material cannot be waived by even a matching rule.
@@ -394,7 +467,7 @@ def scan_messages(repo, ref, base):
     """提交信息扫描（11-09 维护方：公开仓扫描只查文件，main 提交信息里漏进内部线名 / 设备代号这类内部称呼）：
     base..ref 每条提交信息逐行用同一份 content_rules 里 internal_name 类判；返回 [(短提交号, 行号, 规则 id)]，命中的词本身不外泄"""
     rules = load_rules()
-    rows = [r for r in rules['content_rules'] if r['category'] in MESSAGE_CATEGORIES or r.get('messages')]
+    rows = [r for r in rules['content_rules'] if r['category'] in MESSAGE_CATEGORIES or r.get('messages')] + rules['added_only_rules']
     revs = git(repo, 'rev-list', f'{base}..{ref}').decode().split()
     hits = []
     for rev in revs:
@@ -458,6 +531,10 @@ def main():
             print('【黄】{}:uncovered: {}'.format(json.dumps(f['path'], ensure_ascii=True), f['reason']))
         for f in report['uncovered_blocking']:
             print('{}:uncovered: {}'.format(json.dumps(f['path'], ensure_ascii=True), f['reason']))
+        for f in report['uncovered_allowed']:
+            if 'reviewed_archive' in f:
+                print('{}:reviewed_archive: SHA-256 已核对（仍未扫描正文）'.format(
+                    json.dumps(f['path'], ensure_ascii=True)))
         if args.base is None:
             print('全量公开仓扫描：候选 {}，未读阻挡 {}，有理由保留未读 {}（仍未扫描正文）'.format(
                 report['blocking_count'], len(report['uncovered_blocking']), len(report['uncovered_allowed'])))

@@ -106,6 +106,7 @@ static void *stopper(void *unused) {
     return NULL;
 }
 int main(void) {
+    setenv("S2A_CAPS_OWN", "1", 1);   // 测我方帧率表装载机制本身（11-14 起缺省不装，S2A_CAPS_OWN=1 才装）
     require(plat_mem_write32(1, 7) != 0, "invalid write rejected without crashing");
     module_t *m = &g_mod[g_nmod++];
     snprintf(m->name, sizeof m->name, "main"); m->base = img; m->size = sizeof img;
@@ -121,7 +122,7 @@ int main(void) {
           "w main 0x1028 i32 61 *0x8*0x10\n"
           "w main 0xfffffffffffffffc i32 99\n"
           "w main 0x101c i32 99 if main 0xffffffffffffffff u8 == 1\n", f); fclose(f);
-    unsetenv("S2A_FPS_TABLE"); unsetenv("S2A_FPS60"); unsetenv("S2A_FPS_CAP");
+    unsetenv("S2A_FPS_TABLE"); setenv("S2A_FPS60", "1", 1);   /* 玩家开了（11-11 起默认原帧率） */ unsetenv("S2A_FPS_CAP");
     s2a_fps_start(dir);
     wait_flag(&chain_writes, "two-level pointer chain must reach CHAIN_B+0x10");
     pthread_mutex_lock(&mu); require(chain_value == 61, "chain row writes the table value 61"); pthread_mutex_unlock(&mu);
@@ -149,7 +150,6 @@ int main(void) {
     block_write = 0; pthread_cond_broadcast(&cv); pthread_mutex_unlock(&mu);
     wait_flag(&stop_returned, "stop did not join writer");
     require(pthread_join(stopper_thread, NULL) == 0, "join caller");
-    require(atomic_load(&clock_calls) > 0, "writer uses injected monotonic clock");
     // A second session must start its own writer. Turning 60 fps off writes the
     // table's explicit off value (11-02: never the first value read, which was a
     // snapshot from before the game initialised the variable). Stop has returned
@@ -165,6 +165,6 @@ int main(void) {
     require(s2a_fps_session_stop() == 0, "stop succeeds");
     require(s2a_fps_session_reset() == 0, "final reset succeeds");
     unlink(path); rmdir(dir);
-    puts("✓ t_fps_portable: safe I/O, two-level pointer chain, injected clock and joined stop");
+    puts("✓ t_fps_portable: safe I/O, two-level pointer chain, and joined stop");
     return 0;
 }

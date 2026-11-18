@@ -1,9 +1,24 @@
 {
  "schema": 1,
- "id": "2026-11-10-official-site",
+ "id": "mac-old-updater-1114",
  "text": {
-  "zh-Hans": "好消息：s2arm.com 已正式成为 S2Arm 官方网站。S2Arm 免费开源，从不接受捐赠；请只从 s2arm.com 或 GitHub 仓库获取 S2Arm。",
-  "en": "Good news: s2arm.com is now the official S2Arm website. S2Arm is free and open source and never accepts donations; get S2Arm only from s2arm.com or the GitHub repository."
+  "zh-Hans": "Mac 版 0.3.4 及更早：请到 s2arm.com 下载 dmg 覆盖安装，先不要用应用内更新——旧更新器可能更新到一半，留下新旧混装。",
+  "en": "Mac 0.3.4 or earlier: download the dmg from s2arm.com and install it over the old app. Don't use in-app update on these versions; the old updater can stop halfway and leave a mixed install."
  },
- "url": "https://github.com/jhaizhou-ops/S2Arm#readme"
+ "url": "https://s2arm.com/",
+ "messages": [
+  {
+   "id": "mac-old-updater-v040",
+   "level": "important",
+   "platforms": [
+    "mac"
+   ],
+   "text": {
+    "zh-Hans": "Mac 版 0.3.5 到 0.3.9：现在可以直接用应用内更新升到 v0.4.0，不用再下载 dmg。之前提示「先别用应用内更新」的问题已在 v0.4.0 修好。",
+    "en": "Mac 0.3.5 to 0.3.9: you can now update to v0.4.0 in-app — no need to download the dmg. The earlier \"don't use in-app update\" issue is fixed in v0.4.0."
+   },
+   "url": "https://s2arm.com/",
+   "maxVersion": "0.3.9"
+  }
+ ]
 }

@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 S2Arm contributors
-# 门禁覆盖：pack/orch/roots.py
+# 门禁覆盖：pack/orch/roots.py pack/orch/dirrename.py
 # 门禁手动：W1限定七新增文件且不改列车入口；Windows与Mac显式原生运行本测试，命令与分母随PR交付
 """Original files only: transaction/CAS, independent bytes and outside sentinels."""
 import contextlib
 import errno
 import io
 import os
+import stat
 from pathlib import Path
 import subprocess
 import sys
@@ -16,7 +17,17 @@ import unittest
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from pack.orch import roots
+from pack.orch import dirrename, roots
+
+
+
+def writable(path):
+    """真去以写方式打开一下（不写）：Windows 的封存是拒写的访问控制项，os.access 只看只读位、判不出来"""
+    try:
+        with open(path, 'r+b'):
+            return True
+    except PermissionError:
+        return False
 
 
 class _Os:
@@ -42,7 +53,7 @@ class RenameDirTest(unittest.TestCase):
                 left[0] -= 1
                 e = PermissionError(13, '拒绝访问。'); e.winerror = winerror; raise e
             return real(path, target)
-        with patch.object(roots, 'os', _Os(name)), patch.object(Path, 'rename', rename):
+        with patch.object(dirrename, 'os', _Os(name)), patch.object(Path, 'rename', rename):
             try:
                 roots.rename_dir(self.home / 'a.tmp', self.home / 'a', sleep=sleeps.append); error = None
             except PermissionError as e:
@@ -115,6 +126,40 @@ class RootsTest(unittest.TestCase):
         self.assertEqual((first / 'exefs/main').read_bytes(), b'original main\x00')
         self.assertEqual(self.store.cur('原创'), second)
 
+    def intern_fails(self, how):
+        """收进共享存储那几步按 how 出错：期望提交照常成功，RomFS 以真目录留在本版本里、内容不变，存储里没有半截身份，打一行黄（#754）"""
+        tx = self.store.begin('原创', 'seed')
+        (tx.path / 'exefs').mkdir(); (tx.path / 'exefs/main').write_bytes(b'm')
+        (tx.path / 'romfs/arc/sub').mkdir(parents=True); (tx.path / 'romfs/arc/sub/f').write_bytes(b'resource')
+        real_link, real_rename = roots.directory_link, roots.rename_dir
+        def half_junction(target, link, **k):   # junction 退路建了空目录、写重解析点时失败（_junction 自己的回收也没成）；别的链接照常
+            if Path(link).name != 'romfs': return real_link(target, link, **k)
+            Path(link).mkdir(); raise OSError(145, '目录不是空的。')
+        def move_fails(src, dst, **k):
+            if Path(dst).parent.name == '原创' and '.romfs_store' in str(dst): raise PermissionError(5, '拒绝访问。')
+            return real_rename(src, dst, **k)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), \
+             patch.object(roots, 'directory_link', side_effect=half_junction if how == 'link' else real_link), \
+             patch.object(roots, 'rename_dir', side_effect=move_fails if how == 'move' else real_rename):
+            final = tx.commit()
+        self.assertFalse(roots.is_link(final / 'romfs'))
+        self.assertEqual((final / 'romfs/arc/sub/f').read_bytes(), b'resource')
+        self.assertFalse((final / '.romfs.intern').exists())
+        store = self.home / 'roots/.romfs_store/原创'
+        self.assertEqual(list(store.iterdir()) if store.is_dir() else [], [])
+        self.assertIn('【黄】RomFS 没收进共享存储', err.getvalue())
+        return final
+
+    def test_intern_link_failure_keeps_romfs_in_version(self):
+        final = self.intern_fails('link')
+        tx = self.store.begin('原创', 'next')   # 下一个阶段照常从这一版开工
+        self.assertEqual((tx.path / 'romfs/arc/sub/f').read_bytes(), b'resource')
+        tx.abort()
+
+    def test_intern_move_failure_keeps_romfs_in_version(self):
+        self.intern_fails('move')
+
     def test_failed_activation_leaves_current(self):
         first = self.seed()
         tx = self.store.begin('原创', 'fail')
@@ -183,13 +228,183 @@ class RootsTest(unittest.TestCase):
         self.assertIsNone(self.store.cur('原创'))
 
     def test_romfs_is_physically_readonly(self):
-        first = self.seed()
+        # 开发 / 门禁机（S2A_ROMFS_SEAL=1）：共享存储物理只读，阶段误写当场失败
+        with patch.dict(os.environ, {'S2A_ROMFS_SEAL': '1'}):
+            first = self.seed()
         probe = 'from pathlib import Path; import sys; Path(sys.argv[1]).write_bytes(b"BAD")'
         result = subprocess.run([sys.executable, '-c', probe, str(first / 'romfs/data')], capture_output=True)
         if os.name != 'nt' and hasattr(os, 'geteuid') and os.geteuid() == 0:
             self.skipTest('root bypasses POSIX permission bits; normal-user check required')
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual((first / 'romfs/data').read_bytes(), b'original resource\x00')
+
+    def test_romfs_player_writable(self):
+        # 玩家机（不设 S2A_ROMFS_SEAL）：存储在玩家看得见的游戏库里，不许只读——玩家手动删旧产物不能被挡
+        with patch.dict(os.environ, {'S2A_ROMFS_SEAL': ''}):
+            first = self.seed()
+        target = (first / 'romfs').resolve()
+        if os.name == 'nt':
+            probe = 'from pathlib import Path; import sys; Path(sys.argv[1]).write_bytes(Path(sys.argv[1]).read_bytes())'
+            self.assertEqual(subprocess.run([sys.executable, '-c', probe, str(target / 'data')]).returncode, 0)
+        else:
+            stuck = [p for p in [target, *target.rglob('*')] if not p.is_symlink() and not os.stat(p).st_mode & stat.S_IWUSR]
+            self.assertEqual(stuck, [])
+
+    def test_ntfs_romfs_hardlink(self):
+        # #291：Windows 同卷非 ReFS（NTFS）播种 RomFS 建硬链接、不逐文件实拷；别的目录（link_ok 不给）照旧实拷成独立的一份。
+        #   期望手写：link_ok → 目标与源同一个文件（同 inode、链接数 2）、不打「实拷」；不给 → 独立文件、字节相同、打「实拷」；
+        #   建链接失败（跨卷 / FAT）→ 退回实拷。在 Mac / Linux 上把平台看成 win32、ReFS 判否来走这条路（硬链接 posix 照样能建）
+        src = self.home / 'romfs-file'
+        src.write_bytes(bytes(range(256)) * 17)
+        def run(dst, **kw):
+            err = io.StringIO()
+            with patch.object(roots.sys, 'platform', 'win32'), patch.object(roots, 'refs_same_volume', return_value=False), \
+                 contextlib.redirect_stderr(err):
+                roots.copy_file(src, dst, **kw)
+            return err.getvalue()
+        out = run(self.home / 'linked', link_ok=True)
+        self.assertTrue(os.path.samefile(src, self.home / 'linked'))
+        self.assertEqual(os.stat(src).st_nlink, 2)
+        self.assertNotIn('实拷', out)
+        out = run(self.home / 'copied')
+        self.assertFalse(os.path.samefile(src, self.home / 'copied'))
+        self.assertEqual(src.read_bytes(), (self.home / 'copied').read_bytes())
+        self.assertIn('实拷', out)
+        with patch.object(roots.os, 'link', side_effect=OSError(errno.EXDEV, 'cross-device')):
+            out = run(self.home / 'fallback', link_ok=True)
+        self.assertFalse(os.path.samefile(src, self.home / 'fallback'))
+        self.assertIn('硬链接不可用', out)
+
+    def test_copy_tree_judges_volume_once_per_tree(self):
+        # 11-16 出包轻阶段：每个阶段事务克隆现行，追加内容几千个文件原先逐个判「同一 ReFS 卷」（每个文件两次 realpath + 两次查卷）。
+        #   期望手写：一棵 3 个文件、2 层子目录的树 → 判卷 1 次，判的是源根与目标根，判出的结果交给每个文件；字节逐个相同；
+        #   只有空目录的树 → 0 次；单个文件不给 refs 照旧自己判 1 次，给了 refs=False 不判
+        src = self.home / 'aoc-src'
+        (src / '1/sub').mkdir(parents=True); (src / 'empty').mkdir()
+        files = {'a.bin': b'A' * 3, '1/b.bin': b'B' * 5, '1/sub/c.bin': b'C' * 7}
+        for rel, data in files.items():
+            (src / rel).write_bytes(data)
+        judge = Mock(return_value=False)
+        with patch.object(roots.sys, 'platform', 'win32'), patch.object(roots, 'refs_same_volume', judge), \
+             contextlib.redirect_stderr(io.StringIO()):
+            self.store._copy_tree(src, self.home / 'aoc-dst')
+            self.assertEqual(judge.call_count, 1)
+            self.assertEqual(judge.call_args.args[0], src)
+            self.assertEqual(Path(judge.call_args.args[1]).parent, self.home / 'aoc-dst')
+            for rel, data in files.items():
+                self.assertEqual((self.home / 'aoc-dst' / rel).read_bytes(), data)
+            self.assertTrue((self.home / 'aoc-dst/empty').is_dir())
+            judge.reset_mock()
+            (self.home / 'only-dirs/x/y').mkdir(parents=True)
+            self.store._copy_tree(self.home / 'only-dirs', self.home / 'only-dirs-copy')
+            self.assertEqual(judge.call_count, 0)
+            roots.copy_file(src / 'a.bin', self.home / 'single')
+            self.assertEqual(judge.call_count, 1)
+            roots.copy_file(src / 'a.bin', self.home / 'single2', refs=False)
+            self.assertEqual(judge.call_count, 1)
+        self.assertEqual((self.home / 'single2').read_bytes(), b'AAA')
+
+    def test_shared_tree_written_in_place_is_refused_at_commit(self):
+        # 11-16 维护者：硬链接的前提「aoc/ 只许整目录替换、不许原地改」要有守护。期望手写：
+        #   ① 阶段原地改 aoc/d1/a.bin → 提交报冲突、点名 aoc/d1/a.bin，现行版本号不变（Windows 硬链接下现行那份文件已被连带改，非 Windows 不变）；② 整目录换掉 aoc/（aoc 阶段那条路）→ 正常提交、内容是新的；
+        #   ③ 不动 aoc/、只改别处 → 正常提交
+        first = self.seed()
+        tx = self.store.begin('原创', 'aoc0')
+        (tx.path / 'aoc' / 'd1').mkdir(parents=True); (tx.path / 'aoc/d1/a.bin').write_bytes(b'dlc a'); (tx.path / 'aoc/b.bin').write_bytes(b'dlc b')
+        base = tx.commit()
+        tx = self.store.begin('原创', 'aoc1')
+        linked = os.path.samefile(tx.path / 'aoc/d1/a.bin', base / 'aoc/d1/a.bin')   # Windows 上是硬链接（_copy_tree hardlink），别处是克隆 / 实拷
+        if linked and roots.sealing():   # 开发 / 门禁机上它已封存（Transaction._seal_shared）：原地写在第一下就失败，另见 test_shared_tree_sealed_on_dev_machines_only
+            with self.assertRaises(PermissionError):
+                (tx.path / 'aoc/d1/a.bin').write_bytes(b'dlc a changed in place')
+            tx.abort()
+            return
+        (tx.path / 'aoc/d1/a.bin').write_bytes(b'dlc a changed in place')
+        with self.assertRaises(roots.Conflict) as cm:
+            tx.commit()
+        self.assertIn('aoc/d1/a.bin', str(cm.exception).replace(os.sep, '/'))
+        # 守护只能在提交时发现、拦住这一版上线；硬链接下原地写已经连带改了现行那份文件（这正是只许整目录替换的原因），克隆 / 实拷下现行不受影响
+        self.assertEqual((self.store.cur('原创'), (base / 'aoc/d1/a.bin').read_bytes()), (base, b'dlc a changed in place' if linked else b'dlc a'))
+        self.assertEqual(linked, os.name == 'nt')
+        tx = self.store.begin('原创', 'aoc2')
+        roots.remove_owned(tx.path / 'aoc'); tx.replaced('aoc'); (tx.path / 'aoc').mkdir(); (tx.path / 'aoc/c.bin').write_bytes(b'dlc c')
+        two = tx.commit()
+        self.assertEqual(sorted(p.name for p in (two / 'aoc').iterdir()), ['c.bin'])
+        tx = self.store.begin('原创', 'aoc3')
+        (tx.path / 'exefs/main').write_bytes(b'new main')
+        self.assertEqual((tx.commit() / 'aoc/c.bin').read_bytes(), b'dlc c')
+        self.assertNotEqual(first, two)
+        # ④ 整目录换掉却没声明（tx.replaced）→ 照样报冲突：不靠树目录 inode 判「换没换」（ext4 上删掉的目录 inode 会马上被新目录复用，11-16 Linux 门禁误报）
+        tx = self.store.begin('原创', 'aoc4')
+        roots.remove_owned(tx.path / 'aoc'); (tx.path / 'aoc').mkdir(); (tx.path / 'aoc/c.bin').write_bytes(b'dlc C changed')
+        with self.assertRaises(roots.Conflict):
+            tx.commit()
+        self.assertEqual((self.store.cur('原创') / 'aoc/c.bin').read_bytes(), b'dlc c')
+
+    def test_shared_tree_sealed_on_dev_machines_only(self):
+        # 11-16 维护者定：共用数据树（aoc/）只在开发 / 门禁机（S2A_ROMFS_SEAL=1）封成只读，玩家机不封。期望手写：
+        #   ① 门禁机提交后 aoc 下的文件不可写，别处（exefs）照旧可写；② Windows 上下一版的 aoc 是同一个文件的硬链接：原地写在第一下就失败、现行内容不变；
+        #   ③ 下一版整目录换掉 aoc（remove_owned + replaced）照常提交，删掉的只是这一版的链接，上一版那份仍封着；④ 玩家机提交后 aoc 照旧可写
+        self.seed()
+        with patch.dict(os.environ, {'S2A_ROMFS_SEAL': '1'}):
+            tx = self.store.begin('原创', 'seal0')
+            (tx.path / 'aoc').mkdir(); (tx.path / 'aoc/a.bin').write_bytes(b'dlc a')
+            base = tx.commit()
+            self.assertEqual((writable(base / 'aoc/a.bin'), writable(base / 'exefs/main')), (False, True))
+            tx = self.store.begin('原创', 'seal1')
+            if os.name == 'nt':
+                self.assertTrue(os.path.samefile(tx.path / 'aoc/a.bin', base / 'aoc/a.bin'))
+                with self.assertRaises(PermissionError):
+                    (tx.path / 'aoc/a.bin').write_bytes(b'dlc a changed in place')
+            self.assertEqual((base / 'aoc/a.bin').read_bytes(), b'dlc a')
+            roots.remove_owned(tx.path / 'aoc'); tx.replaced('aoc'); (tx.path / 'aoc').mkdir(); (tx.path / 'aoc/b.bin').write_bytes(b'dlc b')
+            two = tx.commit()
+            self.assertEqual(sorted(p.name for p in (two / 'aoc').iterdir()), ['b.bin'])
+            self.assertEqual(((base / 'aoc/a.bin').read_bytes(), writable(base / 'aoc/a.bin')), (b'dlc a', False))
+        with patch.dict(os.environ, {'S2A_ROMFS_SEAL': ''}):
+            tx = self.store.begin('原创', 'seal2')
+            (tx.path / 'aoc/c.bin').write_bytes(b'dlc c')
+            tx.replaced('aoc')
+            self.assertTrue(writable(tx.commit() / 'aoc/c.bin'))
+
+    def test_shared_trees_hardlinked_on_windows_and_fall_back_to_copy(self):
+        # 11-16 出包轻阶段：追加内容（aoc）各版本共用、不原地改，阶段事务克隆现行时 Windows 上逐个建硬链接，不逐个块克隆。
+        #   期望手写：① 阶段事务克隆现行：aoc 走硬链接、exefs 不走；② Windows 下硬链接树：每个文件与源同一个文件、空目录照建、不调 copy_file；
+        #   ③ 硬链接建不了（FAT 类卷）：说一句黄、这一棵全部照常 copy_file（3 个文件 3 次），字节相同、与源不是同一个文件
+        tx = self.store.begin('原创', 'with-aoc')
+        (tx.path / 'exefs').mkdir(); (tx.path / 'exefs/main').write_bytes(b'main')
+        (tx.path / 'aoc/1').mkdir(parents=True); (tx.path / 'aoc/1/data').write_bytes(b'dlc')
+        tx.commit()
+        seen = {}; real = self.store._copy_tree
+        def spy(source, dest, *a, hardlink=False, **k):
+            seen[Path(source).name] = hardlink
+            return real(source, dest, *a, hardlink=hardlink, **k)
+        with patch.object(self.store, '_copy_tree', side_effect=spy):
+            self.store.begin('原创', 'next').abort()
+        self.assertEqual(seen, {'aoc': True, 'exefs': False})
+        src = self.home / 'aoc-src'
+        (src / '1/sub').mkdir(parents=True); (src / '2').mkdir()
+        files = {'a.bin': b'A' * 3, '1/b.bin': b'B' * 5, '1/sub/c.bin': b'C' * 7}
+        for rel, data in files.items():
+            (src / rel).write_bytes(data)
+        nt = _Os('nt')
+        posix_link = patch.object(roots, 'is_link', lambda p: Path(p).is_symlink())   # 只把硬链接这一步看成 Windows；判链接照本机
+        with patch.object(roots, 'os', nt), posix_link, patch.object(roots, 'copy_file', side_effect=AssertionError('copied')):
+            self.store._copy_tree(src, self.home / 'linked', hardlink=True)
+        for rel in files:
+            self.assertTrue(os.path.samefile(src / rel, self.home / 'linked' / rel), rel)
+        self.assertTrue((self.home / 'linked/2').is_dir())
+        nt.link = Mock(side_effect=OSError(errno.EPERM, 'no hard links on this volume'))
+        err = io.StringIO()
+        with patch.object(roots, 'os', nt), posix_link, patch.object(roots, 'refs_same_volume', return_value=False), \
+             patch.object(roots, 'copy_file', wraps=roots.copy_file) as copied, contextlib.redirect_stderr(err):
+            self.store._copy_tree(src, self.home / 'copied', hardlink=True)
+        self.assertEqual(copied.call_count, 3)
+        self.assertEqual(nt.link.call_count, 1)
+        self.assertIn('硬链接不可用', err.getvalue())
+        for rel, data in files.items():
+            self.assertEqual((self.home / 'copied' / rel).read_bytes(), data)
+            self.assertFalse(os.path.samefile(src / rel, self.home / 'copied' / rel))
 
     def test_realcopy_warns_and_bytes_match(self):
         src = self.home / 'source'
@@ -325,6 +540,199 @@ class RootsTest(unittest.TestCase):
         finally:
             if p.poll() is None:
                 p.terminate(); p.communicate(timeout=10)
+
+
+class SelfHealLinkModeTest(unittest.TestCase):
+    """链接模式（NTFS / APFS）的自愈（v0.3.1）。期望手写：
+    ① 现行链接丢了（被删 / 换版本中途被杀在换链接之前）：cur() 取最新的已提交版本重建现行，内容是那一版；没有任何版本时照旧 None
+    ② 换链接那一步失败：现行还是旧版（已有用例 test_failed_activation_leaves_current）；之后再提交照常"""
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='s2a-heal-'); self.home = Path(self.temp.name)
+        self.store = roots.Roots(self.home / 'roots', shared=False)
+
+    def tearDown(self):
+        roots.remove_owned(self.home); self.temp.cleanup()
+
+    def test_missing_current_link_heals_to_newest(self):
+        with patch.dict(os.environ, {'S2A_ROOTS_NO_BOOT': '1'}):
+            self.assertIsNone(self.store.cur('原创'))
+            for tag, data in (('v1', b'1'), ('v2', b'2')):
+                tx = self.store.begin('原创', tag); (tx.path / 'f').write_bytes(data); tx.commit(); time.sleep(0.01)
+            live = self.store.path / '原创@现行'
+            roots.remove_owned(live)
+            cur = self.store.cur('原创')
+        self.assertTrue(roots.is_link(live)); self.assertEqual(cur.name, '原创@v2'); self.assertEqual((cur / 'f').read_bytes(), b'2')
+
+
+class PlainRootsTest(unittest.TestCase):
+    """实目录模式（v0.3.1：游戏库 / 存放位置在 exFAT / FAT32 上，卷上建不了目录链接；S2A_ROOTS_PLAIN=1 在 Mac 上走同一条）。期望手写：
+    ① 现行是真目录（不是链接），版本名记在 .root_tag；再提交一次，旧现行改回 <款>@<它的版本名>、内容不变，romfs 留在版本里、不建 .romfs_store
+    ② 两个事务从同一现行起，先提交的赢，后提交的没声明重放就 Conflict（版本身份按 .root_tag 比，不按固定的「@现行」目录名）
+    ③ 声明了重放：两边的改动都在
+    ④ 第二次改名（新版本 → 现行）失败：旧现行改回原位、仍是现行（两次改名中间失败的自愈）；被杀在两次改名之间 / 现行被删 / 版本名记录丢了也自愈（见各用例）
+    ⑤ prune 留现行 + 上一版，更早的删掉
+    ⑥ 播种 move_romfs：不把原处 romfs 整个搬走（搬走后原处没法留联接），原处还在、现行里有一份"""
+    def setUp(self):
+        self.env = patch.dict(os.environ, {'S2A_ROOTS_PLAIN': '1'}); self.env.start()
+        self.temp = tempfile.TemporaryDirectory(prefix='s2a-plain-')
+        self.home = Path(self.temp.name)
+        self.store = roots.Roots(self.home / 'roots', shared=False)
+
+    @unittest.skipUnless(os.name == 'nt', 'UNC volume probe is Windows-only')
+    def test_unc_share_uses_plain_mode_without_volume_junction_probe(self):
+        with patch.dict(os.environ, {'S2A_ROOTS_PLAIN': ''}), \
+             patch.object(roots, '_api', side_effect=AssertionError('UNC roots must not query junction-capable volume APIs')):
+            self.assertFalse(roots.links_supported(r'\\server\share\game-library'))
+
+    def tearDown(self):
+        roots.remove_owned(self.home); self.temp.cleanup(); self.env.stop()
+
+    def commit(self, tag, files):
+        tx = self.store.begin('原创', tag)
+        for name, data in files.items():
+            (tx.path / name).parent.mkdir(parents=True, exist_ok=True); (tx.path / name).write_bytes(data)
+        return tx.commit()
+
+    def test_current_is_real_directory_and_old_is_parked(self):
+        self.assertTrue(self.store.plain)
+        first = self.commit('seed', {'exefs/main': b'm1', 'romfs/data': b'r1'})
+        live = self.store.path / '原创@现行'
+        self.assertEqual(first, live); self.assertFalse(roots.is_link(live)); self.assertTrue(live.is_dir())
+        self.assertEqual(roots.read(live / '.root_tag'), '原创@seed')
+        self.commit('next', {'exefs/main': b'm2'})
+        self.assertEqual(self.store.cur('原创'), live)
+        self.assertEqual(roots.read(live / '.root_tag'), '原创@next')
+        self.assertEqual((live / 'exefs/main').read_bytes(), b'm2'); self.assertEqual((live / 'romfs/data').read_bytes(), b'r1')
+        old = self.store.path / '原创@seed'
+        self.assertEqual((old / 'exefs/main').read_bytes(), b'm1')
+        self.assertFalse(roots.is_link(live / 'romfs')); self.assertFalse((self.home / 'roots' / '.romfs_store').exists())
+
+    def test_concurrent_conflict_and_replay(self):
+        self.commit('seed', {'exefs/main': b'm'})
+        a = self.store.begin('原创', 'a'); b = self.store.begin('原创', 'b'); c = self.store.begin('原创', 'c')
+        (a.path / 'a').write_bytes(b'A'); (b.path / 'b').write_bytes(b'B'); (c.path / 'c').write_bytes(b'C')
+        live = a.commit()
+        with self.assertRaises(roots.Conflict):
+            b.commit()
+        self.assertFalse((live / 'b').exists())
+        live = c.commit(replay=('c',))
+        self.assertEqual(((live / 'a').read_bytes(), (live / 'c').read_bytes()), (b'A', b'C'))
+
+    def test_failed_second_rename_restores_current(self):
+        self.commit('seed', {'exefs/main': b'm1'})
+        live = self.store.path / '原创@现行'
+        tx = self.store.begin('原创', 'next')
+        real = roots.rename_dir
+        def rename(src, dst, **kw):
+            if Path(dst) == live and Path(src) == tx.path:
+                raise OSError('rename denied')
+            return real(src, dst, **kw)
+        with patch.object(roots, 'rename_dir', rename), self.assertRaises(OSError):
+            tx.commit()
+        self.assertEqual(self.store.cur('原创'), live)
+        self.assertEqual(roots.read(live / '.root_tag'), '原创@seed'); self.assertEqual((live / 'exefs/main').read_bytes(), b'm1')
+
+    def test_prune_keeps_current_and_previous(self):
+        for i in range(4):
+            self.commit(f'v{i}', {'exefs/main': str(i).encode()})
+            time.sleep(0.01)
+        names = sorted(p.name for p in (self.home / 'roots').glob('原创@*') if p.is_dir())
+        self.assertEqual(names, ['原创@v2', '原创@现行'])
+
+    def test_killed_between_two_renames_heals_to_new_version(self):
+        # ① 换版本中途被杀：旧现行已停回 <款>@seed，新版本还在 <款>@next.tmp（已写 .root_tag = 已校验、正在换上），没有现行 →
+        #   cur() 把换到一半的那个换上；内容是新版、版本名是 原创@next
+        self.commit('seed', {'exefs/main': b'm1'})
+        live = self.store.path / '原创@现行'
+        tx = self.store.begin('原创', 'next'); (tx.path / 'exefs/main').write_bytes(b'm2')
+        roots.text(tx.path / '.root_tag', '原创@next\n')
+        roots.rename_dir(live, self.store.path / '原创@seed')   # 被杀前已做完的第一次改名
+        cur = self.store.cur('原创')
+        self.assertEqual(cur, live); self.assertEqual((live / 'exefs/main').read_bytes(), b'm2')
+        self.assertEqual(roots.read(live / '.root_tag'), '原创@next')
+        self.assertTrue((self.store.path / '原创@seed').is_dir())
+
+    def test_missing_current_heals_to_newest_parked(self):
+        # ① 另一种被杀时机（新版本还没写 .root_tag）/ 现行目录被删：取最新的已提交版本换上
+        self.commit('v1', {'f': b'1'}); time.sleep(0.01); self.commit('v2', {'f': b'2'})
+        live = self.store.path / '原创@现行'
+        roots.remove_owned(live)
+        with patch.dict(os.environ, {'S2A_ROOTS_NO_BOOT': '1'}):
+            cur = self.store.cur('原创')
+        self.assertEqual(cur, live); self.assertEqual((live / 'f').read_bytes(), b'1')   # v2 是被删的那个现行；剩下最新的是 v1
+        self.assertEqual(roots.read(live / '.root_tag'), '原创@v1')
+
+    def test_lost_tag_is_rewritten_and_next_commit_parks_old(self):
+        # ② 现行的版本名记录（.root_tag）丢了：cur() 补记一个新名字；再提交时旧现行停到那个名字下，新的成现行
+        self.commit('seed', {'f': b'1'})
+        live = self.store.path / '原创@现行'
+        (live / '.root_tag').unlink()
+        self.store.cur('原创')
+        tag = roots.read(live / '.root_tag')
+        self.assertTrue(tag.startswith('原创@recovered-'))
+        self.commit('next', {'f': b'2'})
+        self.assertEqual((live / 'f').read_bytes(), b'2'); self.assertEqual(((self.store.path / tag) / 'f').read_bytes(), b'1')
+
+    def test_seed_does_not_move_romfs_away(self):
+        from pack.orch import refresh
+        src = self.home / 'ex'; (src / 'exefs').mkdir(parents=True); (src / 'exefs/main').write_bytes(b'm')
+        (src / 'romfs').mkdir(); (src / 'romfs/a').write_bytes(b'r'); (src / 'unpack.tsv').write_text('title_id\t0100aaaa00000000\n')
+        with patch.dict(os.environ, {'S2A_DUAL': '0'}):
+            cur = refresh.seed(self.store, '原创', src, move_romfs=True)
+        self.assertEqual((src / 'romfs/a').read_bytes(), b'r'); self.assertFalse(roots.is_link(src / 'romfs'))
+        self.assertEqual((cur / 'romfs/a').read_bytes(), b'r')
+
+
+class FailedSymlinkStubTest(unittest.TestCase):
+    # #1431：玩家 Windows（26300、库在 ReFS 开发驱动器、没开开发者模式）上 os.symlink 报失败时 link 处已经留下了东西，
+    #   junction 退路随即 mkdir 撞 WinError 183，播种每次都红；撤回时 remove_owned 又删不掉这份残留，abort 报「目录不是空的」。期望手写：
+    #   ① nt（模拟）：软链失败前 link 不在、失败后在 → 删掉残留再走退路，退路建链时 link 不在；软链前 link 已经在 → 不删，照原样把错误交给退路
+    #   ② remove_owned：在、但既不是链接也不是文件 / 目录的残留 → 删掉，上一级能删空
+    #   ③ 原生 Windows：软链失败并留下空目录 → 照样建成 junction，经它读到目标里的文件
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='s2a-1431-'); self.home = Path(self.temp.name)
+        (self.home / 'target').mkdir(); (self.home / 'target/f').write_bytes(b'T')
+
+    def tearDown(self): self.temp.cleanup()
+
+    def stub_symlink(self, src, dst, target_is_directory=False):   # 失败但留下一个空目录（玩家机上看到的样子）
+        os.mkdir(dst)
+        e = OSError(22, '客户端没有所需的特权。'); e.winerror = 1314; raise e
+
+    def run_nt(self, link):
+        fake = _Os('nt'); fake.symlink = self.stub_symlink; seen = []
+        def junction(target, at):   # 同 _junction 第一步：link.mkdir()，已在就是 WinError 183
+            seen.append(os.path.lexists(at)); Path(at).mkdir()
+        with patch.object(roots, 'os', fake), patch.object(roots, 'table_now', return_value=[]), \
+             patch.object(roots, '_junction', junction), contextlib.redirect_stderr(io.StringIO()):
+            roots.directory_link(self.home / 'target', link)
+        return seen
+
+    def test_nt_removes_stub_left_by_failed_symlink(self):
+        self.assertEqual(self.run_nt(self.home / 'link'), [False])
+
+    def test_nt_existing_link_path_is_not_removed(self):
+        (self.home / 'link').mkdir(); (self.home / 'link/keep').write_bytes(b'K')
+        with self.assertRaises(FileExistsError):
+            self.run_nt(self.home / 'link')
+        self.assertEqual((self.home / 'link/keep').read_bytes(), b'K')
+
+    def test_remove_owned_removes_unknown_stub(self):
+        box = self.home / 'box'; box.mkdir(); (box / 'stub').mkdir()
+        real_lexists = os.path.lexists
+        with patch.object(roots, 'is_link', lambda p: False), \
+             patch.object(Path, 'is_dir', lambda p: False if p.name == 'stub' else os.path.isdir(p)), \
+             patch.object(Path, 'exists', lambda p: False if p.name == 'stub' else real_lexists(p)):
+            roots.remove_owned(box)
+        self.assertFalse(real_lexists(box))
+
+    @unittest.skipUnless(os.name == 'nt', 'native Windows junction fallback')
+    def test_native_junction_after_stub(self):
+        link = self.home / 'link'
+        with patch.object(roots.os, 'symlink', self.stub_symlink), contextlib.redirect_stderr(io.StringIO()):
+            roots.directory_link(self.home / 'target', link)
+        self.assertTrue(link.is_junction())
+        self.assertEqual((link / 'f').read_bytes(), b'T')
 
 
 class ShortRootLinkTest(unittest.TestCase):

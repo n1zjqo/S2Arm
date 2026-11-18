@@ -75,6 +75,38 @@ namespace S2A.Services.Tests
                 Native.MemMapped = oldMapped; Native.MemQuery = oldQuery;
                 check("金手指 写代码页：抛执行异常、过滤求值时已标记改代码", (true, true), (seen || threw, seen));
             }
+            // 编进包的条目（11-12）：写只读代码页的行由包里的改动接管 → 静默跳过、不抛、不标改代码
+            {
+                var oldMapped = Native.MemMapped; var oldQuery = Native.MemQuery;
+                Native.MemMapped = &Mapped; Native.MemQuery = &QueryReadExec;
+                var gp = new Cheats.GameProcess { Packed = true }; bool threw = false;
+                try { gp.WriteMemory<uint>(0x10000, 1); } catch (Ryujinx.HLE.Exceptions.TamperExecutionException) { threw = true; }
+                Native.MemMapped = oldMapped; Native.MemQuery = oldQuery;
+                check("金手指 编进包：写代码页跳过（不抛、不标改代码）", (false, false), (threw, gp.TamperedCodeMemory));
+            }
+            // main 区按 Horizon 排布换算（11-13）：假排布 main 映像 0x173C000 字节、真实基址 0x1000000000；sdk 紧接其后（Horizon 偏移 0x173C000 起 0xCFB000 字节）、真实基址 0x2000000000。
+            //   「04000000 024191F4 00000001」写 main 区 +0x24191F4 → 期望落 sdk 内 0x24191F4 − 0x173C000 = 0xCDD1F4 → 真实地址 0x2000CDD1F4（手算）；
+            //   main 内 +0x10 → 0x1000000010；超出 sdk（+0x2437000）→ 不写任何地址、按「地址未就绪」报（不标改代码）。写只读页时异常信息带真实地址，借它读出落点
+            {
+                var oldMapped = Native.MemMapped; var oldQuery = Native.MemQuery; var oldVa = Cheats.MainVa;
+                Native.MemMapped = &Mapped; Native.MemQuery = &QueryReadExec;
+                Cheats.MainVa = off => off < 0x173C000 ? 0x1000000000UL + off : off - 0x173C000 < 0xCFB000 ? 0x2000000000UL + (off - 0x173C000) : 0;
+                string Land(string line)
+                {
+                    var gp = new Cheats.GameProcess();
+                    ITamperProgram q = new AtmosphereCompiler(Cheats.MainVirtual, 0, 0, 0, gp).Compile("m", new[] { line });
+                    q.IsEnabled = true; gp.TamperedCodeMemory = false;
+                    try { q.Execute((ControllerKeys)0); return "没写"; }
+                    catch (Ryujinx.HLE.Exceptions.TamperExecutionException x) { return gp.TamperedCodeMemory ? x.Message[(x.Message.LastIndexOf("0x") + 2)..].TrimStart('0') : "地址未就绪"; }
+                }
+                var got = (Land("04000000 024191F4 00000001"), Land("04000000 00000010 00000001"), Land("04000000 02437000 00000001"));
+                Native.MemMapped = oldMapped; Native.MemQuery = oldQuery; Cheats.MainVa = oldVa;
+                check("金手指 main 区按 Horizon 排布：超出 main 落进 sdk、main 内照旧、超出起局模块不写", ($"{0x2000CDD1F4UL:X}", "1000000010", "地址未就绪"), got);
+            }
+            // 文件头 BID（公开库写法 [游戏名 … BID=2607A74F5DF7754C]）：与主程序前 16 位比
+            check("金手指 文件头构建号：一致", true, Cheats.HeaderMatches("[D v1 BID=2607A74F5DF7754C]\n[a]\n", "2607a74f5df7754cc0357b5d"));
+            check("金手指 文件头构建号：不一致 → 不符", false, Cheats.HeaderMatches("[D v1 BID=2607A74F5DF7754D]\n", "2607A74F5DF7754CC0357B5D"));
+            check("金手指 文件头构建号：没写 → 不判", true, Cheats.HeaderMatches("[无限血]\n04000000 00000010 00000001\n", "2607A74F5DF7754C"));
             // NativeAOT 运行时指令（services/aot/rd.xml）要覆盖 Ryujinx Tamper 里全部泛型操作 / 条件 × 4 种宽度：期望 = 反射枚举出来的那一组，少一个就是真机「missing native code」
             var want = new List<string>();
             foreach (Type t in typeof(AtmosphereCompiler).Assembly.GetTypes())
@@ -95,6 +127,30 @@ namespace S2A.Services.Tests
                     if (System.IO.File.ReadAllText(f).Contains("(dynamic)")) dyn.Add(System.IO.Path.GetFileName(f));
             }
             check("金手指 Ryujinx 金手指源码不含 (dynamic)", "仓库可读、0 处", rdPath == null ? "找不到仓库" : $"仓库可读、{dyn.Count} 处{(dyn.Count > 0 ? "：" + string.Join(",", dyn) : "")}");
+            // FPSLocker 表达式（FORMAT.md 口径，手算）：60 帧时帧时间 16.667、0.945×帧时间 15.75；目标等于刷新率时上限 +2；TruncDec 截两位
+            check("FPSLocker 表达式：0.945 * FRAMETIME_TARGET @60", "15.75", FpsLocker.Eval("0.945 * FRAMETIME_TARGET", 60).ToString("0.00", System.Globalization.CultureInfo.InvariantCulture));
+            check("FPSLocker 表达式：FPS_LOCK_TARGET @60 / @30", (62.0, 30.0), (FpsLocker.Eval("FPS_LOCK_TARGET", 60), FpsLocker.Eval("FPS_LOCK_TARGET", 30)));
+            check("FPSLocker 表达式：TruncDec(FRAMETIME_TARGET, 2) @30", 33.33, FpsLocker.Eval("TruncDec(FRAMETIME_TARGET, 2)", 30));
+            check("FPSLocker 表达式：VSYNC_TARGET @60 / @30、优先级与括号", (1.0, 2.0, 7.0), (FpsLocker.Eval("VSYNC_TARGET", 60), FpsLocker.Eval("VSYNC_TARGET", 30), FpsLocker.Eval("1 + 2 * (4 - 1)", 60)));
+            var fl = FpsLocker.Load("{\"units\":[{\"id\":\"fps:a\",\"all_fps\":[{\"type\":\"evaluate_write\",\"address\":[\"MAIN\",68358836],\"value_type\":\"float\",\"value\":\"0.945 * FRAMETIME_TARGET\"},{\"type\":\"write\",\"address\":[\"HEAP\",16,8],\"value_type\":\"int32\",\"value\":[1,2]}]}]}");
+            check("FPSLocker 配置读取：条数 / 第二条地址级数 / 值是列表", (2, 3, System.Text.Json.JsonValueKind.Array), (fl.Count, fl[1].Address.Count, fl[1].Value.ValueKind));
+            // 审计 P1-184：每条写入记下所属那份补丁（只写选中那份），目标帧率按选中档（120 档按 120 求值，帧时间 8.33 ms），刚取消选中写回 30
+            check("FPSLocker 每条写入带所属补丁编号", ("fps:a", "fps:a"), (fl[0].Unit, fl[1].Unit));
+            check("FPSLocker 目标帧率：选 120 / 选 60 / 取消选中", (120.0, 60.0, 30.0), (FpsLocker.Target(120), FpsLocker.Target(60), FpsLocker.Target(0)));
+            check("FPSLocker 120 档帧时间：FRAMETIME_TARGET @120", "8.33", FpsLocker.Eval("FRAMETIME_TARGET", FpsLocker.Target(120)).ToString("0.00", System.Globalization.CultureInfo.InvariantCulture));
+            // 审计 P1-185：收局停金手指线程。起一条真实的 Run 线程（空目录，原生层不在 → 重载失败也照常循环），Stop 后线程 3 秒内退出、_thread 清空（下一局 Start 能重起、重新交原生层）
+            {
+                var flags = System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static;
+                string tmp = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "s2a_cheats_stop_" + Environment.ProcessId); System.IO.Directory.CreateDirectory(tmp);
+                var cts = new System.Threading.CancellationTokenSource();
+                var run = typeof(Cheats).GetMethod("Run", flags);
+                var t = new System.Threading.Thread(() => run.Invoke(null, new object[] { tmp, cts.Token })) { IsBackground = true };
+                typeof(Cheats).GetField("_stop", flags).SetValue(null, cts); typeof(Cheats).GetField("_thread", flags).SetValue(null, t);
+                t.Start(); System.Threading.Thread.Sleep(300);
+                Cheats.Stop();
+                check("金手指 收局停线程：线程已退出 / _thread 清空", (false, true), (t.IsAlive, typeof(Cheats).GetField("_thread", flags).GetValue(null) == null));
+                System.IO.Directory.Delete(tmp, true);
+            }
             check("金手指 编译：坏指令回 null（界面显示「指令有误」）", true,
                 new AtmosphereCompiler(exe, 0, 0, 0, fake).Compile("bad", new[] { "ZZZZ" }) == null);
         }

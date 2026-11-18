@@ -46,6 +46,34 @@ def logged_in(appdata=None):
         with open(os.path.join(base, 'PlumeImpactor', 'accounts.json'), encoding='utf-8') as f: return bool(json.load(f).get('accounts'))
     except (OSError, ValueError, AttributeError): return False
 
+def _store(appdata=None):
+    base = appdata or os.environ.get('APPDATA') or os.path.join(os.path.expanduser('~'), '.config')
+    try:
+        with open(os.path.join(base, 'PlumeImpactor', 'accounts.json'), encoding='utf-8') as f: store = json.load(f)
+        return store if isinstance(store, dict) and isinstance(store.get('accounts') or {}, dict) else {}
+    except (OSError, ValueError): return {}
+
+
+def unselected_accounts(appdata=None):
+    """存了 Apple ID、却没有选中的那个（selected_account 空或指向已删的账号）→ 存着的邮箱列表；选中正常 / 没存账号 → []。
+    同版 v2.7.2 源码 plume_store AccountStore::accounts_remove：删掉的正是选中的那个时只把 selected_account 置空、不改选别的，
+    plumesign 签名就报「No account selected」（D-ZM37）。我们自己的过期处理也教玩家「移除账号再添加」，多账号时就会落到这里"""
+    store = _store(appdata)
+    accounts = store.get('accounts') or {}
+    return [] if not accounts or store.get('selected_account') in accounts else sorted(accounts)
+
+
+def select_only_account(exe, appdata=None):
+    """账号存档里只存了一个 Apple ID 却没选中：用官方 plumesign account switch <邮箱>（同版 v2.7.2 commands/account.rs）替玩家选上，
+    不自己改 Impactor 的存档。只有一个 = 没有歧义、选它就是玩家要的；存了多个不替玩家挑（装机前清单与失败原因让玩家在 Impactor 里选）。
+    → 选上的邮箱；不需要 / 选不上 → None（照旧往下签，plumesign 失败按原文归码）"""
+    left = unselected_accounts(appdata)
+    if len(left) != 1 or not exe: return None
+    try: subprocess.run([exe, 'account', 'switch', left[0]], capture_output=True, timeout=60, env=dict(os.environ, RUST_LOG='info'))
+    except (OSError, subprocess.SubprocessError): return None
+    return left[0] if not unselected_accounts(appdata) else None
+
+
 def selected_team(appdata=None):
     """账号存档里当前选中账号的团队号（accounts.json 的 selected_account → accounts[账号].team_id）；读不到 → None"""
     base = appdata or os.environ.get('APPDATA') or os.path.join(os.path.expanduser('~'), '.config')
@@ -58,6 +86,17 @@ def selected_team(appdata=None):
 # Impactor / 侧载工具界面上的报错原文 → 共用错误码（顺序即优先级；处理办法在 pack/jobs/errors.py RECOVERY）
 EXPLAIN = (
     (r'-80046', 'login_identity_rejected'),
+    # 连不上签名要用的 anisette 服务器（#3fc02b，Windows 玩家 3 次上传：「Anisette error … dns error … 不知道这样的主机。 (os error 11001)」）：
+    #   Impactor v2.7.2 的 omnisette 本机取不到就走远程 v3，地址写死 mac-ani.jkcoxson.com（3rdparty/omnisette/src/lib.rs DEFAULT_ANISETTE_URL_V3）。原先落到 device_install_failed，建议写「检查设备连接」，方向全错
+    (r'anisette error[\s\S]{0,600}?(?:dns error|os error 1100[1-4]|client error \(connect\)|error sending request|connection (?:refused|reset)|timed out)', 'signing_server_unreachable'),
+    # 保存的 Apple ID 会话过期（Apple 开发者接口 1100「Your session has expired. Please log in.」，plumesign 恢复会话时报，玩家反馈 v0.2.7）：
+    #   要在 Impactor 里重新登录；原先落到 device_install_failed，建议写「检查设备连接与包的有效性」，把玩家往错的方向引
+    # 连不上苹果自己的服务器（登录 gsa.apple.com、签名 developerservices2.apple.com）：网络问题，不是 Apple ID 的问题（#edc5f5 拆分）
+    (r'error sending request for url \(https?://[^\s)]*\bapple\.com', 'apple_server_unreachable'),
+    (r'developer api error 1100\b|\b1100\b[^\n]{0,40}session|session has expired|please log ?in again', 'apple_session_expired'),
+    # 还没登录 / 存了账号却没选中（D-ZM37 plumesign 原文「No account selected. Please login first」）：原先归「登录已过期」，
+    #   对从没登录成功过的玩家措辞不对（#edc5f5）。添加即选中（v2.7.2 accounts_add 设 selected_account）；只存了一个的在签名前已替玩家选上（select_only_account）
+    (r'no account selected|please log ?in first|not logged in', 'apple_not_signed_in'),
     (r'-2097\d|-20101|incorrect|entered incorrectly', 'apple_id_wrong'),
     (r'-21669|verification code|two.?factor|2fa', 'two_factor_wrong'),
     (r'unknown error occured while reading the file|unknown error occurred while reading the file|zip64', 'ipa_needs_repack'),
@@ -67,9 +106,12 @@ EXPLAIN = (
     (r'app id limit|\b10 app ids\b|maximum number of app ids|(?:error|code)\D{0,20}\b9120\b', 'free_appid_limit'),
     (r'maximum number of (installed )?apps\b|\b3 apps\b', 'free_app_limit'),   # 11-06 plumesign 原文是「maximum number of installed apps」
     (r'(?:error|code)\D{0,20}\b9401\b|app id with identifier[^\n]{0,120}is not available', 'app_id_taken'),
+    (r'mismatchedapplicationidentifierentitlement|application-identifier entitlement string[^\n]{0,240}does not match', 'app_other_signer'),   # 同 install.SIGN_ERRORS（文本已转小写）
     (r'developer mode', 'developer_mode_required'),
     (r'device is locked|passcode|unlock', 'device_locked'),
-    (r'pairing|not paired|invalidhostid|trust', 'device_pairing_required'),
+    # 苹果设备服务里没有这台的配对记录（#1198 plumesign 原文「unexpected response from device: missing PairRecordData in pair record response」）：
+    #   也是没配好对，原先落到 device_install_failed、建议成「检查设备连接与包」
+    (r'pairing|not paired|invalidhostid|trust|pair ?record', 'device_pairing_required'),
     (r'no device|not connected|usbmux', 'device_not_connected'),
 )
 
@@ -117,12 +159,12 @@ def candidates():
                     for name in ('DisplayIcon', 'InstallLocation'):
                         try:
                             val = str(winreg.QueryValueEx(s, name)[0]).split(',')[0].strip('"')
-                            yield from (glob.glob(os.path.join(val, '*.exe')) if os.path.isdir(val) else [val])
+                            yield from (glob.glob(os.path.join(glob.escape(val), '*.exe')) if os.path.isdir(val) else [val])
                         except OSError: pass
                 except OSError: continue
     home = os.path.expanduser('~')
     for d in ('Desktop', 'Downloads', os.path.join('OneDrive', 'Desktop')):
-        yield from sorted(glob.glob(os.path.join(home, d, '*mpactor*.exe')), reverse=True)
+        yield from sorted(glob.glob(os.path.join(glob.escape(os.path.join(home, d)), '*mpactor*.exe')), reverse=True)
 
 
 def status(online=False, resources=None):
@@ -172,8 +214,8 @@ def guide_html(ipa=None, st=None, lang='zh-Hans'):
         note = f'<p class="note">{esc(s["note"][lang])}</p>' if s.get('note') else ''
         rows.append(f'<section><h2>{i}. {esc(s["title"][lang])}</h2><ol>{items}</ol>{note}</section>')
     errs = ''.join(f'<tr><td><code>{esc(e["match"])}</code></td><td>{esc(e["means"][lang])}</td><td>{esc(recovery(e["code"], packaged=True))}</td></tr>' for e in g['errors'])
-    ipa_line = f'<p>本次出好的包：<code>{esc(os.path.abspath(ipa))}</code>（已在资源管理器里选中）</p>' if ipa else ''
-    return f'''<!doctype html><html lang="zh-Hans"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+    ipa_line = f'<p>本次出好的包：<code>{esc(os.path.abspath(ipa))}</code>（已在资源管理器里选中）</p>' if ipa else ''  # 非玩家句
+    return f'''<!doctype html><html lang="zh-Hans"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">  # 非玩家句
 <title>{esc(g["title"][lang])}</title>
 <style>:root{{--bg:#fff;--fg:#1d1d1f;--mut:#6e6e73;--card:#f5f5f7;--acc:#0a66d6;--warn:#b25000}}
 @media (prefers-color-scheme:dark){{:root{{--bg:#111;--fg:#f2f2f2;--mut:#a1a1a6;--card:#1c1c1e;--acc:#4ea1ff;--warn:#ffb15c}}}}

@@ -5,6 +5,7 @@
 // 弱链接[host]：s2a_vk_entry（直连图形层 graphics/nvn 提供；链接行按这行放行未定义，runtime/build.mk 自动收）
 // 弱链接[host]：s2a_vk_lib_ready（直连图形层 graphics/nvn 提供；链接行按这行放行未定义，runtime/build.mk 自动收）
 // 弱链接[host]：s2a_gl_entry（直连图形层 graphics/nvn 提供；链接行按这行放行未定义，runtime/build.mk 自动收）
+// 弱链接[host]：s2a_gl_stub（直连图形层 graphics/nvn 提供；链接行按这行放行未定义，runtime/build.mk 自动收）
 // 弱链接[host]：s2a_gl_lib_ready（直连图形层 graphics/nvn 提供；链接行按这行放行未定义，runtime/build.mk 自动收）
 // 弱链接[host]：s2a_vi_entry（直连图形层 graphics/nvn 提供；链接行按这行放行未定义，runtime/build.mk 自动收）
 // 弱链接[host]：s2a_nv_entry（直连图形层 graphics/nvn 提供；链接行按这行放行未定义，runtime/build.mk 自动收）
@@ -99,10 +100,16 @@ static char g_brief[48];         // 判定依据短写（开发浮层一眼能�
 static pthread_mutex_t g_mode_mu = PTHREAD_MUTEX_INITIALIZER;
 static _Atomic int g_decided;
 static int g_default_audio_sched;
+// 电源档（Mac 宿主 hud.c s2a_mac_on_battery 强定义：AppleSmartBattery 的 ExternalConnected，按名取同 sys_power；11-14 卡顿诊断手柄项）。
+//   单测 / 没链 hud.c 的构建用这份弱缺省 = 电池档：音频调度照旧 interactive，行为不变
+__attribute__((weak)) int s2a_mac_on_battery(void) { return 1; }
 static void decide(void) {
-    int mode = S2A_GFX_GENERIC;   // = 不能直连（包里没有本宿主口径的直连库）：真起局时 host_main.c 报「游戏文件缺失」收局，不再退通用
+    // 只有直连一种模式（11-07 拆通用）：包里没带本宿主口径的直连库也照样直连，着色器首次遇到时现编（dsh_miss / dm_shader_miss）——
+    //   直连库只是提速件，不是起局的门（11-13 维护者「不许堵门」：原先没库就收局报 direct_lib_missing，玩家导入了不带库的 game.img 就整局起不来）
+    // 只有「设备本身跑不了直连」（无 Metal 4 / Metal 3 路径）是物理做不下去：那时才不直连，host_main.c 照旧停下说明
+    int mode = s2a_nvn_bootstrap_entry && s2a_direct_device_ok && s2a_direct_device_ok() ? S2A_GFX_DIRECT : S2A_GFX_GENERIC;
     g_pid = npdm_read();
-    const char *e = getenv("S2A_GFX"), *why = "包里没有本宿主口径的直连库";
+    const char *e = getenv("S2A_GFX"), *why = "包里没有本宿主口径的直连库：着色器首次遇到时现编，前几分钟会卡";
     char p[1200];
     // 旧版本留在机上的模式文件（wire/<程序号>/fail、fail_seen：10-26 前运行中出错写的；mode：11-07 前「切回通用模式」菜单写的）：
     //   只有直连了，都不再作依据；删掉、打一行
@@ -112,16 +119,17 @@ static void decide(void) {
         if (!unlink(p)) LOG("图形模式：删掉旧的 %s（只有直连，不再按它选模式）", p);
     }
     if (e && *e && strcmp(e, "direct")) LOG("【红】图形模式：S2A_GFX=%s 不认（只有 direct：开发 / 单测强制直连用），按包判", e);
+    int packaged = s2a_direct_packaged();
     if (e && !strcmp(e, "direct")) { mode = S2A_GFX_DIRECT; why = "环境变量 S2A_GFX=direct"; }
-    else if (s2a_direct_packaged()) {   // 包里带直连库就直连（10-25 维护者 拍板）
-        mode = S2A_GFX_DIRECT; why = "包里带本宿主口径的直连库（NVN b-" DMSH_CHAIN " 或 Vulkan vk/）";
-    }
+    else if (mode != S2A_GFX_DIRECT) why = "这台设备跑不了直连（没有 Metal 4 / Metal 3 路径）";
+    else if (packaged) why = "包里带本宿主口径的直连库（NVN b-" DMSH_CHAIN " 或 Vulkan vk/）";
     g_why = why;
-    if (mode != S2A_GFX_DIRECT) snprintf(g_brief, sizeof g_brief, "无直连库");
+    if (mode != S2A_GFX_DIRECT) snprintf(g_brief, sizeof g_brief, "设备不支持直连");
+    else if (!packaged && !(e && !strcmp(e, "direct"))) snprintf(g_brief, sizeof g_brief, "无直连库·现编");
     else if (!strncmp(why, "环境变量", strlen("环境变量"))) snprintf(g_brief, sizeof g_brief, "S2A_GFX 指定");
     else if (!strcmp(g_lib, "NVN")) snprintf(g_brief, sizeof g_brief, "NVN b-%.6s", DMSH_CHAIN);
     else snprintf(g_brief, sizeof g_brief, "%s", g_lib);
-    LOG("图形模式：%s（依据 %s；程序号 %016llx）", mode == S2A_GFX_DIRECT ? "直连" : "没有直连库", why, (unsigned long long)g_pid);
+    LOG("图形模式：%s（依据 %s；程序号 %016llx）", mode == S2A_GFX_DIRECT ? "直连" : "不能直连", why, (unsigned long long)g_pid);
 #if defined(__APPLE__)
     {   // 机器：系统版本与芯片（11-01 异度3：同一份着色器 M3 / macOS 27 编译器内部错误、M5 / macOS 26 正常；普查「系统版本」列按这行归因）
         char os[32] = "?", cpu[64] = "?"; size_t n = sizeof os; sysctlbyname("kern.osproductversion", os, &n, NULL, 0); n = sizeof cpu; sysctlbyname("machdep.cpu.brand_string", cpu, &n, NULL, 0);
@@ -138,8 +146,19 @@ static void decide(void) {
     // 出图线程实时声明不再缺省关（10-30 帧率能耗线）：DM_RT=0 让帧关键线程没有截止时间，轮询退避一长，系统就把它们当闲线程挪能效核降频——
     //   丝之歌测试设备短睡退避 250 µs 局整机 1.72 W 但慢帧 2.5%：主线程 nx-81 只 19% 在性能核，提交线程 1.74 GHz、每帧 1.6 ms（性能核上 0.42 ms）。
     //   维护者 10-30：稳定 60 帧前提下功耗最低，不靠让关键线程空转留在大核；声明按每帧实测 CPU 自动定（hle_nvn.c rt_comp_tick）
-    if (mode == S2A_GFX_DIRECT && !getenv("S2A_AUDIO_SCHED") &&
-        !setenv("S2A_AUDIO_SCHED", "interactive", 0)) g_default_audio_sched = 1;
+    // 直连音频调度缺省按电源档分（11-14 卡顿诊断 §10.1 形态 A）：插电 / 无电池（桌面机）的 Mac 不再补 interactive——不设时
+    //   C# S2ARealtime 走 time-constraint 实时（10-24 能耗线之前的老缺省）；电池 Mac 与掌机（iOS）/ 安卓照旧补 interactive——省电缺省只该管电池场景。
+    //   原缺省不分电源档：声音渲染线程（每 5 ms 一拍、游戏线程每帧同步等它的更新事件）在 interactive 档没有截止期限，系统侧偶发抢占把它拖晚，
+    //   等事件的游戏线程整帧被拖长（11-14 报告：安静环境 44 个慢帧 93% 为游戏线程离 CPU 等事件；基线环境 1227 次 interval 翻转 / 26.7 分钟）。
+    //   显式给的 S2A_AUDIO_SCHED 照用
+    if (mode == S2A_GFX_DIRECT && !getenv("S2A_AUDIO_SCHED")) {
+        int on_battery = 1;   // 掌机 / 安卓 / 读不到电源：照旧 interactive
+#if defined(__APPLE__) && !TARGET_OS_IPHONE
+        on_battery = s2a_mac_on_battery();
+#endif
+        if (!on_battery) LOG("音频调度缺省：实时（插电 / 无电池的 Mac）");
+        else if (!setenv("S2A_AUDIO_SCHED", "interactive", 0)) g_default_audio_sched = 1;
+    }
     atomic_store(&g_mode, mode);
 }
 // iOS：资源包闸门放行之前不落定模式（10-26 测试设备2：资源包说明页等「重新检查」时，直连提示轮询先问了模式，
@@ -189,6 +208,7 @@ void *s2a_nvn_bootstrap_entry(void) __attribute__((weak_import));   // graphics/
 void *s2a_vk_entry(const char *name) __attribute__((weak_import));          // graphics/nvn/host_adapt.m：Vulkan 款的 vk* 导入（直连层 hle_vk，已套切栈桩）
 void *s2a_vi_entry(const char *name) __attribute__((weak_import));          // graphics/nvn/host_adapt.m：游戏导入的 nn::vi 显示层函数（SetLayerCrop：上屏区域）
 void *s2a_gl_entry(const char *name) __attribute__((weak_import));          // graphics/nvn/host_adapt.m：egl* / gl* 导入（graphics/nvn/gfx/gl，重活已套切栈桩）
+void *s2a_gl_stub(const char *name) __attribute__((weak_import));           // graphics/nvn/host_adapt.m：没实现的 GL 核心名的安全空实现（装载器找遍之后才要）
 void *s2a_nv_entry(const char *name) __attribute__((weak_import));          // graphics/nvn/gfx/nvn/nvn2.c：Switch 2 游戏导入的 nv::（GPU 驱动启动层）、gsv 与其他依赖 gs 启动的命名空间；Switch 1 恒回 NULL
 // graphics/nvn/gfx/nvn/nvn2_codec.c：Switch 2 游戏导入的 nn::codec 视频解码器 / 图像池、nn::syncpt::sdk、nn::gs、NVN2 原生图像（真机走 gsv 服务）；Switch 1 恒回 NULL
 void *s2a_codec_entry(const char *name) __attribute__((weak_import));
@@ -200,7 +220,7 @@ uint64_t s2a_direct_lookup(const char *name) {
     //   （gpu_drivers.tsv，profile_guess.gpu_driver_modules），原路径不存在，不交给 GL 层就是装载期未解析、一调即中止。
     //   OpenGL 款（main 导入 egl*、经 eglGetProcAddress 取 gl*）如此；在 GL 里画一部分画面的 NVN 款也如此（火影：Scaleform 建无表面的 EGL 上下文、
     //   经 eglGetProcAddress 取 gl* 画界面，再经 nvnTextureBuilderSetGLTextureName / nvnSyncInitializeFromFencedGLSync 交给 NVN）。
-    //   层里没实现的名字（如马车8 的 glslc*）回 0，照原路径找
+    //   层里没实现的名字回 0，照原路径找（马车8 / #601 的 glslc* 由游戏自己的模块导出）；原路径也没有的核心名由 s2a_direct_stub 给安全空实现
     if (!strncmp(name, "egl", 3) || !strncmp(name, "gl", 2)) { if (!s2a_gl_entry) die("图形模式是直连，但本宿主没链直连图形层（graphics/nvn）"); return (uint64_t)s2a_gl_entry(name); }
     if ((!strncmp(name, "_ZN2nn2vi", 9) || !strncmp(name, "_ZNK2nn2vi", 10)) && s2a_vi_entry) { void *f = s2a_vi_entry(name); if (f) return (uint64_t)sw_xstack_wrap(name, f); }   // 显示层裁切等：直连上屏要知道（真机 SDK 推给系统窗口）
     // Switch 2 的 SDK 接管层（游戏自带 NVN2 驱动 / nn::gs / gsv 直连档不启动，依赖它们的 sdk 函数由宿主答）：C++ 名与 NVIDIA 驱动的 C 名（Nv*）都问两个入口，
@@ -212,6 +232,14 @@ uint64_t s2a_direct_lookup(const char *name) {
         if (s2a_codec_entry) { void *f = s2a_codec_entry(name); if (f) return (uint64_t)sw_xstack_wrap(name, f); }
     }
     if (strcmp(name, "nvnBootstrapLoader")) return 0;
+    if (getenv("S2A_NVN_REAL")) { LOG("诊断：S2A_NVN_REAL 设了，nvnBootstrapLoader 不接管，跑游戏自带 NVN 驱动（只用于取分配参照，画面不保证）"); return 0; }
     if (!s2a_nvn_bootstrap_entry) die("图形模式是直连，但本宿主没链直连图形层（graphics/nvn）");
     return (uint64_t)sw_xstack_wrap(name, s2a_nvn_bootstrap_entry());
+}
+// 装载器（loader.c relocate）对 s2a_direct_lookup、游戏模块、libc、romfs NRO 都找不到的导入最后问一次：直连模式下 gl* 核心名交安全空实现
+//   （GL 驱动模块不装，游戏按报的 GL 版本直接调，留未解析就是一调即中止）；其余名字、通用模式回 0。
+//   空实现只能在找遍之后给：放进 s2a_direct_lookup 会先于游戏模块，游戏自己导出的同名函数被什么都不做的空实现顶掉（#601 glslc*）
+uint64_t s2a_direct_stub(const char *name) {
+    if (s2a_gfx_mode() != S2A_GFX_DIRECT || strncmp(name, "gl", 2) || !s2a_gl_stub) return 0;
+    return (uint64_t)s2a_gl_stub(name);
 }

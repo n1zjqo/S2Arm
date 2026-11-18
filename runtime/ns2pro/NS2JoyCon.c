@@ -52,6 +52,22 @@ void ns2_joycon_sideways(ns2_kind kind, int side_buttons, ns2_state *s) {
     s->buttons = out; s->lx = x; s->ly = y; s->rx = 0; s->ry = 0;
 }
 
+void ns2_joycon_raw(ns2_kind kind, int side_buttons, ns2_state *s) {
+    if (!s || (kind != NS2_KIND_JOYCON_L && kind != NS2_KIND_JOYCON_R)) return;
+    int left = kind == NS2_KIND_JOYCON_L;
+    s->buttons &= ~(BIT(NS2_BUTTON_SL) | BIT(NS2_BUTTON_SR));
+    s->buttons |= side_buttons & (left ? NS2_SIDE_SL_L : NS2_SIDE_SL_R) ? BIT(NS2_BUTTON_SL) : 0;
+    s->buttons |= side_buttons & (left ? NS2_SIDE_SR_L : NS2_SIDE_SR_R) ? BIT(NS2_BUTTON_SR) : 0;
+}
+
+void ns2_joycon_raw_to_sideways(ns2_kind kind, ns2_state *s) {
+    if (!s || (kind != NS2_KIND_JOYCON_L && kind != NS2_KIND_JOYCON_R)) return;
+    int left = kind == NS2_KIND_JOYCON_L;
+    int side = (HAS(s->buttons, NS2_BUTTON_SL) ? (left ? NS2_SIDE_SL_L : NS2_SIDE_SL_R) : 0) |
+               (HAS(s->buttons, NS2_BUTTON_SR) ? (left ? NS2_SIDE_SR_L : NS2_SIDE_SR_R) : 0);
+    ns2_joycon_sideways(kind, side, s);
+}
+
 void ns2_joycon_sideways_motion(ns2_kind kind, ns2_motion *m) {
     if (!m || (kind != NS2_KIND_JOYCON_L && kind != NS2_KIND_JOYCON_R)) return;
     float ax = m->acceleration_x, az = m->acceleration_z, gx = m->gyro_x, gz = m->gyro_z;
@@ -75,3 +91,45 @@ void ns2_encode_rumble_for(ns2_kind kind, const ns2_vibration values[2], uint8_t
     ns2_encode_rumble(one, sequence, gain, out);
     for (unsigned i = 17; i < 42; i++) out[i] = 0;
 }
+
+// 扫描策略（11-11 实机：记着左只、左只没开机时，右只长按 SYNC 也连不上——只直连记住的那只不扫描，直连 30 秒超时失败时又把扫描停掉）
+int ns2_scan_wants_other_side(ns2_kind only, int only_ready, int only_failed) {
+    (void)only_ready;   // 就绪与否都扫：改前要求已就绪，记住的那只没开机时直连等 30 秒，这段时间另一侧找不到
+    return (only == NS2_KIND_JOYCON_L || only == NS2_KIND_JOYCON_R) && !only_failed;
+}
+
+// Switch 2 Pro 回前台直连记住的那只（11-16 全量：iOS 13 份诊断 106 次尝试，直连有结果的成 38%、扫描到广播再连的成 84%，配对广播次次 1 秒内连上；
+//   原先直连 30 秒期间不扫描、超时也不转扫描，玩家照提示长按 SYNC 发的配对广播没人接，D-MT6K 23 次只连上 1 次）：
+//   直连还没建起链路（没就绪、没失败）时也扫描；扫到 Pro 的配对广播就撤掉直连改连它；直连从没就绪就断了，转一轮扫描
+int ns2_pro_direct_pending(ns2_kind only, int only_ready, int only_failed) { return only == NS2_KIND_PRO && !only_ready && !only_failed; }
+int ns2_pro_take_pairing(ns2_kind waiting, int waiting_ready, int waiting_linked, ns2_kind found, ns2_wake wake) {
+    return waiting == NS2_KIND_PRO && !waiting_ready && !waiting_linked && found == NS2_KIND_PRO && wake == NS2_WAKE_PAIRING;
+}
+int ns2_pro_rescan_after_drop(ns2_kind lost, int was_ready, int rearmed) { return lost == NS2_KIND_PRO && !was_ready && !rearmed; }
+
+int ns2_link_failure_stops_scan(ns2_kind failed) {
+    return failed != NS2_KIND_JOYCON_L && failed != NS2_KIND_JOYCON_R;
+}
+
+ns2_kind ns2_output_kind(ns2_kind a, int a_present, ns2_kind b, int b_present) {
+    int a_jc = a == NS2_KIND_JOYCON_L || a == NS2_KIND_JOYCON_R, b_jc = b == NS2_KIND_JOYCON_L || b == NS2_KIND_JOYCON_R;
+    if (a_present && b_present && a_jc && b_jc && a != b) return NS2_KIND_JOYCON_PAIR;
+    if (a_present) return a;
+    if (b_present) return b;
+    return NS2_KIND_NONE;
+}
+int ns2_joycon_split_wanted(ns2_kind kind, int side_buttons) {
+    int want = kind == NS2_KIND_JOYCON_L ? (NS2_SIDE_SL_L | NS2_SIDE_SR_L) : kind == NS2_KIND_JOYCON_R ? (NS2_SIDE_SL_R | NS2_SIDE_SR_R) : 0;
+    return want && (side_buttons & want) == want;
+}
+ns2_assign_gesture ns2_assign_gesture_of(ns2_kind kind, uint64_t buttons, int side_buttons) {
+    int l = (buttons >> L) & 1, r = (buttons >> R) & 1;
+    switch (kind) {
+    case NS2_KIND_PRO: case NS2_KIND_JOYCON_PAIR: return l && r ? NS2_ASSIGN_WHOLE : NS2_ASSIGN_NONE;
+    case NS2_KIND_JOYCON_L: case NS2_KIND_JOYCON_R:
+        if (ns2_joycon_split_wanted(kind, side_buttons)) return NS2_ASSIGN_SINGLE;   // SL + SR 优先：横握时手指压着 SL / SR，顺带碰到肩键也算单只
+        return (kind == NS2_KIND_JOYCON_L ? l : r) ? NS2_ASSIGN_HALF : NS2_ASSIGN_NONE;
+    default: return NS2_ASSIGN_NONE;
+    }
+}
+

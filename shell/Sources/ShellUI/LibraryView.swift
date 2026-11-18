@@ -1,3 +1,4 @@
+#if !os(tvOS)   // tvOS 不编本文件：iOS 库界面与自绘焦点引擎（电视用系统焦点）（电视版库界面见 TVLibraryView.swift，UPSTREAM.md「我方改动」）
 // S2Arm modification: present a dedicated sorting list and guard background library input while it is open.
 import SwiftUI
 
@@ -88,6 +89,8 @@ public struct LibraryView: View {
     /// The side column of iPhone Duo (#622): the captures set it, otherwise the system's values from SideBarProbe.
     @Environment(\.shellSideBar) private var sideBarOverride
     @State private var probedSideBar = SideBar(edge: nil)
+    /// S2Arm (#623): the player chip, when the host has players; it takes a place in the side column too.
+    @Environment(\.shellPlayer) private var shellPlayer
 
     public init(games: [GameDetail], controllers: [ControllerInfo] = [], actions: ShellActions = ShellActions(),
                 input: ShellInputLog = ShellInputLog(), initialSelection: String? = nil, initialDetailOpen: Bool = false,
@@ -131,19 +134,24 @@ public struct LibraryView: View {
             let panelOverLibrary = settingsOpen && floating
             // The chips go into the side column where the system has one. At the accessibility text sizes they stay in the header.
             let side = typeSize.isAccessibilitySize ? nil : (sideBarOverride ?? probedSideBar)
-                .place(screen: whole, insets: insets, top: games.isEmpty ? [] : SideBar.topHeights)
+                .place(screen: whole, insets: insets, bottom: shellPlayer == nil ? SideBar.heights : [SideBar.playerHeight] + SideBar.heights,
+                       top: games.isEmpty ? [] : SideBar.topHeights)
             let column = side?.bottom
             ZStack(alignment: .topLeading) {
                 if layout.isCoverFlow, let selected { CoverFlowBackdrop(game: selected.game) } else { ShellPalette.background.ignoresSafeArea() }
                 if games.isEmpty {
                     EmptyLibraryView()
-                        .overlay(alignment: .topTrailing) {
-                            if column == nil {
-                                HStack(spacing: 10) {
+                        .overlay(alignment: .top) {   // S2Arm: the version for screenshots and the player (#623), level with the chips
+                            HStack(spacing: 10) {
+                                LibraryVersionBadge().layoutPriority(-1)
+                                Spacer(minLength: 8)
+                                if column == nil {
+                                    PlayerChip()
                                     ControllerChip(count: controllers.count, action: openControllers)
                                     ShellSettingsChip(action: openShellSettings)
-                                }.padding(.top, 6).padding(.trailing, 16)
+                                }
                             }
+                            .frame(minHeight: 44).padding(.top, 6).padding(.leading, 24).padding(.trailing, 16)
                         }
                     if let column { sideChips(column, insets: insets) }
                 } else if let selected {
@@ -330,6 +338,7 @@ public struct LibraryView: View {
         .environment(\.shellIgnoresPress, { [gate] in gate.isSystemEcho })
         .environment(\.shellShowHelp, { game in openHelp(game.id) })
         .environment(\.shellAskDelete, actions.onDeleteGame == nil ? nil : { game in openDelete(game.id) })
+        .environment(\.shellManageSaves, guardedActions.onManageSaves)
         .environment(\.shellOpenGameOrder, actions.onReorderGames == nil ? nil : {
             guard libraryPressAllowed, noteTouch() else { return }
             gameOrderOpen = true
@@ -362,6 +371,8 @@ public struct LibraryView: View {
         // Y opens controllers.
         .focusable().focused($keyboardFocus).focusEffectDisabled()
         .onAppear { keyboardFocus = true }
+        // The host's Home Screen quick action Settings: the library's own settings, the same as its gear button
+        .onReceive(NotificationCenter.default.publisher(for: .shellOpenSettings)) { _ in openShellSettings() }
         .onAnyTouch { gate.touch() }
         .onKeyPress(.leftArrow) { handle(.left, from: .keyboard); return .handled }
         .onKeyPress(.rightArrow) { handle(.right, from: .keyboard); return .handled }
@@ -499,9 +510,11 @@ public struct LibraryView: View {
         a.onUseShellCloud = o.onUseShellCloud.map { act in { if !echo() { act($0) } } }
         a.onClearShellData = o.onClearShellData.map { act in { if !echo() { act() } } }
         a.onClearShellCloud = o.onClearShellCloud.map { act in { if !echo() { act() } } }
+        a.onReportProblem = o.onReportProblem.map { act in { if !echo() { act() } } }
         a.onGlobalPadMapChange = o.onGlobalPadMapChange.map { act in { if !echo() { act($0, $1) } } }
         a.onGlobalPadMapReset = o.onGlobalPadMapReset.map { act in { if !echo() { act() } } }
         a.onDeleteGame = o.onDeleteGame.map { act in { if !echo() { act($0, $1) } } }
+        a.onManageSaves = o.onManageSaves.map { act in { if !echo() { act($0) } } }
         return a
     }
     /// An action that did not come from a controller or key came from touch: hints and focus ring step back. False when
@@ -526,6 +539,7 @@ public struct LibraryView: View {
         case .playable: actions.onPlay(detail.id)
         case .needsGameData: actions.onPickGameData(detail.id)
         case .needsAppUpdate: actions.onAppUpdate?()
+        case .needsGameUpdate: break   // needsHelp：上面已展开说明
         case .broken: actions.onShowLog?(detail.id)
         case .installing(let stage): if stage.phase == .failed { actions.onPlay(detail.id) }   // 重试解开；传着 / 解着按了不动
         }
@@ -862,3 +876,4 @@ private struct CoverThumbnail: View {
         .accessibilityHidden(true)
     }
 }
+#endif   // !os(tvOS)

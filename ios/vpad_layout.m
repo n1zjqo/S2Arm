@@ -53,7 +53,6 @@ static CGRect normalized_rect(NSDictionary *value) {
 
 @implementation S2AVPadLayout
 + (instancetype)readData:(NSData *)data error:(NSError **)error {
-    if (data.length > 65536) { fail(error, @"F01.size", S2AL(@"vpad.layout.err.size")); return nil; }
     id doc = [NSJSONSerialization JSONObjectWithData:data options:0 error:error];
     if (!doc) return nil;
     if (!fields(doc, @[@"schemaVersion", @"id", @"name", @"buttons", @"sticks"]) ||
@@ -94,10 +93,7 @@ static CGRect normalized_rect(NSDictionary *value) {
         }
         [seen addObject:s[@"id"]];
     }
-    CGRect overlap = sticks.count == 2 ? CGRectIntersection(normalized_rect(sticks[0][@"activation"]), normalized_rect(sticks[1][@"activation"])) : CGRectNull;
-    if (!CGRectIsNull(overlap) && overlap.size.width > geometryTolerance && overlap.size.height > geometryTolerance) {
-        fail(error, @"F01.sticks", S2AL(@"vpad.layout.err.stickOverlap")); return nil;
-    }
+    // 11-13 维护者「不许堵门」：两个摇杆激活区重叠不再拒收（照样能用，重叠处归谁按触点就近决定），文件大小也不设上限
     S2AVPadLayout *layout = [self new];
     layout->_document = [doc copy]; layout->_identifier = [doc[@"id"] copy]; layout->_name = [doc[@"name"] copy];
     layout->_buttons = [buttons copy]; layout->_sticks = [sticks copy];
@@ -113,7 +109,11 @@ static CGRect normalized_rect(NSDictionary *value) {
     return _name;
 }
 + (instancetype)defaultForSafeRect:(CGRect)rect {
+    return [self defaultForSafeRect:rect split:NO];
+}
++ (instancetype)defaultForSafeRect:(CGRect)rect split:(BOOL)split {
     CGFloat w = MAX(rect.size.width, 1), h = MAX(rect.size.height, 1), unit = MIN(w, h);
+    CGFloat scale = split ? MIN(1, MIN(w / 400, h / 350)) : 1;
     // 11-07 维护者 定（参考图 + 方案三「描线」）：肩键下移到约 1/3 高、拇指够得到；左摇杆左侧中部、十字键在它右下；右摇杆右下偏中；ABXY 右侧中下；
     //   L3 / R3 小键挨着两根摇杆；− / + 留顶上正中。位置按安全区比例（横按宽、纵按高），尺寸照旧按点（iPhone 17 Pro Max 横屏 832×419 安全区设计）
     CGFloat ax = 0.905 * w, ay = 0.625 * h, ad = 47, px = 0.235 * w, py = 0.80 * h, pd = 32;
@@ -124,17 +124,27 @@ static CGRect normalized_rect(NSDictionary *value) {
         @[@"UP", @(px), @(py - pd)], @[@"DOWN", @(px), @(py + pd)], @[@"LEFT", @(px - pd), @(py)], @[@"RIGHT", @(px + pd), @(py)],
         // 摇杆按下（11-06 维护者：七龙珠Z 协议确认页要按）：L3 / R3 挨着各自摇杆的上方；放在其它键之后，热区重叠处仍归旧键（keyAt 按顺序取第一个）
         @[@"LS", @(0.205 * w), @(0.489 * h)], @[@"RS", @(0.795 * w), @(0.489 * h)]];
+    if (split) {
+        ax=.84*w; ay=.68*h; ad=47*scale; px=.35*w; py=.72*h; pd=32*scale;
+        // 外肩键会被安全区边界钳住；内肩键至少隔开一个键宽和 8 点（均随布局缩放）。
+        CGFloat outer=MAX(.06*w,29*scale), inner=MAX(.20*w,outer+66*scale);
+        spec=@[@[@"A",@(ax+ad),@(ay)],@[@"B",@(ax),@(ay+ad)],@[@"X",@(ax),@(ay-ad)],@[@"Y",@(ax-ad),@(ay)],
+            @[@"ZL",@(outer),@(.13*h)],@[@"L",@(inner),@(.13*h)],@[@"R",@(w-inner),@(.13*h)],@[@"ZR",@(w-outer),@(.13*h)],
+            @[@"MINUS",@(w/2-52*scale),@(.13*h)],@[@"PLUS",@(w/2+52*scale),@(.13*h)],
+            @[@"UP",@(px),@(py-pd)],@[@"DOWN",@(px),@(py+pd)],@[@"LEFT",@(px-pd),@(py)],@[@"RIGHT",@(px+pd),@(py)],
+            @[@"LS",@(.13*w),@(.36*h)],@[@"RS",@(.65*w),@(.43*h)]];
+    }
     NSMutableArray *buttons = [NSMutableArray array];
     for (NSUInteger i = 0; i < spec.count; i++) {
         NSArray *s = spec[i]; CGFloat bw = i < 4 ? 50 : i < 8 ? 58 : i < 10 ? 30 : i < 14 ? 30 : 30;
         CGFloat bh = i < 4 ? 50 : i < 8 ? 32 : i < 10 ? 30 : i < 14 ? 30 : 30, cr = i < 4 ? 25 : i < 8 ? 16 : i < 10 ? 15 : i < 14 ? 8 : 15;
         [buttons addObject:@{@"id": s[0], @"x": @(MAX(0, MIN(1, [s[1] doubleValue] / w))), @"y": @(MAX(0, MIN(1, [s[2] doubleValue] / h))),
-            @"width": @(bw / unit), @"height": @(bh / unit), @"cornerRadius": @(cr / unit)}];
+            @"width": @(bw * scale / unit), @"height": @(bh * scale / unit), @"cornerRadius": @(cr * scale / unit)}];
     }
     NSDictionary *doc = @{@"schemaVersion": @1, @"id": S2AVPadLayoutDefaultIdentifier, @"name": S2AL(@"vpad.layout.default"), @"buttons": buttons,
-        @"sticks": @[@{@"id": @"left", @"activation": @{@"x": @0, @"y": @0, @"width": @0.5, @"height": @1}, @"radius": @(60 / unit)},
-                     @{@"id": @"right", @"activation": @{@"x": @0.5, @"y": @0, @"width": @0.5, @"height": @1}, @"radius": @(60 / unit)}]};
-    // UIKit calls this only for landscape viewports. Do not parse our own trusted defaults on every resize.
+        @"sticks": @[@{@"id": @"left", @"activation": @{@"x": @0, @"y": @0, @"width": @0.5, @"height": @1}, @"radius": @(60 * scale / unit)},
+                     @{@"id": @"right", @"activation": @{@"x": @0.5, @"y": @0, @"width": @0.5, @"height": @1}, @"radius": @(60 * scale / unit)}]};
+    // Do not parse our own trusted defaults on every resize.
     S2AVPadLayout *layout = [self new]; layout->_document = doc; layout->_identifier = S2AVPadLayoutDefaultIdentifier; layout->_name = doc[@"name"];
     layout->_buttons = buttons; layout->_sticks = doc[@"sticks"]; return layout;
 }
@@ -191,24 +201,52 @@ static CGRect normalized_rect(NSDictionary *value) {
     return data ? [S2AVPadLayout readData:data error:error] : nil;
 }
 - (CGRect)frameForButton:(NSDictionary *)button safeRect:(CGRect)rect {
+    return [self frameForButton:button safeRect:rect avoiding:CGRectNull];
+}
+- (CGRect)frameForButton:(NSDictionary *)button safeRect:(CGRect)rect avoiding:(CGRect)division {
+    return [self frameForButton:button safeRect:rect avoiding:division scale:1];
+}
+- (CGRect)frameForButton:(NSDictionary *)button safeRect:(CGRect)rect avoiding:(CGRect)division scale:(CGFloat)scale {
     CGFloat unit = MIN(rect.size.width, rect.size.height);
     CGFloat w = MIN(rect.size.width, [button[@"width"] doubleValue] * unit);
     CGFloat h = MIN(rect.size.height, [button[@"height"] doubleValue] * unit);
     CGFloat x = CGRectGetMinX(rect) + [button[@"x"] doubleValue] * rect.size.width - w / 2;
     CGFloat y = CGRectGetMinY(rect) + [button[@"y"] doubleValue] * rect.size.height - h / 2;
-    return CGRectMake(MAX(CGRectGetMinX(rect), MIN(x, CGRectGetMaxX(rect) - w)),
-                      MAX(CGRectGetMinY(rect), MIN(y, CGRectGetMaxY(rect) - h)), w, h);
-}
-- (nullable NSString *)buttonAt:(CGPoint)p safeRect:(CGRect)rect slop:(CGFloat)slop { return [self buttonAt:p safeRect:rect slop:slop scales:nil]; }
-- (nullable NSString *)buttonAt:(CGPoint)p safeRect:(CGRect)rect slop:(CGFloat)slop scales:(NSDictionary<NSString *, NSNumber *> *)scales {
-    for (NSDictionary *button in _buttons) {
-        NSNumber *scale = scales[button[@"id"]] ?: scales[@"*"]; CGFloat s = scale ? scale.doubleValue : 1;
-        if (s <= 0) continue;
-        CGRect f = [self frameForButton:button safeRect:rect];
-        f = CGRectInset(f, f.size.width * (1 - s) / 2, f.size.height * (1 - s) / 2);
-        if (CGRectContainsPoint(CGRectInset(f, -slop, -slop), p)) return button[@"id"];
+    CGRect frame=CGRectMake(MAX(CGRectGetMinX(rect), MIN(x, CGRectGetMaxX(rect) - w)),
+                            MAX(CGRectGetMinY(rect), MIN(y, CGRectGetMaxY(rect) - h)), w, h);
+    frame=CGRectInset(frame,frame.size.width*(1-scale)/2,frame.size.height*(1-scale)/2);
+    if (!CGRectIsNull(division) && !CGRectIsEmpty(CGRectIntersection(frame,division)) && division.size.height>division.size.width) {
+        BOOL left=CGRectGetMidX(frame)<CGRectGetMidX(division);
+        CGRect side=left ? CGRectMake(rect.origin.x,rect.origin.y,MAX(0,CGRectGetMinX(division)-rect.origin.x),rect.size.height) :
+                         CGRectMake(CGRectGetMaxX(division),rect.origin.y,MAX(0,CGRectGetMaxX(rect)-CGRectGetMaxX(division)),rect.size.height);
+        frame.size.width=MIN(frame.size.width,side.size.width);
+        frame.origin.x=MAX(CGRectGetMinX(side),MIN(frame.origin.x,CGRectGetMaxX(side)-frame.size.width));
     }
-    return nil;
+    return frame;
+}
+- (nullable NSString *)buttonAt:(CGPoint)p safeRect:(CGRect)rect slop:(CGFloat)slop {
+    return [self buttonAt:p safeRect:rect slop:slop scales:nil];
+}
+- (nullable NSString *)buttonAt:(CGPoint)p safeRect:(CGRect)rect slop:(CGFloat)slop scales:(NSDictionary<NSString *, NSNumber *> *)scales {
+    return [self buttonAt:p safeRect:rect slop:slop avoiding:CGRectNull nearest:NO scales:scales];
+}
+- (nullable NSString *)buttonAt:(CGPoint)p safeRect:(CGRect)rect slop:(CGFloat)slop avoiding:(CGRect)division nearest:(BOOL)nearest {
+    return [self buttonAt:p safeRect:rect slop:slop avoiding:division nearest:nearest scales:nil];
+}
+- (nullable NSString *)buttonAt:(CGPoint)p safeRect:(CGRect)rect slop:(CGFloat)slop avoiding:(CGRect)division nearest:(BOOL)nearest scales:(NSDictionary<NSString *, NSNumber *> *)scales {
+    if (nearest && (!CGRectContainsPoint(rect,p) || CGRectContainsPoint(division,p))) return nil;
+    NSString *best=nil; CGFloat distance=CGFLOAT_MAX;
+    for (NSDictionary *button in _buttons) {
+        NSNumber *value=scales[button[@"id"]] ?: scales[@"*"]; CGFloat scale=value ? value.doubleValue : 1;
+        if (scale<=0) continue;
+        CGRect frame=[self frameForButton:button safeRect:rect avoiding:division scale:scale], hit=CGRectInset(frame,-slop,-slop);
+        if (nearest) hit=CGRectInset(frame,-MAX(slop,(44-frame.size.width)/2),-MAX(slop,(44-frame.size.height)/2));
+        if (!CGRectContainsPoint(hit,p) || CGRectIsEmpty(frame)) continue;
+        if (!nearest) return button[@"id"];
+        CGFloat dx=(p.x-CGRectGetMidX(frame))/MAX(1,hit.size.width), dy=(p.y-CGRectGetMidY(frame))/MAX(1,hit.size.height), d=dx*dx+dy*dy;
+        if (d<distance) { distance=d; best=button[@"id"]; }
+    }
+    return best;
 }
 - (CGRect)activationForStick:(NSDictionary *)stick safeRect:(CGRect)rect {
     CGRect n = normalized_rect(stick[@"activation"]);
@@ -280,6 +318,8 @@ static int read_enabled(NSURL *file, BOOL *enabled) {
 }
 
 @implementation S2AVPadLayoutStore {
+    S2AVPadLayoutStore *_commonStore;
+    NSString *_splitKeys;
     NSString *_selectionProblem;
     NSString *_hapticProblem;
     NSString *_holdLockProblem;
@@ -292,6 +332,17 @@ static int read_enabled(NSURL *file, BOOL *enabled) {
     NSString *_visibilityProblem;
 }
 - (instancetype)initWithDirectory:(NSURL *)directory { return [self initWithDirectory:directory settingsDirectory:directory]; }
+- (BOOL)split { return _commonStore!=nil; }
+- (instancetype)initWithDirectory:(NSURL *)directory settingsDirectory:(NSURL *)settingsDirectory split:(BOOL)split {
+    self=[self initWithDirectory:split ? [directory URLByAppendingPathComponent:@"split" isDirectory:YES] : directory settingsDirectory:settingsDirectory];
+    if (self && split) {
+        _commonStore=[[S2AVPadLayoutStore alloc] initWithDirectory:directory settingsDirectory:settingsDirectory];
+        _splitKeys=_selectedIdentifier;
+        if ([_commonStore.selectedIdentifier isEqualToString:S2AVPadLayoutTouchIdentifier]) _selectedIdentifier=S2AVPadLayoutTouchIdentifier;
+        _manualChosen=_commonStore.manualChosen; _holdLockEnabled=_commonStore.holdLockEnabled; _holdLockProblem=_commonStore->_holdLockProblem;
+    }
+    return self;
+}
 - (instancetype)initWithDirectory:(NSURL *)directory settingsDirectory:(NSURL *)settingsDirectory {
     if (!(self = [super init])) return nil;
     _directory = [directory copy]; _settingsDirectory = [settingsDirectory copy]; _selectedIdentifier = S2AVPadLayoutDefaultIdentifier; _diagnostics = @[];
@@ -350,7 +401,7 @@ static int read_enabled(NSURL *file, BOOL *enabled) {
     NSURL *url = [self urlForIdentifier:identifier];
     NSDictionary *attributes = [NSFileManager.defaultManager attributesOfItemAtPath:url.path error:error];
     if (!attributes) return nil;
-    if (![attributes[NSFileType] isEqualToString:NSFileTypeRegular] || [attributes[NSFileSize] unsignedLongLongValue] > 65536) {
+    if (![attributes[NSFileType] isEqualToString:NSFileTypeRegular]) {
         fail(error, @"F01.file", S2AL(@"vpad.layout.err.file")); return nil;
     }
     NSData *data = [NSData dataWithContentsOfURL:url options:0 error:error];
@@ -407,6 +458,10 @@ static int read_enabled(NSURL *file, BOOL *enabled) {
     _hapticFeedbackEnabled = enabled; _hapticProblem = nil; return YES;
 }
 - (BOOL)setHoldLockEnabled:(BOOL)enabled error:(NSError **)error {
+    if (_commonStore) {
+        if (![_commonStore setHoldLockEnabled:enabled error:error]) return NO;
+        _holdLockEnabled=enabled; _holdLockProblem=nil; return YES;
+    }
     if (![self prepareDirectory:error]) return NO;
     NSData *data = [NSJSONSerialization dataWithJSONObject:@{@"schemaVersion": @1, @"enabled": (enabled ? @YES : @NO)} options:0 error:error];
     if (!data || ![data writeToURL:[_directory URLByAppendingPathComponent:@".hold_lock.json"] options:NSDataWritingAtomic error:error]) return NO;
@@ -450,19 +505,19 @@ static S2AVPadKeyStyle key_style_snapped(S2AVPadKeyStyle s) {
     return s;
 }
 static BOOL key_style_valid(S2AVPadKeyStyle s) {
-    return isfinite(s.scale) && isfinite(s.opacity) && s.scale >= 0.6 && s.scale <= 1.6 && s.opacity >= 0.2 && s.opacity <= 1;
+    return isfinite(s.scale) && isfinite(s.opacity) && s.scale >= S2A_VPAD_SCALE_MIN && s.scale <= S2A_VPAD_SCALE_MAX && s.opacity >= 0.2 && s.opacity <= 1;
 }
 - (NSURL *)keyStyleFile { return [_directory URLByAppendingPathComponent:@".key_style.json"]; }
 - (void)loadKeyStyles {
     _keyStyles = [NSMutableDictionary dictionary]; _keyTheme = 0; _globalScale = _globalOpacity = 1;
     NSData *data = [NSData dataWithContentsOfURL:self.keyStyleFile];
-    id doc = data.length && data.length <= 65536 ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+    id doc = data.length ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
     if (!doc) return;
-    if (!fields(doc, @[@"schemaVersion", @"theme", @"keys", @"globalScale", @"globalOpacity"]) || !number(doc[@"schemaVersion"], 1, 1) || !number(doc[@"theme"], 0, kS2AVPadKeyThemeCount - 1) || !number(doc[@"globalScale"], 0.6, 1.6) || !number(doc[@"globalOpacity"], 0.2, 1) || ![doc[@"keys"] isKindOfClass:NSDictionary.class]) {
+    if (!fields(doc, @[@"schemaVersion", @"theme", @"keys", @"globalScale", @"globalOpacity"]) || !number(doc[@"schemaVersion"], 1, 1) || !number(doc[@"theme"], 0, kS2AVPadKeyThemeCount - 1) || !number(doc[@"globalScale"], S2A_VPAD_SCALE_MIN, S2A_VPAD_SCALE_MAX) || !number(doc[@"globalOpacity"], 0.2, 1) || ![doc[@"keys"] isKindOfClass:NSDictionary.class]) {
         _keyStyleProblem = [NSString stringWithFormat:S2AL(@"vpad.layout.error"), @"F01.keyStyle", S2AL(@"vpad.layout.problem.keyStyle")]; return; }
     for (NSString *key in doc[@"keys"]) {
         NSDictionary *v = doc[@"keys"][key];
-        if (!fields(v, @[@"scale", @"opacity", @"hidden"]) || !number(v[@"scale"], 0.6, 1.6) || !number(v[@"opacity"], 0.2, 1) || ![v[@"hidden"] isKindOfClass:NSNumber.class]) {
+        if (!fields(v, @[@"scale", @"opacity", @"hidden"]) || !number(v[@"scale"], S2A_VPAD_SCALE_MIN, S2A_VPAD_SCALE_MAX) || !number(v[@"opacity"], 0.2, 1) || ![v[@"hidden"] isKindOfClass:NSNumber.class]) {
             _keyStyles = [NSMutableDictionary dictionary]; _keyStyleProblem = [NSString stringWithFormat:S2AL(@"vpad.layout.error"), @"F01.keyStyle", S2AL(@"vpad.layout.problem.keyStyle")]; return; }
         _keyStyles[key] = v;
     }
@@ -523,7 +578,7 @@ static BOOL key_style_valid(S2AVPadKeyStyle s) {
     NSData *data = [layout JSONData:error];
     if (!data || ![S2AVPadLayout readData:data error:error] || ![self prepareDirectory:error]) return NO;
     NSURL *url = [self urlForIdentifier:layout.identifier];
-    if ([NSFileManager.defaultManager fileExistsAtPath:url.path]) return fail(error, @"F01.exists", S2AL(@"vpad.layout.err.exists"));
+    if ([NSFileManager.defaultManager fileExistsAtPath:url.path]) return [self replaceLayout:layout error:error];   // 同 id 已有：导入即更新这一份（原先拒收、要玩家去改 JSON 里的 id）
     NSURL *temporary = [_directory URLByAppendingPathComponent:[@".import-" stringByAppendingString:NSUUID.UUID.UUIDString]];
     if (![data writeToURL:temporary options:NSDataWritingAtomic error:error]) return NO;
     // moveItem refuses an existing destination; the visible file is always complete.
@@ -532,14 +587,50 @@ static BOOL key_style_valid(S2AVPadKeyStyle s) {
     return ok;
 }
 - (BOOL)selectIdentifier:(NSString *)identifier error:(NSError **)error {
+    if (_commonStore) _commonStore=[[S2AVPadLayoutStore alloc] initWithDirectory:_commonStore.directory settingsDirectory:_settingsDirectory];
+    if (_commonStore && [identifier isEqualToString:S2AVPadLayoutTouchIdentifier]) return [self setTouchOnly:YES error:error]>=0;
     if (!identifier_ok(identifier)) return fail(error, @"F01.identity", S2AL(@"vpad.layout.err.id"));
     if (![S2AVPadLayout isBuiltinIdentifier:identifier] && ![self readIdentifier:identifier error:error]) return NO;
     if (![self prepareDirectory:error]) return NO;
+    NSURL *selection=[_directory URLByAppendingPathComponent:@".selection.json"];
+    NSData *before=_commonStore ? [NSData dataWithContentsOfURL:selection] : nil;
     NSData *data = [NSJSONSerialization dataWithJSONObject:@{@"schemaVersion": @1, @"id": identifier} options:0 error:error];
     if (![data writeToURL:[_directory URLByAppendingPathComponent:@".selection.json"] options:NSDataWritingAtomic error:error]) return NO;
+    if (_commonStore && [_commonStore setTouchOnly:NO error:error]<0) {
+        if (before) [before writeToURL:selection options:NSDataWritingAtomic error:nil]; else [NSFileManager.defaultManager removeItemAtURL:selection error:nil];
+        return NO;
+    }
+    if (_commonStore) _splitKeys=[identifier copy];
     _selectedIdentifier = [identifier copy]; _selectionProblem = nil; return YES;
 }
++ (NSUInteger)adoptLegacyLayoutsFrom:(NSURL *)appDirectory into:(NSURL *)gameDirectory {
+    NSFileManager *fm = NSFileManager.defaultManager;
+    if (!appDirectory || !gameDirectory || [appDirectory.URLByStandardizingPath.path isEqualToString:gameDirectory.URLByStandardizingPath.path]) return 0;
+    NSURL *marker = [gameDirectory URLByAppendingPathComponent:@".legacy_adopted"];
+    if ([fm fileExistsAtPath:marker.path]) return 0;
+    NSArray<NSURL *> *urls = [fm contentsOfDirectoryAtURL:appDirectory includingPropertiesForKeys:nil options:NSDirectoryEnumerationSkipsHiddenFiles error:nil];
+    NSUInteger copied = 0; BOOL any = NO;
+    for (NSURL *url in urls) {
+        if (![url.pathExtension.lowercaseString isEqualToString:@"json"]) continue;
+        NSString *identifier = url.lastPathComponent.stringByDeletingPathExtension;
+        if (!identifier_ok(identifier) || [S2AVPadLayout isBuiltinIdentifier:identifier]) continue;
+        NSDictionary *attributes = [fm attributesOfItemAtPath:url.path error:nil];
+        if (![attributes[NSFileType] isEqualToString:NSFileTypeRegular] || [attributes[NSFileSize] unsignedLongLongValue] > 65536) continue;
+        NSData *data = [NSData dataWithContentsOfURL:url];
+        S2AVPadLayout *layout = data ? [S2AVPadLayout readData:data error:nil] : nil;
+        if (!layout || ![layout.identifier isEqualToString:identifier]) continue;
+        any = YES;
+        NSURL *target = [gameDirectory URLByAppendingPathComponent:url.lastPathComponent];
+        if ([fm fileExistsAtPath:target.path]) continue;
+        if (![fm createDirectoryAtURL:gameDirectory withIntermediateDirectories:YES attributes:nil error:nil]) return copied;
+        if ([data writeToURL:target options:NSDataWritingAtomic error:nil]) copied++;
+    }
+    if (any && [fm createDirectoryAtURL:gameDirectory withIntermediateDirectories:YES attributes:nil error:nil])
+        [[NSData data] writeToURL:marker options:NSDataWritingAtomic error:nil];   // 没有旧布局的不写标记：以后从旧版备份恢复了 App 级目录仍能接进来
+    return copied;
+}
 - (BOOL)markManual:(NSError **)error {
+    if (_commonStore) { BOOL ok=[_commonStore markManual:error]; if (ok) _manualChosen=YES; return ok; }
     if (_manualChosen) return YES;
     if (![self prepareDirectory:error]) return NO;
     if (![[NSData data] writeToURL:[_directory URLByAppendingPathComponent:@".manual"] options:NSDataWritingAtomic error:error]) return NO;
@@ -555,6 +646,13 @@ static BOOL key_style_valid(S2AVPadKeyStyle s) {
     return identifier;
 }
 - (int)setTouchOnly:(BOOL)on error:(NSError **)error {
+    if (_commonStore) {
+        // 编辑器和游戏内各有 store；切模式前现读共用选择，不能把另一份刚保存的布局覆盖成旧缓存。
+        _commonStore=[[S2AVPadLayoutStore alloc] initWithDirectory:_commonStore.directory settingsDirectory:_settingsDirectory];
+        int r=[_commonStore setTouchOnly:on error:error];
+        if (r>=0) _selectedIdentifier=on ? S2AVPadLayoutTouchIdentifier : _splitKeys;
+        return r;
+    }
     BOOL now = !_selectionProblem && [_selectedIdentifier isEqualToString:S2AVPadLayoutTouchIdentifier];
     if (now == on) return 0;
     if (on) {

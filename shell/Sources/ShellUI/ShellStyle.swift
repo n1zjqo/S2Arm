@@ -31,6 +31,13 @@ enum ShellStrings {
 }
 
 @MainActor public enum ShellFonts {
+    /// 电视（tvOS）上界面按手机点数设计的尺寸放大多少：1920×1080 点、两三米外看，正文 15 → 27（tvOS 系统正文约 29）。
+    /// 字号（`font`）与几张卡片 / 页面的最大宽度乘它；iOS / macOS 为 1，尺寸不变
+    #if os(tvOS)
+    public nonisolated static let tvScale: CGFloat = 1.8
+    #else
+    public nonisolated static let tvScale: CGFloat = 1
+    #endif
     /// Register just the bundled font. No game or user files are accessed.
     private static let registered: Bool = {
         guard let url = Bundle.module.url(forResource: "Manrope", withExtension: "ttf") else { return false }
@@ -40,7 +47,7 @@ enum ShellStrings {
     }()
     /// Manrope that follows Dynamic Type.
     public static func font(_ size: CGFloat, weight: Font.Weight = .regular, relativeTo: Font.TextStyle = .body) -> Font {
-        if registered { return .custom("Manrope", size: size, relativeTo: relativeTo).weight(weight) }
+        if registered { return .custom("Manrope", size: size * tvScale, relativeTo: relativeTo).weight(weight) }
         return .system(relativeTo).weight(weight)
     }
     /// Manrope at a fixed size, for lettering that belongs to a picture rather than to the interface.
@@ -141,6 +148,7 @@ struct ShellButtonStyle: ButtonStyle {
             .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(.white.opacity(0.10)))
             .opacity(enabled ? 1 : 0.4)
             .contentShape(RoundedRectangle(cornerRadius: 9))
+            .tvFocusLift()
     }
 }
 
@@ -157,6 +165,7 @@ struct PrimaryPillStyle: ButtonStyle {
             .opacity(configuration.isPressed ? 0.78 : 1)
             .scaleEffect(configuration.isPressed ? 0.98 : 1)
             .contentShape(Capsule())
+            .tvFocusLift()
     }
 }
 
@@ -167,7 +176,7 @@ private struct PrimarySurface: ViewModifier {
     // S2Arm：开关值用 @AppStorage 绑同一个键，设置里一切换就重画（原先在 body 里直接读 store，切了要等别的原因重画才变）
     @AppStorage(ShellSettingsStore.liquidGlassKey, store: ShellSettingsStore.current.defaults) private var glass = true
     func body(content: Content) -> some View {
-        if #available(iOS 26.0, macOS 26.0, *), glass {
+        if #available(iOS 26.0, macOS 26.0, tvOS 26.0, *), glass {
             content.glassEffect(.regular.tint(ShellPalette.cream).interactive(), in: Capsule())
         } else {
             content.background(ShellPalette.cream, in: Capsule())
@@ -186,6 +195,7 @@ struct RoundIconButtonStyle: ButtonStyle {
             .background(active ? ShellPalette.cream : .white.opacity(configuration.isPressed ? 0.2 : 0.10), in: Circle())
             .overlay(Circle().strokeBorder(.white.opacity(active ? 0 : 0.14)))
             .contentShape(Circle())
+            .tvFocusLift()
     }
 }
 
@@ -199,8 +209,32 @@ struct ChipButtonStyle: ButtonStyle {
             .environment(\.colorScheme, .dark)
             .overlay(Capsule().strokeBorder(.white.opacity(0.14)))
             .contentShape(Capsule())
+            .tvFocusLift()
     }
 }
+
+extension View {
+    /// tvOS：按钮被系统焦点选中时放大、提亮一点（自定义 ButtonStyle 在 tvOS 上没有系统的焦点效果）。iOS / macOS 原样返回
+    func tvFocusLift() -> some View {
+        #if os(tvOS)
+        modifier(TVFocusLift())
+        #else
+        self
+        #endif
+    }
+}
+
+#if os(tvOS)
+/// 读的是按钮自己的焦点（ButtonStyle 的 makeBody 在按钮里面，`isFocused` 指最近的可聚焦祖先，就是这个按钮）
+private struct TVFocusLift: ViewModifier {
+    @Environment(\.isFocused) private var focused
+    func body(content: Content) -> some View {
+        content.scaleEffect(focused ? 1.06 : 1).brightness(focused ? 0.08 : 0)
+            .shadow(color: .black.opacity(focused ? 0.45 : 0), radius: focused ? 18 : 0, y: focused ? 8 : 0)
+            .animation(.easeOut(duration: 0.15), value: focused)
+    }
+}
+#endif
 
 /// The chip's own quiet backdrop: on iOS 26 / macOS 26 with Liquid Glass on, the system's regular glass
 /// (GameCase #61's shape; no tint — a chip is never the primary action), interactive because the chip is
@@ -210,7 +244,7 @@ private struct ChipSurface: ViewModifier {
     let isPressed: Bool
     @AppStorage(ShellSettingsStore.liquidGlassKey, store: ShellSettingsStore.current.defaults) private var glass = true   // 同 PrimarySurface
     func body(content: Content) -> some View {
-        if #available(iOS 26.0, macOS 26.0, *), glass {
+        if #available(iOS 26.0, macOS 26.0, tvOS 26.0, *), glass {
             content.glassEffect(.regular.interactive(), in: Capsule())
         } else {
             content.background {
@@ -352,10 +386,15 @@ struct CoverView: View {
             .clipShape(RoundedRectangle(cornerRadius: radius))
             .overlay(RoundedRectangle(cornerRadius: radius).strokeBorder(.white.opacity(0.10)))
             .overlay(alignment: .topLeading) {
-                if showsState {
+                if showsState || game.sgrade {
                     GeometryReader { geometry in
                         let size = max(8, min(14, geometry.size.width * 0.034))
-                        StateDot(state: game.state, size: size).padding(size * 0.9)
+                        // 金色 S（v0.4.0）：这款打进了 S 级优化，放左上角；状态点跟在它右边
+                        HStack(alignment: .center, spacing: size * 0.6) {
+                            if game.sgrade { SGradeBadge(size: max(16, geometry.size.width * 0.085)) }
+                            if showsState { StateDot(state: game.state, size: size) }
+                        }
+                        .padding(size * 0.9)
                     }
                 }
             }
@@ -456,14 +495,25 @@ extension GameState {
         case .playable: ShellStrings.text("Ready to play")
         case .needsGameData: ShellStrings.text("Needs game data")
         case .needsAppUpdate: ShellStrings.text("App update needed")
+        case .needsGameUpdate: ShellStrings.text("Update on your computer")
         case .broken(let reason, _, _): reason.isEmpty ? ShellStrings.text("Unavailable") : reason
         case .installing(let stage):
             switch stage.phase {
             case .transferring: ShellStrings.text("Transferring – keep connected…") + Self.percent(stage.fraction)
-            case .installing: ShellStrings.text("Installing…") + Self.percent(stage.fraction)
+            case .installing: Self.stepTitle(stage.step) + Self.percent(stage.fraction)
             case .interrupted: ShellStrings.text("Transfer stopped")
             case .failed: ShellStrings.text("Install didn't finish")
             }
+        }
+    }
+    private static func stepTitle(_ step: Int) -> String {
+        switch step {
+        case 1: ShellStrings.text("Importing…")
+        case 2: ShellStrings.text("Unpacking small files…")
+        case 3: ShellStrings.text("Checking files…")
+        case 4: ShellStrings.text("Waiting for another game…")
+        case 5: ShellStrings.text("Organizing game folders…")
+        default: ShellStrings.text("Installing…")
         }
     }
     private static func percent(_ fraction: Double?) -> String { fraction.map { " \(Int(($0 * 100).rounded(.down)))%" } ?? "" }
@@ -477,7 +527,7 @@ extension GameState {
     var color: Color {
         switch self {
         case .playable: ShellPalette.ready
-        case .needsGameData, .needsAppUpdate: ShellPalette.attention
+        case .needsGameData, .needsAppUpdate, .needsGameUpdate: ShellPalette.attention
         case .broken: ShellPalette.muted
         case .installing(let stage): stage.phase == .interrupted || stage.phase == .failed ? ShellPalette.attention : ShellPalette.muted
         }
@@ -485,15 +535,17 @@ extension GameState {
     var explanation: String {
         switch self {
         case .playable: ""
-        case .needsGameData: ShellStrings.text("Choose this game's data to get ready to play.")
+        case .needsGameData: ShellStrings.text("Choose this game's data to get ready to play. If it was installed from a computer, connect the iPhone and click “Install on iPhone” for this game in S2Arm: it picks up from what was already copied, so it won’t start over.")
         case .needsAppUpdate: ShellStrings.text("Install a newer version of this app to play this game.")
+        case .needsGameUpdate: ShellStrings.text("This game on your phone doesn't match S2Arm on this phone, so it can't open: it was built for another version, installed from another computer or Apple ID, or didn't finish installing. Connect your phone to your computer and click \"Install on iPhone\" for this game in S2Arm.")
         case .broken(_, let detail, _): detail
         case .installing(let stage):
             switch stage.phase {
             case .transferring: ShellStrings.text("This game is being copied from your computer. Keep the cable connected.")
             case .installing: ShellStrings.text("Getting this game ready. Keep this app open.")
-            case .interrupted: ShellStrings.text("Connect this iPhone to the computer again to continue.")
-            case .failed: ShellStrings.text("Tap Try again. If it still does not finish, install it again from the computer.")
+            case .interrupted: ShellStrings.text("Connect this iPhone to the computer, then click “Install on iPhone” for this game in S2Arm. It picks up from what was already copied, so it won’t start over.")
+            case .failed:
+                (stage.reason.map { $0 + "\n" } ?? "") + ShellStrings.text("Tap Try again. If it still does not finish, install it again from the computer.")
             }
         }
     }
@@ -501,7 +553,7 @@ extension GameState {
         switch self {
         case .playable: ShellStrings.text("Play")
         case .needsGameData: ShellStrings.text("Choose game data…")
-        case .needsAppUpdate: ShellStrings.text("How to update")
+        case .needsAppUpdate, .needsGameUpdate: ShellStrings.text("How to update")
         case .broken: ShellStrings.text("How to fix")
         case .installing(let stage):
             switch stage.phase {
@@ -515,7 +567,7 @@ extension GameState {
         switch self {
         case .playable: "play.fill"
         case .needsGameData: "folder"
-        case .needsAppUpdate: "arrow.up.circle"
+        case .needsAppUpdate, .needsGameUpdate: "arrow.up.circle"
         case .broken: "wrench.and.screwdriver"
         case .installing(let stage):
             switch stage.phase {
@@ -603,7 +655,7 @@ extension GameState {
         switch self {
         case .playable: ShellStrings.text("Play")
         case .needsGameData: ShellStrings.text("Choose")
-        case .needsAppUpdate: ShellStrings.text("How to update")
+        case .needsAppUpdate, .needsGameUpdate: ShellStrings.text("How to update")
         case .broken: ShellStrings.text("How to fix")
         case .installing: actionTitle
         }
@@ -611,7 +663,7 @@ extension GameState {
     /// Broken, needs-an-update and a stopped transfer are fixed on the computer. Their primary action explains how, instead of acting.
     var needsHelp: Bool {
         switch self {
-        case .broken, .needsAppUpdate: true
+        case .broken, .needsAppUpdate, .needsGameUpdate: true
         case .installing(let stage): stage.phase == .interrupted
         default: false
         }

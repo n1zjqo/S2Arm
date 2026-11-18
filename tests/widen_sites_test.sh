@@ -88,4 +88,18 @@ ck "⑤ 0x138 / 0x140 换成宿主门：原位是 B（${b138:-?}），门表 wid
 "$REW" "$T/exefs/main" "$T/out6" main "$T/sites6.tsv" > "$T/rew6.log" 2>&1; rc6=$?
 wt6=$(tr '\t\n' ' ,' < "$T/out6/main.widen.tsv" 2>/dev/null); ny=$(grep -c '满屏候选 0x.* 跳过（不计缺口）' "$T/rew6.log"); ng=$(grep -c '^GAP' "$T/rew6.log")
 ck "⑥ 坏候选两行：rc=${rc6}、GAP ${ng} 行、跳过记黄 ${ny} 行、widen.tsv 同 ②（实得：${wt6}）" '[ $rc6 = 0 ] && [ $ng = 0 ] && [ $ny = 2 ] && [ "$wt6" = "0 0x100 f2w 0xd2a89408,1 0x104 f2h 0xf2e88688,2 0x124 asp 0x5291c76d,3 0x12c asp 0x5291c72e,4 0x138 capsz 0x2d4a2408,5 0x140 lytsz 0x2d451122,6 0x174 movz 0xd280a00e,7 0x178 i2h 0xf2c05a0e," ]'
-[ $bad = 0 ] && echo "宽屏候选扫描 + 跳板 / 门 期望 8 项全通 → 全通" || { echo "宽屏候选扫描 + 跳板 / 门 期望 8 项全通 → 有不通"; exit 1; }
+# ⑦ 社区补丁认领同一条指令（11-13：pack/cpatch.py 在本款没有我方宽屏表时放行宽屏候选点）：补丁表 p 行改 0x12c / 0x130（第二对 asp 的 MOVZ / MOVK）
+#    → 改写器 rc 0、无 GAP；0x12c 不进 widen.tsv（日志「让给社区补丁」一行），其余序号连续：0 0x100 / 1 0x104 / 2 0x124 / 3 0x138 / 4 0x140 / 5 0x174 / 6 0x178
+#    p 行新字手算：ldr w14,[x16,#1016×8] = 0xB9400000 | (8128÷4)<<10 | 16<<5 | 14 = 0xb95fc20e；movk 位换 nop 0xd503201f
+printf 'p\tmain\t12c\t5291c72e\tb95fc20e\t0\t@k\np\tmain\t130\t72a7fc6e\td503201f\t0\n' > "$T/cp7.tsv"; mkdir -p "$T/out7"
+S2A_CPATCH_TSV="$T/cp7.tsv" "$REW" "$T/exefs/main" "$T/out7" main "$T/sites.tsv" > "$T/rew7.log" 2>&1; rc7=$?
+wt7=$(tr '\t\n' ' ,' < "$T/out7/main.widen.tsv" 2>/dev/null); ny7=$(grep -c '0x12c.*让给社区补丁' "$T/rew7.log"); ng7=$(grep -c '^GAP' "$T/rew7.log")
+ck "⑦ 补丁认领 0x12c：rc=${rc7}、GAP ${ng7}、让给 ${ny7} 行、widen.tsv 少 0x12c（实得：${wt7}）" '[ $rc7 = 0 ] && [ $ng7 = 0 ] && [ $ny7 = 1 ] && [ "$wt7" = "0 0x100 f2w 0xd2a89408,1 0x104 f2h 0xf2e88688,2 0x124 asp 0x5291c76d,3 0x138 capsz 0x2d4a2408,4 0x140 lytsz 0x2d451122,5 0x174 movz 0xd280a00e,6 0x178 i2h 0xf2c05a0e," ]'
+# ⑧ 补丁认领的是 i2h 的搭档（#1180：0.4.0 出包把搭档 MOVZ 让给社区补丁、换成补丁开关跳转，高半照改 → 运行时找不到搭档、低半按 0 → 宽 0 黑屏）：
+#    补丁表 p 行改 0x174（movz x14,#1280 → movz x14,#1600 = 0xd280000e | 1600<<5 = 0xd280c80e）
+#    → rc 0、无 GAP；0x174 让给补丁，0x178（i2h）也不改（日志「搭档」一行），widen.tsv 只剩前六行：0 0x100 / 1 0x104 / 2 0x124 / 3 0x12c / 4 0x138 / 5 0x140
+printf 'p\tmain\t174\td280a00e\td280c80e\t0\n' > "$T/cp8.tsv"; mkdir -p "$T/out8"
+S2A_CPATCH_TSV="$T/cp8.tsv" "$REW" "$T/exefs/main" "$T/out8" main "$T/sites.tsv" > "$T/rew8.log" 2>&1; rc8=$?
+wt8=$(tr '\t\n' ' ,' < "$T/out8/main.widen.tsv" 2>/dev/null); ny8=$(grep -c '0x178.*搭档' "$T/rew8.log"); ng8=$(grep -c '^GAP' "$T/rew8.log")
+ck "⑧ 补丁认领 i2h 的搭档 0x174：rc=${rc8}、GAP ${ng8}、高半跳过 ${ny8} 行、widen.tsv 无 0x174 / 0x178（实得：${wt8}）" '[ $rc8 = 0 ] && [ $ng8 = 0 ] && [ $ny8 = 1 ] && [ "$wt8" = "0 0x100 f2w 0xd2a89408,1 0x104 f2h 0xf2e88688,2 0x124 asp 0x5291c76d,3 0x12c asp 0x5291c72e,4 0x138 capsz 0x2d4a2408,5 0x140 lytsz 0x2d451122," ]'
+[ $bad = 0 ] && echo "宽屏候选扫描 + 跳板 / 门 期望 10 项全通 → 全通" || { echo "宽屏候选扫描 + 跳板 / 门 期望 10 项全通 → 有不通"; exit 1; }

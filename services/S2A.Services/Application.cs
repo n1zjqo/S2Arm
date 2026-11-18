@@ -104,12 +104,31 @@ namespace S2A.Services
 
             string romfs = Path.Combine(programDir, "romfs");
 
-            IStorage imageStorage = RomFsIndex.OpenImage(programDir);
-            RomFsIndex.Source source = RomFsIndex.Decide(imageStorage != null, File.Exists(Path.Combine(programDir, RomFsIndex.ImageName)), Directory.Exists(romfs), programDir);
+            string overlayDir = Path.Combine(programDir, "ui_overlay", "romfs");   // 界面布局覆盖层（RomFsIndex.OverlayFiles）：同路径读覆盖层那份
+            string readLogAs = $"程序 {programIndex}";   // 诊断读记录（S2A_ROMFS_READLOG，RomFsIndex.ReadLog）里的来源名
+
+            IStorage imgV1 = RomFsIndex.OpenImg(programDir);   // 单一 IMG v1（v0.3.0）：有 game.img 就用它；旧形态（romfs.img 三件套 / romfs/ 目录）照旧支持
+            if (imgV1 != null)
+            {
+                imgV1 = RomFsMods.ApplyAtLaunch(imgV1, programIndex);   // 资源替换类 mod（RomFsMods.cs）：没有 mod 原对象返回；下面几处同
+                device.Configuration.VirtualFileSystem.SetRomFs(pid, RomFsIndex.ReadLog(imgV1, readLogAs));
+                Native.Mark("服务：RomFS 单一 IMG\0"u8);
+            }
+            // 标准 RomFS 镜像（Mac 运行版本 / 产物根里 romfs/ 不在、只有 romfs.std）：整个文件就是游戏要的 RomFS，直接交（RomFsIndex.OpenStd）；romfs/ 在照旧读目录
+            string std = imgV1 != null ? null : RomFsIndex.StdOf(romfs);
+            if (std != null)
+            {
+                IStorage image = RomFsMods.ApplyAtLaunch(RomFsIndex.OpenStd(std, overlayDir), programIndex);
+                device.Configuration.VirtualFileSystem.SetRomFs(pid, RomFsIndex.ReadLog(image, readLogAs));
+                Native.Mark("服务：RomFS 标准镜像\0"u8);
+            }
+            IStorage imageStorage = imgV1 != null || std != null ? null : RomFsIndex.OpenImage(programDir);
+            RomFsIndex.Source source = imgV1 != null || std != null ? RomFsIndex.Source.Missing : RomFsIndex.Decide(imageStorage != null, File.Exists(Path.Combine(programDir, RomFsIndex.ImageName)), Directory.Exists(romfs), programDir);
 
             if (source == RomFsIndex.Source.Image)
             {
-                device.Configuration.VirtualFileSystem.SetRomFs(pid, imageStorage);
+                imageStorage = RomFsMods.ApplyAtLaunch(imageStorage, programIndex);
+                device.Configuration.VirtualFileSystem.SetRomFs(pid, RomFsIndex.ReadLog(imageStorage, readLogAs));
                 Native.Mark("服务：RomFS 单文件镜像\0"u8);
             }
             else if (source == RomFsIndex.Source.Directory)
@@ -118,7 +137,7 @@ namespace S2A.Services
                     Red.Report("RomFS 单文件镜像不完整（多半推到一半），这局改读 romfs/ 目录", programDir);   // 审计 P1-151：不静默改读
                 // 出包时预建的索引（RomFsIndex）优先：免去起局枚举十几万文件；没有就按目录现建（慢，打一行提示）
                 string index = Path.Combine(programDir, RomFsIndex.FileName);
-                string overlay = Path.Combine(programDir, "ui_overlay", "romfs");   // 界面布局覆盖层（RomFsIndex.OverlayFiles）：同路径读覆盖层那份
+                string overlay = overlayDir;
                 IStorage image;
 
                 if (File.Exists(index))
@@ -131,18 +150,22 @@ namespace S2A.Services
                     image = RomFsFromDirectory(romfs, overlay);
                 }
 
-                device.Configuration.VirtualFileSystem.SetRomFs(pid, image);   // 镜像本身按偏移读：各数据存储会话互不共享读位置（#883），大读也不租中间数组
+                image = RomFsMods.ApplyAtLaunch(image, programIndex);
+                device.Configuration.VirtualFileSystem.SetRomFs(pid, RomFsIndex.ReadLog(image, readLogAs));   // 镜像本身按偏移读：各数据存储会话互不共享读位置（#883），大读也不租中间数组
                 Native.Mark("服务：RomFS 目录表建\0"u8);
             }
-            else
+            else if (imgV1 == null && std == null)
             {
-                Red.Report("游戏数据缺 romfs/", programDir);
+                Red.Report("游戏数据缺 romfs/（也没有 romfs.std）", programDir);
             }
 
             Aoc.Register(gameDir);   // DLC：aoc.tsv 里的全部登记为已拥有（有数据的挂 aoc/<idx>/，仅授权的挂载时报红）
 
             Saves.SelectUser(device);
-            if (Saves.Dir() == null) SaveFolder.SelectUser(device, applicationId);   // 存档位置里记的用户号（SaveFolder.cs，审计 P1-162）：建存档之前
+            // 本地玩家（LocalPlayer.cs，#623）：游戏库里选的玩家定当前用户；没给玩家走旧规则——存档位置里记的用户号（SaveFolder.cs，审计 P1-162）。都在建存档之前
+            //   带存档起局（Mac 导入的社区存档首次起局灌入）的种子没记用户号时，也灌给选的玩家（不然落到数据根里上次打开的用户）
+            if (Saves.Dir() == null) { if (!LocalPlayer.Select(device, applicationId)) SaveFolder.SelectUser(device, applicationId); }
+            else if (!File.Exists(Path.Combine(Saves.Dir(), "user"))) LocalPlayer.Select(device, applicationId);
             Result saveResult = ProcessLoaderHelper.EnsureSaveData(device, new ApplicationId(applicationId), nacp);
             if (requireSuccess) saveResult.ThrowIfFailure();
             Saves.Seed(device, applicationId);
@@ -298,13 +321,9 @@ namespace S2A.Services
 
                 // 长度来自目录枚举或预建索引：文件被换过（索引过期）就对不上，读出的数据会错位。
                 //   回失败、不按索引长度补零当完整（审计 #1534 P1-6）；不缓存这个句柄，下次读再核
+                // 11-17 维护者：校验不过不整个拒——黄字记下、照常按实际文件读（读到文件尾就是实际长度），出问题时报红会带上这条
                 if (opened.Length != _size)
-                {
-                    Red.Report("RomFS 文件长度与索引不符（romfs.s2aidx 过期？），本次读回失败", $"{_path}：索引 {_size}，实际 {opened.Length}");
-                    opened.Dispose();
-                    bytesRead = 0;
-                    return ResultFs.HostFileDataCorrupted.Value;
-                }
+                    Red.Waive($"RomFS 文件长度与索引不符（romfs.s2aidx 过期？版本不配，可能读错或闪退，重新装到 iPhone 可解），照常按实际文件读", $"{_path}：索引 {_size}，实际 {opened.Length}");
 
                 lock (_lock)
                 {
@@ -351,7 +370,7 @@ namespace S2A.Services
                 }
                 catch (IOException e) when (e.HResult == EFault)
                 {
-                    if (!ReadViaBounce(stream.SafeFileHandle, destination[..n], offset, out bytesRead))
+                    if (!ReadViaBounce(stream.SafeFileHandle, destination[..n], offset, Path.GetFileName(_path), out bytesRead))
                     {
                         return ResultFs.UnexpectedInLocalFileSystemE.Value;
                     }
@@ -390,10 +409,11 @@ namespace S2A.Services
         //   内核的写不能交给写跟踪：先读进宿主中转缓冲，再报一次写（解保护、GPU 改过的子页先回写，同 GetWritableRegion(tracked)），由 CPU 拷进去。
         //   给不出游戏地址（远端开着、目标不在本线程取过的区域里）就报不了写：不拷、回 false，读盘回失败（11-01 审计 P2-21：原先只报红照拷，
         //   往仍受保护的页写即宿主崩溃，写进去了跟踪器也不知道）
-        private const int EFault = 14;
+        internal const int EFault = 14;
         private static long _bounceCount;
 
-        private unsafe bool ReadViaBounce(SafeFileHandle handle, Span<byte> destination, long offset, out long bytesRead)
+        // 也给单文件镜像 / 单一 IMG 的预建路径用（RomFsIndex.IndexedStorage 直接读 romfs.img / game.img 进游戏内存，同样会 EFAULT，#602）：name 只进日志
+        internal static unsafe bool ReadViaBounce(SafeFileHandle handle, Span<byte> destination, long offset, string name, out long bytesRead)
         {
             // 写钩子收游戏地址：远端连续块的目标视图是影子页、指针不是游戏地址，按取区域时的游戏地址换算（11-01 审计 P1-17）
             ulong host = (ulong)Unsafe.AsPointer(ref MemoryMarshal.GetReference(destination));
@@ -401,7 +421,7 @@ namespace S2A.Services
 
             if (!GuestMemory.TryGuestAddress(host, (ulong)destination.Length, out ulong va))
             {
-                Red.Report("读盘中转：目标不在本线程取过的游戏内存区域里，给不出游戏地址，报不了写、不拷，读盘回失败", $"{Path.GetFileName(_path)} 偏移 0x{offset:X}，宿主 0x{host:X} +0x{destination.Length:X}");
+                Red.Report("读盘中转：目标不在本线程取过的游戏内存区域里，给不出游戏地址，报不了写、不拷，读盘回失败", $"{name} 偏移 0x{offset:X}，宿主 0x{host:X} +0x{destination.Length:X}");
                 return false;
             }
 
@@ -409,7 +429,7 @@ namespace S2A.Services
 
             if (k <= 8 || (k & (k - 1)) == 0)
             {
-                Console.Error.WriteLine($"[fs] 读盘目标页写保护（EFAULT）改中转读：第 {k} 次，{Path.GetFileName(_path)} 偏移 0x{offset:X}，目标 0x{va:X} +0x{destination.Length:X}");
+                Console.Error.WriteLine($"[fs] 读盘目标页写保护（EFAULT）改中转读：第 {k} 次，{name} 偏移 0x{offset:X}，目标 0x{va:X} +0x{destination.Length:X}");
             }
 
             byte[] buf = ArrayPool<byte>.Shared.Rent(destination.Length);
@@ -443,6 +463,29 @@ namespace S2A.Services
             finally
             {
                 ArrayPool<byte>.Shared.Return(buf);
+            }
+        }
+
+        /// <summary>关掉这个文件的句柄（在 LRU 里就摘掉）：出包写 IMG 边写边释放原件（RomFsIndex.WriteStandard consume）删文件前调——
+        ///   Windows 上开着的句柄删不掉，macOS 上删了也要等句柄关了才真腾出空间。有读正在进行 → 抛（调用方只在自己读完之后调）</summary>
+        internal void Release()
+        {
+            lock (_lock)
+            {
+                if (_stream == null)
+                {
+                    return;
+                }
+
+                if (_busy != 0)
+                {
+                    throw new InvalidOperationException("RomFS 读取尚未返回，禁止关闭");
+                }
+
+                _lru.Remove(_node);
+                _stream.Dispose();
+                _stream = null;
+                _node = null;
             }
         }
 

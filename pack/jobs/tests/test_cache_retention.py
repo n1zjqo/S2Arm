@@ -4,6 +4,7 @@ os.environ.setdefault("S2A_BANNER_FETCH", "0")   # 同 jobcase.py：作业开始
 import sys
 import tempfile
 import unittest
+import jobcase  # noqa: E402（作业上下文替身统一工厂 jobcase.fake_context）
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,7 +17,8 @@ class CompilerRetentionTests(unittest.TestCase):
     def _preflight_fixture(self, root):
         import os
         import time
-        c = SimpleNamespace(private=root / 'private', work_root=root / 'private', library=root / 'library', emit=lambda *a, **k: None)
+        c = jobcase.fake_context(root, private=root / 'private', work_root=root / 'private', library=root / 'library', emit=lambda *a, **k: None, warnings=[])
+        c.diagnostic = lambda *a, **k: c.warnings.append((a, k))
         c.library.mkdir()
         paths = []
         for i in range(4):
@@ -54,10 +56,10 @@ class CompilerRetentionTests(unittest.TestCase):
             c, paths, game = self._preflight_fixture(Path(directory))
             with patch.object(library, 'selected_packages', return_value=[{'sha256': 'synthetic', 'size': 4 << 30}]), \
                  patch('shutil.disk_usage', return_value=SimpleNamespace(free=12 << 30)):
-                with self.assertRaises(Failure) as error:
-                    library.check_pack_space(c, game, compiler_policy=cache_retention.retention_policy())
-            self.assertEqual(error.exception.code, 'disk_full')
-            self.assertNotIn('逻辑字节', str(error.exception))   # 玩家提示不露内部词
+                library.check_pack_space(c, game, compiler_policy=cache_retention.retention_policy())   # 11-14 不许堵门：不拦，只记警告
+            [(args, kw)] = c.warnings
+            self.assertEqual((kw.get('code'), kw.get('severity')), ('disk_full', 'warning'))
+            self.assertNotIn('逻辑字节', args[0])   # 玩家提示不露内部词
             self.assertTrue(all(p.exists() for p in paths[:3]))
             self.assertFalse(paths[3].exists())
 
@@ -71,21 +73,24 @@ class CompilerRetentionTests(unittest.TestCase):
             def stat(path, *args, **kwargs):
                 info = real_stat(path, *args, **kwargs)
                 if path == c.library:
-                    return SimpleNamespace(st_dev=info.st_dev + 1)
+                    # 只把设备号换成另一个卷，其余照真的：Python 3.12 的 Path.is_dir() 还经 Path.stat() 读 st_mode
+                    # （3.13 起不经过），只给 st_dev 的替身在 3.12 上报 AttributeError: no attribute 'st_mode'
+                    fields = list(info)
+                    fields[2] = info.st_dev + 1   # os.stat_result 次序：st_mode, st_ino, st_dev, …
+                    return os.stat_result(fields)
                 return info
             budget = {'volumes': [{'role': 'library', 'needBytes': 18 << 30,
                                    'freeBytes': 12 << 30, 'enough': False}]}
             with patch.object(library, 'space_budget', return_value=budget), \
                  patch.object(Path, 'stat', stat), \
                  patch('shutil.disk_usage', return_value=SimpleNamespace(free=1 << 30)):
-                with self.assertRaises(Failure):
-                    library.check_pack_space(c, game, compiler_policy=cache_retention.retention_policy())
+                library.check_pack_space(c, game, compiler_policy=cache_retention.retention_policy())   # 不拦，只记警告
             self.assertTrue(all(p.exists() for p in paths), 'another volume cannot reclaim this cache volume')
 
     def test_success_cleanup_keeps_compiler_inputs(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            c = SimpleNamespace(private=root / 'private', work_root=root / 'private', library=root / 'library')
+            c = jobcase.fake_context(root, private=root / 'private', work_root=root / 'private', library=root / 'library')
             files = [c.private / 'cache/air/ios/aa' / ('a' * 64 + '.air'),
                      c.private / 'cache/pso/bb' / ('b' * 64 + '.bin'),
                      c.private / 'run/gal_dl_cache/ios/cc' / ('c' * 64 + '.metallib')]
@@ -104,7 +109,7 @@ class CompilerRetentionTests(unittest.TestCase):
     def test_success_keeps_direct_store_and_removes_only_transients(self):
         # S2Arm 10-31: the direct cache is store/ (shard files) + logs/; the former per-key trees ios/ and mac/ are the old layout, cleared like work/
         with tempfile.TemporaryDirectory() as directory:
-            c = SimpleNamespace(private=Path(directory) / 'private', work_root=Path(directory) / 'private', library=Path(directory) / 'library')
+            c = jobcase.fake_context(directory, private=Path(directory) / 'private', work_root=Path(directory) / 'private', library=Path(directory) / 'library')
             gid = '0100000000000000'
             direct = c.private / 'run/s2arm/cache/direct' / gid
             kept = [direct / 'store/dshb/aa' / ('aa' + '0' * 62 + '.e'), direct / 'logs/build.log', direct / 'future-format/unknown',
@@ -126,7 +131,7 @@ class CompilerRetentionTests(unittest.TestCase):
         import os
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as directory:
-            c = SimpleNamespace(private=Path(directory) / 'private', work_root=Path(directory) / 'private', library=Path(directory) / 'library', begin=lambda *a, **k: None)
+            c = jobcase.fake_context(directory, private=Path(directory) / 'private', work_root=Path(directory) / 'private', library=Path(directory) / 'library', begin=lambda *a, **k: None)
             gid = '0100000000000000'
             c.library.mkdir()
             roots = layout.ios_work(c, gid) / 'roots'
@@ -152,7 +157,7 @@ class CompilerRetentionTests(unittest.TestCase):
         for name in ('work', 'merged', 'ios.stage.12345'):
             for destination in ('store', 'logs', '../0100000000000001/store'):
                 with self.subTest(name=name, destination=destination), tempfile.TemporaryDirectory() as directory:
-                    c = SimpleNamespace(private=Path(directory) / 'private', work_root=Path(directory) / 'private', library=Path(directory) / 'library')
+                    c = jobcase.fake_context(directory, private=Path(directory) / 'private', work_root=Path(directory) / 'private', library=Path(directory) / 'library')
                     direct = c.private / 'run/s2arm/cache/direct/0100000000000000'
                     direct.mkdir(parents=True)
                     target = direct / destination
@@ -170,7 +175,7 @@ class CompilerRetentionTests(unittest.TestCase):
 
     def test_link_replacement_after_selection_is_rechecked_at_deletion(self):
         with tempfile.TemporaryDirectory() as directory:
-            c = SimpleNamespace(private=Path(directory) / 'private', work_root=Path(directory) / 'private', library=Path(directory) / 'library')
+            c = jobcase.fake_context(directory, private=Path(directory) / 'private', work_root=Path(directory) / 'private', library=Path(directory) / 'library')
             direct = c.private / 'run/s2arm/cache/direct/0100000000000000'
             work = direct / 'work'
             work.mkdir(parents=True)
@@ -221,6 +226,24 @@ class BudgetTests(unittest.TestCase):
         self.assertEqual((result['observedBytes'], result['retainedBytes'], result['removedBytes']), (12, 8, 4))
         self.assertEqual((result['removedEntries'], result['pressureRemaining']), (1, False))
         self.assertEqual(self.trim(free=1)['removedEntries'], 0)
+
+    def test_skip_scan_when_free_leaves_everything_and_refreshes_current_title(self):
+        # 期望手写（11-16 出包收尾不全量扫）：盘余量 5 ≥ 底线 1 → 不扫（scanned False、字节统计 None）、一个文件都不动、
+        #   本款直连仓 store 的修改时间刷成 NOW；盘余量 0 < 底线 → 照旧扫描并删最旧的（同上一条用例）
+        gid = '0100000000010000'
+        air = self.put('cache/air/ios/aa/' + 'a' * 64 + '.air', age=9000)
+        store = self.private / 'run/s2arm/cache/direct' / gid / 'store'
+        store.mkdir(parents=True)
+        os.utime(store, (self.NOW - 50000, self.NOW - 50000))
+        result = self.trim(free=5, current_gid=gid, skip_scan_when_free=True)
+        self.assertEqual((result['scanned'], result['observedBytes'], result['retainedBytes'], result['removedEntries']), (False, None, None, 0))
+        self.assertEqual((result['accountingComplete'], result['pressureRemaining'], result['freeBytes']), (True, False, 5))
+        self.assertTrue(air.exists())
+        self.assertEqual(int(store.stat().st_mtime), int(self.NOW))
+        low = self.trim(readings=[0, 0, 1], current_gid=gid, skip_scan_when_free=True)   # 快路径先读一次盘余量（0，不够）
+        self.assertTrue(low['scanned'])
+        self.assertFalse(air.exists())
+        self.assertEqual(low['removedEntries'], 1)
 
     def test_hot_future_temporary_and_unknown_are_retained_above_budget(self):
         files = [self.put('cache/air/ios/aa/' + 'a' * 64 + '.air', age=3599),
@@ -327,6 +350,24 @@ class BudgetTests(unittest.TestCase):
         self.assertTrue(p.exists())
         result = trim(self.private, min_free_bytes=1, free_bytes=lambda: 0, keep_titles=1, now=self.NOW + 3600)
         self.assertFalse(p.exists())
+
+    def test_current_title_touch_works_without_nofollow_utime(self):
+        # Windows 的 Python：os.utime 不在 os.supports_follow_symlinks 里，带 follow_symlinks=False 抛 NotImplementedError
+        #   （v0.3.0 候选 Windows 出 iPhone 包在这里必红）。模拟这种平台：本款的 store 照样记成刚用过（mtime = now），不抛
+        from unittest import mock
+        from cache_retention import trim
+        gid = '0100000000000000'
+        self.direct(gid)
+        real = os.utime
+        def windows_utime(path, times=None, *, follow_symlinks=True, **kw):
+            if not follow_symlinks:
+                raise NotImplementedError('utime: follow_symlinks unavailable on this platform')
+            return real(path, times, **kw)
+        with mock.patch.object(os, 'utime', windows_utime), mock.patch.object(os, 'supports_follow_symlinks', set()):
+            trim(self.private, min_free_bytes=1, free_bytes=lambda: 0, keep_titles=1, now=self.NOW + 7, current_gid=gid)
+        stores = [p for p in Path(self.private).rglob('store') if p.parent.name == gid]
+        self.assertTrue(stores, 'fixture: 本款有 store 目录')
+        self.assertEqual(stores[0].stat().st_mtime, self.NOW + 7)
 
     def test_direct_unknown_store_file_is_counted_but_not_evicted(self):
         import os
@@ -464,6 +505,7 @@ class ExecutionLockTests(unittest.TestCase):
             c = Context(request)
             c.r['libraryId'] = library.setup(c)['libraryId']
             other = Context(dict(c.r, taskId='other'))
+            other.lock_wait = 0.3   # 排队上限调短（同 test_filelock / test_probe_jobs 的 0.3 秒口径）：这里核的是「锁被占 → 报忙、不动东西」，不是等满产品缺省 30 秒（11-14 门禁提速：原先每例白等 30 秒）
             def fail_while_locked(actual):
                 self.assertIs(actual, c)
                 with self.assertRaises(Failure):

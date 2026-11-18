@@ -168,6 +168,18 @@ class SaveTests(unittest.TestCase):
             self.assertNotIn("payload/system/prod.keys", z.namelist())
         self.assertFalse(list((self.directory / "library/save-transactions").glob("*.json")))
 
+    def test_scan_skips_os_junk_files(self):
+        """exFAT / FAT 上 macOS 给每个带扩展属性的文件生成 ._<名>（AppleDouble），访达写 .DS_Store：不是存档。
+        期望按构造写死：只剩 a.bin 与 sub/b.bin 两个文件、sub 一个目录；修前 ._a.bin、.DS_Store、sub/._b.bin 也进了备份清单"""
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as t:
+            root = Path(t) / "saves"; (root / "sub").mkdir(parents=True)
+            (root / "a.bin").write_bytes(b"a"); (root / "sub" / "b.bin").write_bytes(b"b")
+            (root / "._a.bin").write_bytes(b"\x00\x05\x16\x07\x00\x02\x00\x00\x09\x00"); (root / ".DS_Store").write_bytes(b"Bud1"); (root / "sub" / "._b.bin").write_bytes(b"\x00\x05")
+            files, dirs = saves.scan(SimpleNamespace(check=lambda: None), root)
+            self.assertEqual(list(files), ["a.bin", "sub/b.bin"])
+            self.assertEqual(dirs, ["sub"])
+
     def test_export_manifest_lists_exact_files_without_keys(self):
         self.backup()
         result = self.preview()
@@ -177,7 +189,6 @@ class SaveTests(unittest.TestCase):
         self.assertEqual(m["users"], dict(ids=[USER], active=USER))
         self.assertTrue(any(f["path"].startswith("bis/system/save/") for f in m["files"]))
         self.assertFalse(any("prod.keys" in f["path"] for f in m["files"]))
-        self.assertEqual(self.archive.stat().st_mode & 0o777, 0o600)
 
     def test_zip64_directory_bounds_are_checked_before_zipfile_loads_it(self):
         self.backup()
@@ -318,22 +329,33 @@ class SaveTests(unittest.TestCase):
         self.assertFalse(self.archive.exists())
         self.assertFalse(self.root.exists())
 
-    def test_wrong_game_version_and_user_are_rejected(self):
+    def test_wrong_game_rejected_version_and_user_warn(self):
+        """维护者 11-17：版本 / DLC 组合、用户归属对不上不再拒绝恢复。期望手写：
+        另一款游戏 → 照旧拒绝；版本 / contentIdentity 不符、用户不符 → 检查照常通过、提示里有对应那句、发 warning，恢复照常完成、恢复前副本在；
+        请求带 sync（云存档自动同步）→ 照旧拒绝；任何拒绝都不动当前存档"""
         self.backup()
         original = self.archive.read_bytes()
-        for field, value in (
-            ("id", "0100000000000001"),
-            ("version", 2),
-            ("contentIdentity", "b" * 64),
-        ):
+        def sync_preview():
+            return saves.inspect(self.context(operation="saveInspect", path=str(self.archive), sync=True))
+        self.archive.write_bytes(original)
+        self.rewrite_archive(lambda m: m["game"].update({"id": "0100000000000001"}))
+        with self.assertRaises(Failure):
+            self.preview()
+        for field, value in (("version", 2), ("contentIdentity", "b" * 64)):
             with self.subTest(field=field):
                 self.archive.write_bytes(original)
-                self.rewrite_archive(
-                    lambda m, field=field, value=value: m["game"].update({field: value})
-                )
+                self.rewrite_archive(lambda m, field=field, value=value: m["game"].update({field: value}))
                 with self.assertRaises(Failure):
-                    self.preview()
+                    sync_preview()
+                c = self.context(operation="saveInspect", path=str(self.archive))
+                got = saves.inspect(c)
+                self.assertIn(saves.VERSION_NOTICE, got["notice"])
+                self.assertEqual([(d["code"], d["severity"]) for d in c.job["diagnostics"]], [("save_version", "warning")])
                 self.assertEqual((self.root / PROGRESS).read_bytes(), b"checkpoint-one")
+                r = self.context(operation="saveRestore", path=str(self.archive), **got)
+                result = saves.restore(r)
+                self.assertTrue(result.get("previousBackup"))
+                self.assertTrue(Path(result["previousBackup"]).exists())
         self.archive.write_bytes(original)
         other = "00000000000000020000000000000000"
         self.put(
@@ -342,7 +364,11 @@ class SaveTests(unittest.TestCase):
         )
         self.put(saves.SAVE_INDEX, synthetic_index([(1, GID, 1, other)]))
         with self.assertRaises(Failure):
-            self.preview()
+            sync_preview()
+        c = self.context(operation="saveInspect", path=str(self.archive))
+        got = saves.inspect(c)
+        self.assertIn(saves.USER_NOTICE, got["notice"])
+        self.assertEqual([(d["code"], d["severity"]) for d in c.job["diagnostics"]], [("save_wrong_user", "warning")])
 
     def test_index_owners_override_current_profile_and_profiles_are_labels_only(self):
         owner = "78626c000000000153574e4154495645"
@@ -441,17 +467,59 @@ class SaveTests(unittest.TestCase):
         with self.assertRaises(Failure):
             self.backup()
 
-    def test_changed_archive_or_target_requires_a_new_preview(self):
+    def test_changed_archive_or_target_after_preview_warns_and_restores(self):
+        """维护者 11-17（按新规矩改：原先检查后当前存档 / 备份又变了就拒绝、要重新检查）。期望手写：
+        检查后当前存档又存了一次（three）→ 照常恢复成备份里的 one、发 warning save_changed，执行时现拍的恢复前副本里是 three；
+        检查后备份又被改过（按现在内容重新校验通过）→ 同样照常恢复；云存档自动同步（sync）照旧拒绝、不动当前存档"""
         c = self.prepare_restore()
         self.put(PROGRESS, b"checkpoint-three")
+        sync = self.context(**(c.r | dict(taskId=uuid.uuid4().hex, sync=True)))
         with self.assertRaises(Failure):
-            saves.restore(c)
+            saves.restore(sync)
         self.assertEqual((self.root / PROGRESS).read_bytes(), b"checkpoint-three")
-        c.r.update(self.preview())
+        result = saves.restore(c)
+        self.assertEqual((self.root / PROGRESS).read_bytes(), b"checkpoint-one")
+        self.assertIn(("save_changed", "warning"), [(d["code"], d["severity"]) for d in c.job["diagnostics"]])
+        with zipfile.ZipFile(result["previousBackup"]) as z:
+            self.assertEqual(z.read("payload/" + PROGRESS), b"checkpoint-three")
+        c2 = self.context(operation="saveRestore", path=str(self.archive), **self.preview())
         self.rewrite_archive(lambda m: m.update(createdAt="changed"))
+        saves.restore(c2)
+        self.assertEqual((self.root / PROGRESS).read_bytes(), b"checkpoint-one")
+        self.assertIn(("save_changed", "warning"), [(d["code"], d["severity"]) for d in c2.job["diagnostics"]])
+
+    def corrupt_payload(self, name):
+        """备份里 payload/<name> 换成同长的别的字节（CRC 与 SHA 都对不上，大小不变）"""
+        with zipfile.ZipFile(self.archive) as z:
+            data = {i.filename: z.read(i) for i in z.infolist()}
+        raw = bytearray(data["payload/" + name]); raw[-1] ^= 0xFF; data["payload/" + name] = bytes(raw)
+        with zipfile.ZipFile(self.archive, "w") as z:
+            for n, content in data.items():
+                z.writestr(n, content)
+
+    def test_damaged_file_keeps_target_original_and_restores_the_rest(self):
+        """维护者 11-17：备份里个别文件 CRC / SHA 坏了不再整份拒绝。期望手写：进度文件坏 → 检查照常通过、提示点名它、发 warning save_damaged；
+        恢复后这个文件保留当前存档原来的 two，其余照常恢复；账号索引坏 → 照旧拒绝；云存档自动同步照旧拒绝"""
+        self.backup()
+        other = "bis/user/save/0000000000000001/0/other.bin"
+        self.put(other, b"other-one")
+        self.archive.unlink(); self.backup()
+        original = self.archive.read_bytes()
+        self.put(PROGRESS, b"checkpoint-two"); self.put(other, b"other-two")
+        self.corrupt_payload(PROGRESS)
         with self.assertRaises(Failure):
-            saves.restore(c)
-        self.assertEqual((self.root / PROGRESS).read_bytes(), b"checkpoint-three")
+            saves.inspect(self.context(operation="saveInspect", path=str(self.archive), sync=True))
+        c = self.context(operation="saveInspect", path=str(self.archive))
+        got = saves.inspect(c)
+        self.assertIn(PROGRESS, got["notice"])
+        self.assertIn(("save_damaged", "warning"), [(d["code"], d["severity"]) for d in c.job["diagnostics"]])
+        saves.restore(self.context(operation="saveRestore", path=str(self.archive), **got))
+        self.assertEqual((self.root / PROGRESS).read_bytes(), b"checkpoint-two")   # 坏的不写，留原来的
+        self.assertEqual((self.root / other).read_bytes(), b"other-one")   # 其余照常恢复成备份里的
+        self.archive.write_bytes(original)
+        self.corrupt_payload(saves.SAVE_INDEX)
+        with self.assertRaises(Failure):
+            self.preview()
 
     def test_unsafe_and_corrupt_archives_are_rejected_without_writes(self):
         self.backup()
@@ -518,6 +586,19 @@ class SaveTests(unittest.TestCase):
         with self.assertRaises(Failure):
             self.backup()
         self.assertEqual(self.archive.read_bytes(), b"existing backup")
+
+    def test_backup_on_drive_without_hard_links(self):
+        # v0.3.1：存档备份放到位用硬链接（不覆盖地落盘）；exFAT / FAT32 建不了硬链接（WinError 1 / EPERM）→ 退回「核没有同名再改名」，
+        #   备份照样落盘、内容完整；已有同名备份时照旧不覆盖
+        def no_links(*a, **k):
+            raise OSError(1, "Incorrect function")
+        with patch.object(saves.os, "link", no_links):
+            self.backup()
+            self.assertTrue(self.archive.is_file() and self.archive.stat().st_size > 0)
+            before = self.archive.read_bytes()
+            with self.assertRaises(Failure):
+                self.backup()
+            self.assertEqual(self.archive.read_bytes(), before)
 
     def test_disk_shortage_and_cancellation_leave_original_intact(self):
         c = self.prepare_restore()
@@ -713,7 +794,8 @@ saves.restore(c)
     def test_live_execution_lock_blocks_backup(self):
         import filelock
 
-        with (self.directory / "library/.execution.lock").open("a") as f:
+        import core
+        with (self.directory / "library/.execution.lock").open("a") as f, patch.object(core, "LOCK_WAIT_S", 0.3):   # 排队上限调短（同 test_filelock / test_probe_jobs 的 0.3 秒口径）：这里核的是「锁被占 → 报忙、不动东西」，不是等满产品缺省 30 秒（11-14 门禁提速：原先每例白等 30 秒）
             filelock.try_lock(f)
             with self.assertRaises(Failure):
                 self.backup()
@@ -941,9 +1023,20 @@ class ExternalImportTests(unittest.TestCase):
         log.write_text("启动失败，没灌入", encoding="utf-8")
         saves.finish_seed(c, GID, log)
         self.assertEqual(saves.claim_seed(c, GID), pending)   # 没灌成功：留着，下次启动再放
-        log.write_text("S2A 带存档起局：account ← x（2 个文件，15 字节）", encoding="utf-8")
+        # 审计 P1-156：只有「当前用户」行和前一类成功行、后一类挂不上（没有全部完成那句）→ 种子留着
+        log.write_text("S2A 带存档起局：当前用户 0123\nS2A 带存档起局：account ← x（2 个文件，15 字节）\n"
+                       "带存档起局：挂 device 存档失败", encoding="utf-8")
+        saves.finish_seed(c, GID, log)
+        self.assertEqual(saves.claim_seed(c, GID), pending)
+        log.write_text("S2A 带存档起局：account ← x（2 个文件，15 字节）\nS2A 带存档起局完成：1 类全部灌入", encoding="utf-8")
         saves.finish_seed(c, GID, log)
         self.assertIsNone(saves.claim_seed(c, GID))
+
+    def test_seed_done_line_matches_service_layer(self):
+        # 审计 P1-156：作业层删种子认的那句，必须是服务层每类都灌入后才打的那句（一字不差）
+        cs = (Path(__file__).resolve().parents[3] / "services/S2A.Services/Saves.cs").read_text(encoding="utf-8")
+        self.assertIn(f'SeedAllDoneLine = "{saves.SEED_DONE_LINE}"', cs)
+        self.assertNotIn(saves.SEED_DONE_LINE, "S2A 带存档起局：当前用户 0123")
 
     def test_never_played_game_changed_since_preview_is_refused(self):
         import shutil
@@ -985,6 +1078,82 @@ class ExternalImportTests(unittest.TestCase):
         second = saves.inspect(self.context(operation="saveInspect", path=str(src)))
         self.assertEqual(first["archiveSha256"], second["archiveSha256"])
         self.assertEqual(len(list((self.directory / "library/save-imports" / GID).glob("*.s2asave"))), 1)
+
+
+class LocalPlayerImportTests(unittest.TestCase):
+    """本地玩家（#623）：社区存档导入进当前玩家（请求的 player 字段，同起局）那个用户号的账号存档，别人的不动。
+    期望手写：第一个玩家 = 存档位置 SaveData 里记的用户号（user 文件，或 Ryujinx 导出的 ExtraData0），都没有 = Ryujinx 缺省用户 USER；
+    其他玩家 = 请求里的用户号（同 services/S2A.Services/LocalPlayer.cs 起局选用户的规则）"""
+
+    setUp = SaveTests.setUp
+    context = SaveTests.context
+    put = SaveTests.put
+    community = ExternalImportTests.community
+
+    HONG = "d7a43a96495d0a594e615dd88587b6bf"
+    THIRD = "aaaaaaaaaaaaaaaabbbbbbbbbbbbbbbb"
+
+    def players(self, *extra):
+        """账号存档：USER → 存档 1（setUp 已有 checkpoint-one），HONG → 3，extra 里的 → 4、5…"""
+        rows = [(1, GID, 1, USER), (3, GID, 1, self.HONG)] + [(4 + i, GID, 1, u) for i, u in enumerate(extra)]
+        self.put(saves.SAVE_INDEX, synthetic_index(rows))
+        for sid, _, _, user in rows[1:]:
+            self.put("bis/user/save/%016x/0/progress.bin" % sid, b"own-" + user[:4].encode())
+
+    def import_as(self, player, data=b"community"):
+        src = self.community("JKSV-" + uuid.uuid4().hex[:6], {"Synthetic game/Player - 2026-10-20/progress.bin": data})
+        with patch.object(saves.save_formats, "detect", return_value=[]):
+            preview = saves.inspect(self.context(operation="saveInspect", path=str(src), player=player))
+            return saves.restore(self.context(operation="saveRestore", path=str(src), player=player, **preview))
+
+    def slots(self, *sids):
+        return [(self.root / ("bis/user/save/%016x/0/progress.bin" % sid)).read_bytes() for sid in sids]
+
+    def test_second_player_gets_the_import_and_the_first_keeps_his(self):
+        self.players()
+        self.assertTrue(self.import_as(dict(user=self.HONG, name="Hong", folder="SaveData-Hong"))["committed"])
+        self.assertEqual(self.slots(1, 3), [b"checkpoint-one", b"community"])
+
+    def test_first_player_without_a_recorded_user_is_the_default_user(self):
+        self.players()
+        self.assertTrue(self.import_as(dict(user="first", name="", folder="SaveData"))["committed"])
+        self.assertEqual(self.slots(1, 3), [b"community", b"own-d7a4"])
+
+    def test_first_player_follows_the_user_recorded_in_his_save_folder(self):
+        self.players(self.THIRD)
+        folder = self.root.parent / "SaveData"
+        folder.mkdir()
+        (folder / "user").write_text(self.THIRD.upper() + "\n")
+        self.import_as(dict(user="first", name="Ming", folder="SaveData"), b"by-user-file")
+        self.assertEqual(self.slots(1, 3, 4), [b"checkpoint-one", b"own-d7a4", b"by-user-file"])
+        # 没有 user 文件、只有 Ryujinx 导出的 ExtraData0（程序号 @0，用户号两段小端 @0x8 / @0x10，类型 1 @0x20）
+        (folder / "user").unlink()
+        meta = struct.pack("<4Q", int(GID, 16), 0xAAAAAAAAAAAAAAAA, 0xBBBBBBBBBBBBBBBB, 0) + bytes([1]) + bytes(0x1F)
+        (folder / "export/0000000000000004").mkdir(parents=True)
+        (folder / "export/0000000000000004/ExtraData0").write_bytes(meta)
+        self.import_as(dict(user="first", name="Ming", folder="SaveData"), b"by-extra-data")
+        self.assertEqual(self.slots(1, 3, 4), [b"checkpoint-one", b"own-d7a4", b"by-extra-data"])
+
+    def test_player_without_a_save_for_this_game_is_told_to_play_first(self):
+        self.put(saves.SAVE_INDEX, synthetic_index([(1, GID, 1, USER)]))
+        with self.assertRaises(Failure) as e:
+            self.import_as(dict(user=self.HONG, name="Hong", folder="SaveData-Hong"))
+        self.assertEqual(e.exception.code, "save_no_target")
+        self.assertIn("这位玩家", str(e.exception))
+        self.assertEqual(self.slots(1), [b"checkpoint-one"])
+
+    def test_without_a_player_several_users_still_cannot_be_told_apart(self):
+        self.players()
+        with self.assertRaises(Failure) as e:
+            self.import_as(None)
+        self.assertIn("多个用户", str(e.exception))
+        self.assertEqual(self.slots(1, 3), [b"checkpoint-one", b"own-d7a4"])
+
+    def test_bad_player_is_rejected(self):
+        self.players()
+        with self.assertRaises(Failure):
+            self.import_as(dict(user=self.HONG, name="Hong", folder="../SaveData"))
+        self.assertEqual(self.slots(1, 3), [b"checkpoint-one", b"own-d7a4"])
 
 
 if __name__ == "__main__":

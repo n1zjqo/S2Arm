@@ -26,6 +26,7 @@ class Explain(unittest.TestCase):
                 ('Developer services error 9120: Your maximum App ID limit has been reached.', 'free_appid_limit'),   # 带 Apple 错误码的转述形态
                 ("Developer API error 9401 (HTTP Some(200)): An App ID with Identifier 'io.s2arm.games.abcde12345' is not available. Please enter a different string.", 'app_id_taken'),   # #408 Windows plumesign 原文
                 ('Developer Mode is disabled', 'developer_mode_required'),
+                ('    unexpected response from device: missing PairRecordData in pair record response', 'device_pairing_required'),   # #1198 Windows plumesign 原文
                 ('完全看不懂的报错', 'device_install_failed')):
             with self.subTest(text=text): self.assertEqual(impactor.explain(text), code)
 
@@ -124,3 +125,44 @@ class SelectedTeamTests(unittest.TestCase):
             (store / "accounts.json").write_text("{broken")
             self.assertIsNone(impactor.selected_team(d))
         self.assertIsNone(impactor.selected_team("/nonexistent-dir"))
+
+
+class UnselectedAccountTests(unittest.TestCase):
+    """D-ZM37：账号存档存了 Apple ID 却没选中（同版 v2.7.2 plume_store：删掉选中的那个只把 selected_account 置空），plumesign 报
+    「No account selected」。只存一个 → 用官方 plumesign account switch 选上；存多个 → 不替玩家挑"""
+    def setUp(self):
+        self.d = tempfile.mkdtemp(); self.addCleanup(lambda: __import__("shutil").rmtree(self.d, ignore_errors=True))
+        self.f = Path(self.d) / "PlumeImpactor" / "accounts.json"; self.f.parent.mkdir()
+
+    def put(self, selected, emails):
+        self.f.write_text(json.dumps({"selected_account": selected, "accounts": {e: {"team_id": "ABCDE12345"} for e in emails}}))
+
+    def test_unselected(self):
+        for selected, emails, want in ((None, ["a@x"], ["a@x"]), ("gone@x", ["b@x", "a@x"], ["a@x", "b@x"]),
+                                       ("a@x", ["a@x", "b@x"], []), (None, [], [])):
+            with self.subTest(selected=selected, emails=emails):
+                self.put(selected, emails); self.assertEqual(impactor.unselected_accounts(self.d), want)
+        self.f.write_text("{broken"); self.assertEqual(impactor.unselected_accounts(self.d), [])
+
+    def test_single_account_switched_by_plumesign(self):
+        self.put(None, ["a@x"]); calls = []
+        def fake_run(cmd, **kw):   # 官方 plumesign account switch 的效果：选中那个邮箱
+            calls.append(cmd); self.put(cmd[-1], ["a@x"]); return mock.Mock(returncode=0)
+        with mock.patch.object(impactor.subprocess, "run", fake_run):
+            self.assertEqual(impactor.select_only_account("plumesign.exe", self.d), "a@x")
+        self.assertEqual(calls, [["plumesign.exe", "account", "switch", "a@x"]])
+        self.assertEqual(impactor.selected_team(self.d), "ABCDE12345")
+
+    def test_many_or_selected_not_touched(self):
+        for selected, emails in ((None, ["a@x", "b@x"]), ("a@x", ["a@x"])):
+            with self.subTest(selected=selected, emails=emails), mock.patch.object(impactor.subprocess, "run") as run:
+                self.put(selected, emails)
+                self.assertIsNone(impactor.select_only_account("plumesign.exe", self.d)); run.assert_not_called()
+
+    def test_switch_failed_is_none(self):
+        self.put(None, ["a@x"])
+        with mock.patch.object(impactor.subprocess, "run", return_value=mock.Mock(returncode=1)):
+            self.assertIsNone(impactor.select_only_account("plumesign.exe", self.d))
+
+    def test_no_account_selected_text(self):   # D-ZM37 原文
+        self.assertEqual(impactor.explain("Error: No account selected. Please login first using 'plumesign account login'"), "apple_not_signed_in")   # #edc5f5：从没登录 / 没选中不再说成「登录已过期」

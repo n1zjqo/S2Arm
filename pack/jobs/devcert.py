@@ -62,11 +62,11 @@ def fetch_rcodesign(dest, side, cache=None):
         try:
             urllib.request.urlretrieve(RCODESIGN_DOWNLOAD + name, tmp)
         except OSError as e:
-            raise SystemExit(f"【红】取不到 {RCODESIGN_DOWNLOAD + name}（{e}）：在能连 GitHub 的机器上下好放进 {cache}（或用 S2A_RCODESIGN_CACHE 指过去）再打")
+            raise SystemExit(f"【红】取不到 {RCODESIGN_DOWNLOAD + name}（{e}）：在能连 GitHub 的机器上下好放进 {cache}（或用 S2A_RCODESIGN_CACHE 指过去）再打")  # 非玩家句
         os.replace(tmp, src)
     got = _h.sha256(src.read_bytes()).hexdigest()
     if got != want:
-        raise SystemExit(f"【红】{src} 的 SHA-256 是 {got}，钉的是 {want}：不是 apple-codesign {RCODESIGN_VERSION} 官方发布件，拒打")
+        raise SystemExit(f"【红】{src} 的 SHA-256 是 {got}，钉的是 {want}：不是 apple-codesign {RCODESIGN_VERSION} 官方发布件，拒打")  # 非玩家句
     dest.mkdir(parents=True, exist_ok=True)
     top = name.rsplit(".tar.gz", 1)[0].rsplit(".zip", 1)[0]
     for inner, out in ((member, member), ("COPYING", "LICENSE-apple-codesign-MPL-2.0.txt")):
@@ -78,7 +78,7 @@ def fetch_rcodesign(dest, side, cache=None):
                 data = t.extractfile(f"{top}/{inner}").read()
         (dest / out).write_bytes(data)
     os.chmod(dest / member, 0o755)
-    (dest / "来源.txt").write_text(f"rcodesign（apple-codesign {RCODESIGN_VERSION}，Gregory Szorc，MPL-2.0：LICENSE-apple-codesign-MPL-2.0.txt），官方发布件原样附带。\n"
+    (dest / "来源.txt").write_text(f"rcodesign（apple-codesign {RCODESIGN_VERSION}，Gregory Szorc，MPL-2.0：LICENSE-apple-codesign-MPL-2.0.txt），官方发布件原样附带。\n"  # 非玩家句
                                   f"来源：{RCODESIGN_DOWNLOAD}{name}\n源码：{RCODESIGN_SOURCE}\n", encoding="utf-8")
     return dest / member
 
@@ -257,7 +257,7 @@ def normalize_p12(src, dest, password):
                 os.close(cr)
             ok, why = b.returncode == 0, why + b.stderr.decode(errors="replace")
         elif a.returncode == 0:
-            why += "；p12 里缺私钥或证书"
+            why += "；p12 里缺私钥或证书"  # 非玩家句
     if not ok or not Path(dest).is_file():
         Path(dest).unlink(missing_ok=True)
         raise Failure("证书打不开：密码不对，或 .p12 文件坏了。", code="devcert_password", internal=why.strip()[-400:])
@@ -299,7 +299,7 @@ class Secrets:
         r = subprocess.run(["/usr/bin/security", "-i"], input=f'add-generic-password -U -s {KEYCHAIN_SERVICE} -a {account} -l "S2Arm developer certificate" -w {encoded}\n',
                            capture_output=True, text=True)
         if r.returncode or "error" in (r.stdout + r.stderr).lower():
-            raise Failure("证书密码没存进钥匙串：" + (r.stderr or r.stdout).strip()[-200:], code="devcert_keychain")
+            raise Failure("证书密码没存进钥匙串：" + (r.stderr or r.stdout).strip()[-200:], code="devcert_keychain")  # 非玩家句
 
     def load(self, account):
         if os.name == "nt":
@@ -455,5 +455,7 @@ def sign_app(c, app, log):
         # --team-name：团队号写进签名（苹果发的证书 rcodesign 会自己从证书读，这里显式给，免得认不出的证书签出「没有团队号」的签名）。
         # -e 是「作用范围:值」格式、按第一个冒号拆：绝对路径带盘符（R:\…，Windows 实机 11-10 实测权限挂到了不存在的路径「R」上、主程序没权限）
         #   或目录名带冒号都会拆错，所以在权限文件所在目录里跑、只传不含冒号的文件名
-        c.run([rcs, "sign", "--p12-file", p12, "--p12-password-file", pf, "--team-name", got["teamId"], "-e", ef.name, app], log, cwd=ef.parent)
+        # --timestamp-url none（#794）：rcodesign 缺省向苹果时间戳服务器（timestamp.apple.com/ts01）要安全时间戳，连不上就整次签名失败、装不了也更新不了。
+        #   开发签名装自己的设备不需要安全时间戳（苹果自己的 codesign 对开发签名也不打，pack/dev_sign.py 同样 --timestamp=none）
+        c.run([rcs, "sign", "--p12-file", p12, "--p12-password-file", pf, "--team-name", got["teamId"], "--timestamp-url", "none", "-e", ef.name, app], log, cwd=ef.parent)
     return got["bundleId"], got

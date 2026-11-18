@@ -1,3 +1,6 @@
+#ifdef __ANDROID__
+#include <android/log.h>
+#endif
 #include "runtime.h"
 #include "host_android.h"
 #include "../dguard_android.h"
@@ -14,8 +17,10 @@
 #include "guest_main.h"
 #include "guest_signal.h"
 #include "s2a_native.h"
+#include "s2a_session.h"
 #include "s2a_gfx_mode.h"   // 冻结的图形模式（direct_session.c）：与选择器提交的 NVN 直连表对账
 #include "direct/provider_vk.h"   // 弱符号：没有 provider 的构建里为 NULL
+#include <errno.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
@@ -32,6 +37,7 @@ void load_modules(const char *, const char **, int);
 void load_modules_from_source(const struct s2a_loader_source *, const char **, int);
 void s2a_caps_apply(const char *);   // runtime/src/caps.c
 void s2a_fps_start(const char *);    // runtime/src/fps.c
+void s2a_ql_boot_mode(int docked);   // runtime/src/qladder_host.c
 unsigned s2a_unresolved_count(void);
 uint64_t s2a_mem_init(const char *);
 void *guest_sym(const char *);
@@ -64,6 +70,10 @@ static int failed(int error, int services_error, const char *why) {
     g_status.services_error = services_error;
     pthread_mutex_unlock(&g_lock);
     // 既有 HostApi 异步请求退出；此处不销毁仍可能使用中的 guest 内存、服务或 lease。
+    // 结束原因同时进会话日志：stop detail 只交给外壳，外壳关窗后就看不到了。用户停止 / guest 正常返回不算红。
+    int red = error != S2A_RUNTIME_STOP && error != S2A_RUNTIME_RETURNED;
+    fprintf(stderr, "[s2a] %sruntime %s %d (services %d): %s\n", red ? "【红】" : "", red ? "failed" : "ended",
+            error, services_error, why ? why : "");
     g_host->stop->request_stop(g_host->host, S2A_HOST_STOP_ERROR, why);
     return error;
 }
@@ -187,6 +197,15 @@ static int run_common(const struct s2a_android_runtime_request *r,
             frozen->mode == 1 ? "direct" : "generic", frozen->reason,
             frozen->counts.devices, frozen->counts.queues, frozen->counts.workers,
             frozen->counts.consumers);
+#ifdef __ANDROID__
+        // 同一行也直接写系统日志：这时 stderr 还没被泵进 logcat，发布包上这一行只会在下一局
+        // 以「prev|」回放出现（真机实测），按本局进程核对实际图形路径的工具在当局读不到它。
+        __android_log_print(ANDROID_LOG_INFO, "S2Arm",
+            "[s2a] graphics selection: %s (%s), devices=%u queues=%u workers=%u consumers=%u",
+            frozen->mode == 1 ? "direct" : "generic", frozen->reason,
+            frozen->counts.devices, frozen->counts.queues, frozen->counts.workers,
+            frozen->counts.consumers);
+#endif
         if (frozen->mode == 1) {
             if (!s2a_direct_frontend_ready || !s2a_direct_frontend_ready())
                 return failed(S2A_RUNTIME_DIRECT, S2A_DIRECT_RES_UNSUPPORTED,
@@ -219,6 +238,13 @@ static int run_common(const struct s2a_android_runtime_request *r,
         } else names[count++] = r->module_names[i];
     }
     // 包内能力清单（产物根 s2a_caps.tsv，tools/make_pack.py 放进游戏数据根，iOS / Mac 同一份）：装载前读，只在环境变量未设时写 S2A_WIDEN_CAPS / S2A_FPS60
+    // 停帧救场留下的「这款帧率补丁下次也关」（docs_android.h s2a_android_stall_off_apply；state 目录即上面绑的 S2A_DOCS）：要在能力清单之前，清单才不会把 60 帧写回 1
+    {
+        int stall = s2a_android_stall_off_apply(r->services.state_dir);
+        if (stall == 1) fprintf(stderr, "[s2a] 停帧救场标记 cpatch_stall_off 在：这款上次画面停住时关过帧率补丁，本局 60 帧 / 帧率补丁按关（S2A_FPS60=0）\n");
+        else if (stall == 2) fprintf(stderr, "[s2a] 停帧救场标记 cpatch_stall_off 在，但启动环境已给 S2A_FPS60，按启动环境\n");
+        else if (stall < 0) fprintf(stderr, "[s2a] 【红】停帧救场标记在，写 S2A_FPS60=0 失败（errno=%d），本局帧率补丁照清单\n", -stall);
+    }
     s2a_caps_apply(r->services.game_data_dir);
     if (r->module_source) {
         s2a_nro_table_load(r->services.game_data_dir);
@@ -256,6 +282,9 @@ static int run_common(const struct s2a_android_runtime_request *r,
     // 60 帧表（#48 D2）：改写器按包里 fps.tsv 打进的读槽指令要 fps.c 往键页槽里写值，没人写游戏就读到 0。
     //   表与 s2a_caps.tsv 同在游戏数据根（tools/make_pack.py）；开关 S2A_FPS60 已由上面的能力清单 / 启动环境给定。
     //   放在 VM 写入通道就绪之后：写入线程改游戏数据走 checked 写（fps_provider.c），要 writers / 跟踪已准备好。
+    // 档位梯子（#528 第 6 项）：读本机本款记下的帧率档，上限 = App 选的运行模式（console_mode 1 主机 / 0 掌机）。
+    //   要在文档根绑好之后（ladder.txt 在 S2A_DOCS 下）；换档本身在直连上屏每帧（hle_nvn.c → s2a_qp_frame → s2a_ql_host_frame）
+    s2a_ql_boot_mode(r->services.console_mode == 1);
     s2a_fps_start(r->services.game_data_dir);
     // 在执行任何 SDK 指令前解析全部必需入口。DT_INIT 仍由共享 loader 按逆依赖顺序遍历。
     static const char *const sdk[] = {"_init_libc0", "nnosInitialize", "_init_libc1",
@@ -398,7 +427,24 @@ uint64_t s2a_android_runtime_session(void) {
     return session;
 }
 // 强引用真实NativeAOT reverse-PInvoke，不能用Host.Init发生在另一线程代替附着。
+void s2a_capacity_child(void) __attribute__((weak));   // capacity_affinity.cpp（诊断探针等不带它的链接里没有）
+// 信号帧记录号 → 名字（Linux arm64 UAPI asm/sigcontext.h 的 *_MAGIC；1 = 帧里没有 FPSIMD 记录）
+static const char *sigframe_record_name(unsigned magic) {
+    switch (magic) {
+    case 1: return "FPSIMD 缺失";
+    case 0x54504902: return "TPIDR2（SME）";
+    case 0x54366345: return "ZA（SME，矩阵有内容）";
+    case 0x5a544e01: return "ZT（SME2）";
+    case 0x53564501: return "SVE（流式模式）";
+    case 0x46504d52: return "FPMR";
+    case 0x504f4530: return "POE";
+    case 0x45585401: return "EXTRA（帧外扩展）";
+    case 0x47435300: return "GCS";
+    default: return "未知";
+    }
+}
 int s2a_android_runtime_enter_guest_thread(void) {
+    if (s2a_capacity_child) s2a_capacity_child();   // 先把继承来的窄亲和掩码放宽，再做下面的准入
     uint64_t session = s2a_android_runtime_session();
     if (!session) return S2A_RUNTIME_ARGUMENT;
     if (stop_requested()) return failed(S2A_RUNTIME_STOP, 0, "stop before managed thread attach");
@@ -409,9 +455,36 @@ int s2a_android_runtime_enter_guest_thread(void) {
         status.session_id != session || status.state != S2A_SERVICES_READY || status.error)
         return failed(S2A_RUNTIME_SERVICES, rc ? rc : status.error, "managed guest thread attach failed");
     if (stop_requested()) return failed(S2A_RUNTIME_STOP, 0, "stop after managed thread attach");
-    if (s2a_android_fault_probe()) return failed(S2A_RUNTIME_SIGNALS, 0, "guest thread fault self-probe failed");
+    int probe = s2a_android_fault_probe();
+    if (probe) {
+        // 自检不让起局崩（#573）：信号帧里有本机认不出的记录时探针判 ENOTSUP 返回，这里说清是哪种记录、请玩家去 #573 反馈再停。
+        //   这句经 HostApi stop 原样进玩家看到的「S2Arm session ended: …」提示
+        static char why[320];
+        unsigned record = s2a_android_fault_unsupported_record();
+        if (probe == ENOTSUP)
+            snprintf(why, sizeof why, "缺页自检没过：这台设备的信号帧里有 S2Arm 还接不住的「%s」记录（0x%08x），游戏没法起局。"
+                     "请到 GitHub #573 留言告诉我们机型和系统版本 / Fault self-check failed: unsupported signal frame record %s (0x%08x); "
+                     "please report your device on GitHub #573", sigframe_record_name(record), record, sigframe_record_name(record), record);
+        else
+            snprintf(why, sizeof why, "缺页自检没过：故意制造的缺页没有被 S2Arm 接住（错误 %d），游戏没法起局。请到 GitHub #573 留言告诉我们机型和系统版本 / "
+                     "Fault self-check failed (error %d); please report your device on GitHub #573", probe, probe);
+        return failed(S2A_RUNTIME_SIGNALS, probe, why);
+    }
     if (!s2a_track_runtime_ready()) return failed(S2A_RUNTIME_TRACKING, 0, "guest thread final tracking admission failed");
     if (stop_requested()) return failed(S2A_RUNTIME_STOP, 0, "stop after guest thread self-probe");
+    return 0;
+}
+
+static int publish_current(void) { return s2a_session_running(s2a_session_generation()); }
+int s2a_android_runtime_publish_running(void) {
+    int rc = s2a_android_host_publish_running(publish_current);
+    if (rc > 0) return failed(S2A_RUNTIME_STOP, 0, "stop before session RUNNING publication");
+    if (!rc) return 0;
+    int state = s2a_host_session_state();
+    if (state == S2A_SESSION_FAILED) return failed(S2A_RUNTIME_SERVICES, 0, "session failed before RUNNING publication");
+    if (s2a_session_stop_requested()) return failed(S2A_RUNTIME_STOP, 0, "session exiting before RUNNING publication");
+    fprintf(stderr, "[s2a] 【红】共用会话运行态没发布：代 %u 状态 %d（期望本代 STARTING=%d），没有停止或失败，照常进 SDK\n",
+            s2a_session_generation(), state, S2A_SESSION_STARTING);
     return 0;
 }
 

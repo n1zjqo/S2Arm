@@ -34,9 +34,14 @@ public class MainActivity extends Activity
     private TouchPadView touchPad;      // on-screen gamepad over the surface
     private String touchMode = "auto";  // auto: shown unless a physical gamepad is connected
     private boolean touchLog;           // debug: log every change of the published input
+    private TouchLayoutStore touchLayouts;   // the player's layout for this game (P11)
+    private LinearLayout touchEditBar;       // Save / Default / Cancel while dragging controls
+    private static final String PREF_TOUCH_PASSTHROUGH = "touchPassthrough.";   // + layout file name: per game
     private String lastInputLog = "";
     private int loggedLayout;
     private static final int PICK_PACKAGE = 1;
+    private static final int PICK_TOUCH_LAYOUT = 2, EXPORT_TOUCH_LAYOUT = 3;
+    private byte[] touchExport;
     private GameLibrary library;   // installed game packages (import + verification)
     private HostKeyboard hostKeyboard;
     private LegacyTextInput legacyTextInput;
@@ -74,6 +79,19 @@ public class MainActivity extends Activity
     private final android.os.Handler lifecycleProbe = new android.os.Handler(android.os.Looper.getMainLooper());
     private long lastLifecyclePresent;
     private final Runnable lifecycleSample = this::sampleLifecyclePresent;
+    // 游玩时间（共用 runtime/src/playtime.c）：游戏在前台时每 10 秒落一次盘（同 iOS app.m 的 10 秒心跳），闪退 / 被杀最多丢这 10 秒；
+    //   onPause 与收局前另各落一次。计时本身在原生上屏出口里，这里只管什么时候写文件
+    // 停帧看门的屏上提示（StallNotice 定显示哪条）：画面下方一条半透明字，不可点、不挡操作
+    private final StallNotice stallState = new StallNotice();
+    private TextView stallText;
+    private final Runnable stallRender = this::renderStallNotice;
+    private final Runnable playtimeTick = new Runnable() {
+        @Override public void run() {
+            if (!resumed || !gameMode || !runtimeLoaded || gameStopping) return;
+            if (host != 0) NativeBridge.flushPlaytime();
+            lifecycleProbe.postDelayed(this, 10000);
+        }
+    };
     // B3（debug.s2a.buffer_geometry）：交换链缓冲按渲染目标尺寸出图时，native 把
     // 缓冲尺寸报上来；这里按它把 surface 的 frame 布成同比例居中矩形，
     // 合成器的 SCALE_TO_WINDOW 拉伸才不变形（native_window 没有 SCALE_FIT）。
@@ -88,7 +106,10 @@ public class MainActivity extends Activity
     private final Runnable saveAtomicSample = new Runnable() {
         @Override public void run() {
             if (!gameMode || gameStopping || !runtimeLoaded) return;
-            if (NativeBridge.pollSaveAtomic() != 0)
+            int bits = NativeBridge.pollSaveAtomic();
+            // 负数 = 状态未知（服务层缺导出，native 已报红）：不当原因位、不提示，本局不再轮询
+            if (bits < 0) { Log.e("S2Arm", "存档原子提交状态未知（pollSaveAtomic=" + bits + "），本局不提示"); return; }
+            if (bits != 0)
                 android.widget.Toast.makeText(MainActivity.this, SAVE_ATOMIC_NOTICE, android.widget.Toast.LENGTH_LONG).show();
             saveAtomicProbe.postDelayed(this, 1000);
         }
@@ -102,6 +123,7 @@ public class MainActivity extends Activity
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
         DebugGate.scrub(getIntent());   // 调试参数两道门（DebugGate）：门没开，后面一律读不到
+        if (state != null) touchExport = state.getByteArray("touchLayoutExport");
         gameMode = this instanceof GameActivity;
         if (gameMode) {
             if (GameActivity.libraryRoute(getIntent(), GameSession.running())) {
@@ -148,7 +170,9 @@ public class MainActivity extends Activity
             // A5/#163 读数落 logcat（采集的 logcat.txt）：数值变化才写一行，插电时
             // unavailable 只在状态变化时报一次；rails 是 Android 15+ 的 CPU/GPU 轨功耗
             //（插电也可读），event 是低频原始值行（保留电流原号，供真机对账）。
-            powerSampler = new SystemPowerSampler(this, lifecycleProbe, new SystemPowerSampler.Sink() {
+            powerSampler = new SystemPowerSampler(this, lifecycleProbe,
+                java.util.concurrent.Executors.newSingleThreadExecutor(r -> { Thread t = new Thread(r, "s2a-power-read"); t.setDaemon(true); return t; }),
+                getMainExecutor(), new SystemPowerSampler.Sink() {
                 private String lastBattery = "", lastRails = "";
                 @Override public void battery(double watts) {
                     String text = Double.isNaN(watts)
@@ -226,11 +250,27 @@ public class MainActivity extends Activity
             FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT,
             android.view.Gravity.TOP | android.view.Gravity.CENTER_HORIZONTAL);
         if (runtimeLoaded) {
-            touchPad = new TouchPadView(this, changed -> publishInput());
+            touchPad = new TouchPadView(this, new TouchPadView.Listener() {
+                @Override public void onTouchPad(TouchPad changed) { publishInput(); }
+                @Override public void onTouchMenu() { showTouchMenu(); }
+            });
             root.addView(touchPad, new FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+            touchLayouts = new TouchLayoutStore(new File(getFilesDir(), "touch-layouts"),
+                gameMode ? getIntent().getStringExtra(GameActivity.TITLE_EXTRA) : null);
+            loadTouchLayout();
             frameRate = new FrameRateOverlay(this);
             root.addView(frameRate, fpsLayout);
+            stallText = new TextView(this);
+            stallText.setTextColor(0xFFFFFFFF); stallText.setTextSize(15); stallText.setBackgroundColor(0xCC000000);
+            stallText.setGravity(android.view.Gravity.CENTER); stallText.setClickable(false); stallText.setFocusable(false);
+            { int sp = Math.round(10 * getResources().getDisplayMetrics().density); stallText.setPadding(sp * 2, sp, sp * 2, sp); }
+            stallText.setVisibility(android.view.View.GONE);
+            FrameLayout.LayoutParams stallLayout = new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT,
+                android.view.Gravity.BOTTOM | android.view.Gravity.CENTER_HORIZONTAL);
+            stallLayout.bottomMargin = Math.round(32 * getResources().getDisplayMetrics().density);
+            root.addView(stallText, stallLayout);
             updateFrameRate(getIntent());
         }
         root.setOnApplyWindowInsetsListener((view, insets) -> {
@@ -264,7 +304,7 @@ public class MainActivity extends Activity
             @Override public void onStatus(String text) { runOnUiThread(() -> {
                 if (isDestroyed()) return;
                 games.setText(text);
-                if (text.startsWith("Game admission failed:")) {
+                if (text.startsWith(getString(R.string.player_err_start))) {   // GameLibrary 起局失败（Game admission failed）
                     panel.setVisibility(android.view.View.VISIBLE);
                     games.setTextColor(0xFFFF5252);
                 }
@@ -275,13 +315,12 @@ public class MainActivity extends Activity
                     if (gameSession == null) {
                         gameSession = ready;
                         try { GameResume.publish(getCacheDir(), android.os.Process.myPid(), ready.spec); }
-                        catch (java.io.IOException error) { status.setText("Game startup failed: " + error.getMessage()); stopGame("session receipt failed", false); return; }
+                        catch (java.io.IOException error) { Log.e("S2Arm", "Game startup failed", error); status.setText(PlayerError.text(MainActivity.this, R.string.player_err_start, error)); stopGame("session receipt failed", false); return; }
                     }
                     tryStartGame();
                 });
             }
-        }, gameMode ? getIntent().getStringExtra(GameActivity.TITLE_EXTRA) : null,
-            gameMode && getIntent().getBooleanExtra(GameActivity.REVISION_EXTRA, false));
+        }, gameMode ? getIntent().getStringExtra(GameActivity.TITLE_EXTRA) : null);
         graphicsModePreference = graphicsModeFromIntent(getIntent());
         requestOrientation(getIntent());
         updateTouchPad();
@@ -301,8 +340,10 @@ public class MainActivity extends Activity
                 int mirrorError = NativeBridge.configureMirror(coldMirror == BootSpec.Mirror.ON);
                 if (mirrorError != 0) throw new IllegalStateException("Mirror switch configuration failed: " + mirrorError);
                 Log.i("S2Arm", "Mirror switch: " + coldMirror.value);
-                boolean inlineSme = getIntent() != null
-                    && getIntent().getBooleanExtra("s2arm.experimental_inline_sme_context", false);
+                // 缺省开（#573 / #736）：SME 核心（骁龙 8 Elite Gen 5 起）每个信号帧都带 TPIDR2 / ZA 记录，不认就接不住缺页；
+                //   这个开关只留给调试时关掉
+                boolean inlineSme = getIntent() == null
+                    || getIntent().getBooleanExtra("s2arm.experimental_inline_sme_context", true);
                 int error = NativeBridge.configureInlineSmeContext(inlineSme);
                 if (error != 0) throw new IllegalStateException("Signal context experiment configuration failed: " + error);
                 Log.i("S2Arm", "Inline SME signal context experiment: " + inlineSme);
@@ -343,6 +384,11 @@ public class MainActivity extends Activity
                 if (error != 0) throw new IllegalStateException("Threaded renderer configuration failed: " + error);
                 Log.i("S2Arm", "Threaded renderer (GPU emulation / Vulkan split): " + threadedMode
                     + (threadedExtra ? " (extra)" : " (default)"));
+                // 玩家画质选项（游戏库页「高画质 / 更省电」，缺省更省电）
+                boolean highQuality = getSharedPreferences("display", MODE_PRIVATE).getBoolean("quality_high", false);
+                error = NativeBridge.configureHighQuality(highQuality);
+                if (error != 0) throw new IllegalStateException("Quality configuration failed: " + error);
+                Log.i("S2Arm", "Quality: " + (highQuality ? "high" : "saver"));
             }
             // Last configuration before host creation; the shared services read this
             // same process environment on their normal startup path.
@@ -360,6 +406,7 @@ public class MainActivity extends Activity
             String game = gameMode ? null : apkGame();
             if (game != null) capabilities += "\n" + game;
             status.setText(capabilities);
+            applyTouchPassthrough();
             requestDebugLifecycle(getIntent());
         } catch (LinkageError | RuntimeException e) {
             Log.e("S2Arm", "Native host startup failed", e);
@@ -390,6 +437,12 @@ public class MainActivity extends Activity
             NativeBridge.load(library, app.sourceDir, app.splitSourceDirs, app.nativeLibraryDir);
             configureRedLogDir();
             configureDiagDir();
+            java.io.File externalFiles = getExternalFilesDir(null);
+            // 除了外挂驱动，原生收尾也靠这里存下的 files 目录删会话标记的 end（#528 第 15 项，lifecycle_android.c）：
+            //   每次装载后都要调、不能挪到起局之后，否则每次正常退局库页都会误报「上一局异常结束」（exit_order_test 守着这一行）
+            int gpuDriverRc = NativeBridge.configureGpuDriver(getFilesDir().getAbsolutePath(),
+                externalFiles == null ? "" : externalFiles.getAbsolutePath());
+            if (gpuDriverRc != 0) Log.w("S2Arm", "自定义驱动目录不可用（errno=" + gpuDriverRc + "）");
             try {
                 int frameLogRc = NativeBridge.configureFrameLogDir(getFilesDir().getAbsolutePath());
                 if (frameLogRc != 0) Log.w("S2Arm", "frame-log 目录不可用（errno=" + frameLogRc + "）");
@@ -579,16 +632,24 @@ public class MainActivity extends Activity
         } catch (java.io.IOException | RuntimeException | LinkageError error) {
             Log.e("S2Arm", "Game startup failed", error);
             panel.setVisibility(android.view.View.VISIBLE);
-            status.setText("Game startup failed: " + error.getMessage());
+            status.setText(PlayerError.text(this, R.string.player_err_start, error));
             stopGame("game startup failed", false);
         }
     }
 
+    private void stopGame(String why, boolean normal) { stopGame(why, normal, normal); }
+
     // normal 只表示“这是一次正常收局”（用户/游戏主动停止），异常清理（启动失败、
     // Activity 被销毁但没有正常结束会话）不能清 attempt 锁，否则下一局 AUTO 会误回 direct。
-    private void stopGame(String why, boolean normal) {
+    // cleanEnd（#528 第 15 项）：玩家或游戏自己结束了这一局，会话标记写成 end（干净收尾、待原生确认）。
+    //   原生优雅收尾走到最后一步才删它（lifecycle_android.c 的 s2a_sesmark_clear_home）；收尾中途失败或被兜底结束时 end 留着，
+    //   库页照样提示。运行时报错停局（HostApi 低内存 / 显卡设备丢失 / 不可恢复错误）也是 normal，但不算干净收尾，标记留着 fg。
+    //   没有原生宿主（host == 0）就没有这一局的标记，也没有原生收尾来删 end：不动标记。
+    private void stopGame(String why, boolean normal, boolean cleanEnd) {
         if (!gameMode || gameStopping) return;
         gameStopping = true;
+        if (cleanEnd && host != 0) sessionMark(LastSession.ENDING);
+        if (frameRate != null) frameRate.setResumed(false);
         saveAtomicProbe.removeCallbacks(saveAtomicSample);
         if (gameAudioFocus != null) gameAudioFocus.pause();
         try { GameResume.clear(getCacheDir()); }
@@ -597,6 +658,9 @@ public class MainActivity extends Activity
         if (surface != null) surface.setKeepScreenOn(false);
         maybeExportShaderCache("session");
         if (gameSession != null) gameSession.stop();
+        lifecycleProbe.removeCallbacks(playtimeTick);
+        // 游玩时间收局前落盘：原生收尾以 _exit 结束进程；收局路径 lifecycle.c 按 dlsym(RTLD_DEFAULT) 找它，安卓单库里不靠它（见坑记录同名一节）
+        if (host != 0) NativeBridge.flushPlaytime();
         // 先让原生收尾在 Surface 仍然有效时开始：Activity 一 finish，BufferQueue 就撤销，
         // GPU/present fence 的排空会和 surfaceDestroyed 抢同一份资源（真机上表现为收尾超时或崩溃）。
         // 进程最终由原生 _exit 结束；这里的延迟 finish 只是「原生没能结束进程」时的兜底。
@@ -605,6 +669,17 @@ public class MainActivity extends Activity
         // 原生收尾有自己的硬预算并会 _exit；这里只兜底「原生没能结束进程」的情况。
         // 提前 finish 会撤销 BufferQueue，surfaceDestroyed 的 1 秒期限随即打断正在排空的 GPU 收尾。
         new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(this::finishAndRemoveTask, 10000);
+    }
+
+    // #528 第 15 项：会话标记（LastSession，iOS sesdiag.c 的安卓侧），库页读它决定要不要提示「上一局异常结束」。
+    //   只在真有一局时写（游戏进程、有原生宿主、没在收局）：回前台 fg、进后台 bg。收局中不再改：干净收尾已写 end（原生收尾走完才删），异常收尾留着 fg。
+    private void markSession(boolean foreground) {
+        if (!gameMode || !runtimeLoaded || host == 0 || gameStopping) return;
+        sessionMark(foreground ? LastSession.FOREGROUND : LastSession.BACKGROUND);
+    }
+    private void sessionMark(int state) {
+        try { LastSession.mark(getFilesDir(), state); }
+        catch (java.io.IOException | RuntimeException error) { Log.e("S2Arm", "Session mark failed", error); }
     }
 
     // Per-game APK (tools/game_apk.py): the game this app was built for, and a load check of the
@@ -626,11 +701,12 @@ public class MainActivity extends Activity
         // A rejected cold-start configuration never owns a native game host.
         // Do not acquire the game storage lease for a session that cannot start.
         if (!runtimeLoaded || (gameMode && host == 0)) return;
+        markSession(true);
         if (gameMode && !gameStopping && gameAudioFocus != null) gameAudioFocus.resume();
         hostKeyboard.resume();
         legacyTextInput.resume();
         dguardNotice.resume();
-        frameRate.setResumed(true);
+        frameRate.setResumed(!gameStopping);
         current = this;
         applyGameWindow();
         library.scanImports();   // report the library; imports require an explicit staging target
@@ -640,6 +716,7 @@ public class MainActivity extends Activity
         if (powerState != null) powerState.start();
         tryStartGame();
         if (gameMode) lifecycleProbe.postDelayed(geometrySample, 500);   // B3 输出尺寸轮询（开关关时全部回落 MATCH_PARENT）
+        if (gameMode) { lifecycleProbe.removeCallbacks(playtimeTick); lifecycleProbe.postDelayed(playtimeTick, 10000); }
         if (gameMode && host != 0 && !gameStopping && getIntent().getBooleanExtra(GameActivity.LIFECYCLE_TEST_EXTRA, false)
                 && (getApplicationInfo().flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0) {
             lastLifecyclePresent = NativeBridge.gamePresentCount();
@@ -684,17 +761,20 @@ public class MainActivity extends Activity
     }
     @Override protected void onPause() {
         resumed = false;
+        markSession(false);
         if (gameAudioFocus != null) gameAudioFocus.pause();
         if (legacyTextInput != null) legacyTextInput.pause();
         if (dguardNotice != null) dguardNotice.pause();
         lifecycleProbe.removeCallbacks(lifecycleSample);
         lifecycleProbe.removeCallbacks(geometrySample);
+        lifecycleProbe.removeCallbacks(playtimeTick);
         if (runtimeLoaded) {
             clearInput();
             hostKeyboard.pause();
             frameRate.setResumed(false);
             // Rendering stops; the surface stays with the render thread until surfaceDestroyed.
             if (host != 0) NativeBridge.setForeground(host, false);
+            if (gameMode && host != 0) NativeBridge.flushPlaytime();   // 进后台落盘：之后失焦不再计时（同 iOS 进后台）
         }
         if (powerSampler != null) powerSampler.stop();
         if (systemTuning != null) systemTuning.stop();
@@ -721,9 +801,40 @@ public class MainActivity extends Activity
         super.onLowMemory();
         dguardMemoryWarning();   // 旧接口仍可能派到前台告警，同一条证据
     }
+    @Override protected void onSaveInstanceState(Bundle state) {
+        super.onSaveInstanceState(state);
+        if (touchExport != null) state.putByteArray("touchLayoutExport", touchExport);
+    }
+
     @Override protected void onActivityResult(int request, int result, android.content.Intent data) {
         super.onActivityResult(request, result, data);
-        if (runtimeLoaded && request == PICK_PACKAGE && result == RESULT_OK && data != null && data.getData() != null)
+        if (!runtimeLoaded) return;   // 运行库被拒的冷启动没有触屏层也没有库：两种结果都不处理
+        if (request == PICK_TOUCH_LAYOUT || request == EXPORT_TOUCH_LAYOUT) {
+            byte[] exported = touchExport;
+            touchExport = null;
+            if (result != RESULT_OK || data == null || data.getData() == null) return;
+            try {
+                if (request == PICK_TOUCH_LAYOUT) {
+                    byte[] bytes;
+                    try (java.io.InputStream input = getContentResolver().openInputStream(data.getData())) {
+                        bytes = TouchLayoutStore.readImport(input);
+                    }
+                    touchPad.setLayout(touchLayouts.importLayout(bytes));
+                } else {
+                    if (exported == null) exported = touchLayouts.exportBytes(touchPad.pad().layoutModel());
+                    try (java.io.OutputStream output = getContentResolver().openOutputStream(data.getData(), "wt")) {
+                        if (output == null) throw new java.io.IOException(getString(R.string.touch_layout_document_unavailable));
+                        output.write(exported);
+                    }
+                }
+                android.widget.Toast.makeText(this, request == PICK_TOUCH_LAYOUT
+                    ? R.string.touch_layout_imported : R.string.touch_layout_exported, android.widget.Toast.LENGTH_LONG).show();
+            } catch (java.io.IOException | IllegalArgumentException | SecurityException error) {
+                touchTransferFailed(request == PICK_TOUCH_LAYOUT, error);
+            }
+            return;
+        }
+        if (request == PICK_PACKAGE && result == RESULT_OK && data != null && data.getData() != null)
             library.importTree(data.getData());
     }
     @Override protected void onNewIntent(android.content.Intent intent) {
@@ -760,6 +871,11 @@ public class MainActivity extends Activity
         if (gameMode && intent != null && intent.hasExtra(GameActivity.TITLE_EXTRA)) {
             String incoming = intent.getStringExtra(GameActivity.TITLE_EXTRA);
             if (!java.util.Objects.equals(incoming, getIntent().getStringExtra(GameActivity.TITLE_EXTRA))) {
+                if (intent.getBooleanExtra(GameActivity.SWITCH_EXTRA, false)) {   // 玩家在库页确认过：正常收局（存档照常），库页等进程退出再起新款
+                    Log.i("S2Arm", "player switched to " + incoming + "; stopping the running game");
+                    stopGame("player switched game", true);
+                    return;
+                }
                 status.setTextColor(0xFFFF5252);
                 status.setText("Game launch refused: previous session still owns this process; exit it first");
                 panel.setVisibility(android.view.View.VISIBLE);
@@ -798,14 +914,15 @@ public class MainActivity extends Activity
         frameRate.setEnabledForGame(gameMode && prefs.getBoolean("fps", false));
     }
 
-    /** 冷启动 intent：s2arm.graphics_mode=auto|generic|direct；未知值记错误并按 auto。 */
+    /** 安卓只走直连（与 iOS 对齐）：不给、auto、direct 都按直连（2）起。
+     * 原先 auto（0）在上一局直连没正常结束、或直连准备失败时会悄悄改走通用后端，问题被盖住；
+     * 现在直连出问题就按直连的失败处理（直连安全网计数与提示），不换路。generic 不再是可选项，给了记一行错误、仍按直连。 */
     private static int graphicsModeFromIntent(android.content.Intent intent) {
         String value = intent == null ? null : intent.getStringExtra("s2arm.graphics_mode");
-        if (value == null || value.isEmpty() || "auto".equals(value)) return 0;
-        if ("generic".equals(value)) return 1;
-        if ("direct".equals(value)) return 2;
-        Log.e("S2Arm", "Unknown s2arm.graphics_mode '" + value + "'; using auto");
-        return 0;
+        if (value == null || value.isEmpty() || "auto".equals(value) || "direct".equals(value)) return 2;
+        if ("generic".equals(value)) Log.e("S2Arm", "s2arm.graphics_mode=generic is no longer available on Android; using direct");
+        else Log.e("S2Arm", "Unknown s2arm.graphics_mode '" + value + "'; using direct");
+        return 2;
     }
 
     @SuppressWarnings("deprecation")
@@ -845,21 +962,32 @@ public class MainActivity extends Activity
             //   s2a_console_mode_set → ChangeDockedModeState）；没在跑就只持久化、冷启生效——不静默。
             //   coldConsoleMode 不跟改：begin 仍拿冻结的冷启值，重进不踩「mode frozen」。
             BootSpec.ConsoleMode mode = BootSpec.ConsoleMode.forRuntime(gameMode, value);
-            prefs.edit().putString(PREF_CONSOLE, mode.value).apply();
-            if (host != 0 && gameSession != null && gameSession.attempted() && !gameStopping) {
-                int rc = NativeBridge.setConsoleMode(host, mode.nativeValue);
-                Log.i("S2Arm", rc == 0 ? "console mode switched at runtime: " + mode.value
-                    : "console mode " + mode.value + " saved; runtime switch refused (rc=" + rc
-                        + "), takes effect on cold start");
-            } else {
-                Log.i("S2Arm", "console mode " + mode.value
-                    + " saved; takes effect on cold start (no running session)");
-            }
+            applyConsoleMode(mode);
             return mode;
         }
         BootSpec.ConsoleMode mode = BootSpec.ConsoleMode.forLaunch(coldStart, gameMode, present, value);
         if (gameMode && present) prefs.edit().putString(PREF_CONSOLE, mode.value).apply();
         return mode;
+    }
+    /** Saves the player's console mode and pushes it to a running session. Returns true when the
+     *  running session took it; false means it is saved and applies on the next cold start. */
+    private boolean applyConsoleMode(BootSpec.ConsoleMode mode) {
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString(PREF_CONSOLE, mode.value).apply();
+        if (host != 0 && gameSession != null && gameSession.attempted() && !gameStopping) {
+            int rc = NativeBridge.setConsoleMode(host, mode.nativeValue);
+            Log.i("S2Arm", rc == 0 ? "console mode switched at runtime: " + mode.value
+                : "console mode " + mode.value + " saved; runtime switch refused (rc=" + rc
+                    + "), takes effect on cold start");
+            return rc == 0;
+        }
+        Log.i("S2Arm", "console mode " + mode.value
+            + " saved; takes effect on cold start (no running session)");
+        return false;
+    }
+    /** The mode the player last chose (handheld when never chosen), for the touch menu. */
+    private BootSpec.ConsoleMode storedConsoleMode() {
+        String stored = getSharedPreferences(PREFS, MODE_PRIVATE).getString(PREF_CONSOLE, null);
+        return BootSpec.ConsoleMode.DOCKED.value.equals(stored) ? BootSpec.ConsoleMode.DOCKED : BootSpec.ConsoleMode.HANDHELD;
     }
     // Debug: `--ei s2arm.release_stall_ms <ms>` makes the render thread hold a released surface that long,
     // standing in for a stuck driver call: under 1000 ms surfaceDestroyed waits it out, over that the
@@ -910,7 +1038,7 @@ public class MainActivity extends Activity
         String why = NativeBridge.stopReason(reason) + (detail.isEmpty() ? "" : ": " + detail);
         status.setText("Session ended: " + why);
         android.widget.Toast.makeText(this, "S2Arm session ended: " + why, android.widget.Toast.LENGTH_LONG).show();
-        if (gameMode) stopGame(why, true);
+        if (gameMode) stopGame(why, true, LastSession.cleanStop(reason));
         else finish();
     }
     // Debug: `am start ... --es s2arm.orientation landscape|reverse-landscape|portrait` rotates this activity only;
@@ -1020,15 +1148,254 @@ public class MainActivity extends Activity
     private static boolean gamepadConnected() {
         for (int id : InputDevice.getDeviceIds()) {
             InputDevice device = InputDevice.getDevice(id);
-            if (device != null && !device.isVirtual() && controller(device.getSources())) return true;
+            // 只认真有手柄按键（A 键）的设备：有的手机自带一个报 JOYSTICK 来源的内置传感设备
+            // （压感 / 肩键一类，只有 X / Y 轴、没有手柄按键），算成「接了手柄」会把虚拟手柄永远藏掉。
+            if (device != null && !device.isVirtual() && controller(device.getSources())
+                    && device.hasKeys(KeyEvent.KEYCODE_BUTTON_A)[0]) return true;
         }
         return false;
     }
+    private void loadTouchLayout() {
+        touchPad.setOpacityPercent(getSharedPreferences(PREFS, MODE_PRIVATE)
+            .getInt("touch_opacity_percent", 100));
+        try {
+            TouchLayout saved = touchLayouts.load();
+            touchPad.setLayout(saved);
+            if (saved != null) Log.i("S2Arm", "Touch layout: " + touchLayouts.file().getName());
+        } catch (java.io.IOException | IllegalArgumentException error) {
+            // A damaged file must not take the pad away: built-in layout, and say so once.
+            Log.e("S2Arm", "Touch layout ignored (" + touchLayouts.file().getName() + "): " + error.getMessage());
+            android.widget.Toast.makeText(this, R.string.touch_layout_load_failed,
+                android.widget.Toast.LENGTH_LONG).show();
+            touchPad.setLayout(null);
+        }
+    }
+
+    private String passthroughKey() { return PREF_TOUCH_PASSTHROUGH + touchLayouts.file().getName(); }
+
+    /** The player's touch passthrough choice for this game (the old adb extra still overrides for one run). */
+    private void applyTouchPassthrough() {
+        if (touchPad == null || touchLayouts == null || !BuildConfig.EXPERIMENTAL_TOUCH) return;
+        if (!getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(passthroughKey(), false)) return;
+        setTouchPassthrough(true, false);
+    }
+
+    private void setTouchPassthrough(boolean enabled, boolean remember) {
+        try {
+            touchPad.setGameTouchEnabled(enabled);
+            if (remember) getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean(passthroughKey(), enabled).apply();
+            Log.i("S2Arm", "Touch passthrough " + (enabled ? "on" : "off"));
+        } catch (IllegalStateException e) {
+            Log.e("S2Arm", e.getMessage());
+            android.widget.Toast.makeText(this, e.getMessage(), android.widget.Toast.LENGTH_LONG).show();
+        }
+        updateTouchPad();
+    }
+
+    /** Four-finger hold: the in-game touch menu (iOS: same gesture). No adb needed for any of it. */
+    private void showTouchMenu() {
+        if (touchPad == null || touchPad.editing() || isFinishing()) return;
+        java.util.List<String> labels = new java.util.ArrayList<>();
+        java.util.List<Runnable> actions = new java.util.ArrayList<>();
+        labels.add(getString(R.string.touch_menu_edit_positions)); actions.add(this::beginTouchEdit);
+        labels.add(getString(R.string.touch_appearance_opacity)); actions.add(this::showTouchOpacity);
+        // 接了手柄时虚拟手柄自动收起；玩家随时能叫回来或收起（不替玩家决定，本局有效）
+        boolean padShown = touchPad.controlsVisible();
+        labels.add(getString(padShown ? R.string.touch_menu_hide_pad : R.string.touch_menu_show_pad));
+        actions.add(() -> { touchMode = padShown ? "off" : "on"; updateTouchPad(); });
+        labels.add(getString(R.string.touch_menu_import)); actions.add(() -> pickTouchLayout(true));
+        labels.add(getString(R.string.touch_menu_export)); actions.add(() -> pickTouchLayout(false));
+        if (touchLayouts.file().isFile()) {
+            labels.add(getString(R.string.touch_menu_restore_default)); actions.add(this::resetTouchLayout);
+        }
+        if (host != 0 && BuildConfig.EXPERIMENTAL_TOUCH) {   // not built in: no item that can only fail
+            boolean on = touchPad.gameTouchEnabled();
+            labels.add(getString(on ? R.string.touch_passthrough_on : R.string.touch_passthrough_off));
+            actions.add(() -> setTouchPassthrough(!on, true));
+        }
+        if (gameMode) {   // 运行模式：此前只有测试用的启动参数能切，玩家够不着
+            boolean docked = storedConsoleMode() == BootSpec.ConsoleMode.DOCKED;
+            labels.add(getString(docked ? R.string.console_mode_docked : R.string.console_mode_handheld));
+            actions.add(() -> {
+                boolean live = applyConsoleMode(docked ? BootSpec.ConsoleMode.HANDHELD : BootSpec.ConsoleMode.DOCKED);
+                android.widget.Toast.makeText(this, live ? R.string.console_mode_switched : R.string.console_mode_saved,
+                    android.widget.Toast.LENGTH_LONG).show();
+            });
+        }
+        new android.app.AlertDialog.Builder(this)
+            .setTitle(R.string.touch_menu_title)
+            .setItems(labels.toArray(new String[0]), (dialog, which) -> actions.get(which).run())
+            .setNegativeButton(android.R.string.cancel, null)
+            .show();
+    }
+
+    private void showTouchOpacity() {
+        int original = touchPad.opacityPercent();
+        LinearLayout content = new LinearLayout(this);
+        content.setOrientation(LinearLayout.VERTICAL);
+        android.widget.TextView value = new android.widget.TextView(this);
+        value.setGravity(android.view.Gravity.CENTER_HORIZONTAL);
+        value.setText(getString(R.string.touch_appearance_opacity_value, original));
+        content.addView(value);
+        android.widget.SeekBar slider = new android.widget.SeekBar(this);
+        slider.setMax(100);
+        slider.setProgress(original);
+        slider.setContentDescription(getString(R.string.touch_appearance_opacity));
+        slider.setOnSeekBarChangeListener(new android.widget.SeekBar.OnSeekBarChangeListener() {
+            public void onProgressChanged(android.widget.SeekBar bar, int progress, boolean fromUser) {
+                touchPad.setOpacityPercent(progress);
+                value.setText(getString(R.string.touch_appearance_opacity_value, progress));
+            }
+            public void onStartTrackingTouch(android.widget.SeekBar bar) { }
+            public void onStopTrackingTouch(android.widget.SeekBar bar) { }
+        });
+        content.addView(slider);
+        new android.app.AlertDialog.Builder(this)
+            .setTitle(R.string.touch_appearance_opacity).setView(content)
+            .setPositiveButton(android.R.string.ok, (dialog, which) ->
+                getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                    .putInt("touch_opacity_percent", slider.getProgress()).apply())
+            .setNegativeButton(android.R.string.cancel, (dialog, which) -> touchPad.setOpacityPercent(original))
+            .setOnCancelListener(dialog -> touchPad.setOpacityPercent(original))
+            .show();
+    }
+
+    private void touchTransferFailed(boolean importing, Exception error) {
+        Log.e("S2Arm", "Touch layout transfer failed", error);
+        // 报真原因 + 下一步（中英各一份）；异常原文是内部英文，进日志
+        String message = error.getMessage() != null ? error.getMessage() : "";
+        int reason = error instanceof IllegalArgumentException
+            ? (message.contains("64 KiB") ? R.string.touch_layout_err_size : R.string.touch_layout_err_invalid)
+            : importing ? R.string.touch_layout_err_read : R.string.touch_layout_err_write;
+        android.widget.Toast.makeText(this, getString(importing ? R.string.touch_layout_import_failed
+            : R.string.touch_layout_export_failed, getString(reason)), android.widget.Toast.LENGTH_LONG).show();
+    }
+
+    private void pickTouchLayout(boolean importing) {
+        android.content.Intent intent = new android.content.Intent(importing
+            ? android.content.Intent.ACTION_OPEN_DOCUMENT : android.content.Intent.ACTION_CREATE_DOCUMENT);
+        intent.addCategory(android.content.Intent.CATEGORY_OPENABLE);
+        intent.setType("application/json");
+        try {
+            if (!importing) {
+                touchExport = touchLayouts.exportBytes(touchPad.pad().layoutModel());
+                intent.putExtra(android.content.Intent.EXTRA_TITLE, TouchLayoutStore.exportFilename(touchExport));
+            }
+            try {
+                startActivityForResult(intent, importing ? PICK_TOUCH_LAYOUT : EXPORT_TOUCH_LAYOUT);
+            } catch (android.content.ActivityNotFoundException missingJsonPicker) {
+                intent.setType("*/*");
+                startActivityForResult(intent, importing ? PICK_TOUCH_LAYOUT : EXPORT_TOUCH_LAYOUT);
+            }
+        } catch (java.io.IOException | IllegalArgumentException | SecurityException
+                | android.content.ActivityNotFoundException error) {
+            touchExport = null;
+            touchTransferFailed(importing, error);
+        }
+    }
+
+    private void beginTouchEdit() {
+        touchPad.beginEditing();
+        touchEditBar = new LinearLayout(this);
+        touchEditBar.setOrientation(LinearLayout.VERTICAL);
+        touchEditBar.setBackgroundColor(0xE6101820);
+        String[] names = {getString(R.string.touch_edit_save), getString(R.string.touch_edit_default), getString(R.string.touch_edit_cancel), getString(R.string.touch_appearance_smaller), getString(R.string.touch_appearance_larger)};
+        Runnable[] actions = {this::saveTouchEdit, () -> { endTouchEdit(); resetTouchLayout(); }, () -> { endTouchEdit(); loadTouchLayout(); }, () -> resizeTouchButtons(0.9), () -> resizeTouchButtons(1.0 / 0.9)};
+        LinearLayout row = null;
+        for (int i = 0; i < names.length; i++) {
+            if (i == 0 || i == 3) {
+                row = new LinearLayout(this);
+                row.setOrientation(LinearLayout.HORIZONTAL);
+                touchEditBar.addView(row);
+            }
+            android.widget.Button button = new android.widget.Button(this);
+            button.setText(names[i]);
+            Runnable action = actions[i];
+            button.setOnClickListener(v -> action.run());
+            row.addView(button);
+        }
+        touchPad.setEditDragListener(dragging -> {
+            if (touchEditBar == null) return;
+            touchEditBar.setAlpha(dragging ? 0.15f : 1f);
+            if (!dragging) placeTouchEditBar();
+        });
+        // Screen centre: the one place no built-in control sits (− / + are at the top centre).
+        root.addView(touchEditBar, new FrameLayout.LayoutParams(FrameLayout.LayoutParams.WRAP_CONTENT,
+            FrameLayout.LayoutParams.WRAP_CONTENT, android.view.Gravity.CENTER));
+        touchEditBar.post(this::placeTouchEditBar);
+    }
+
+    private void resizeTouchButtons(double factor) {
+        try {
+            touchPad.scaleEditingButtons(factor);
+            if (touchEditBar != null) touchEditBar.post(this::placeTouchEditBar);
+        } catch (IllegalArgumentException error) {
+            android.widget.Toast.makeText(this, getString(R.string.touch_layout_save_failed, error.getMessage()),
+                android.widget.Toast.LENGTH_LONG).show();
+        }
+    }
+
+    /** Keep the editor bar off the controls; if none is free, keep it see-through. */
+    private void placeTouchEditBar() {
+        if (touchEditBar == null) return;
+        int w = touchEditBar.getWidth(), h = touchEditBar.getHeight(), rw = root.getWidth(), rh = root.getHeight();
+        int low = windowInsets[1], high = rh - windowInsets[3] - h;
+        if (w == 0 || h == 0 || high < low) return;
+        float left = (rw - w) / 2f, centre = (rh - h) / 2f;
+        Integer best = null;
+        for (int top = low; top <= high; top += Math.max(1, h / 4)) {
+            boolean covers = false;
+            for (TouchPad.Control c : touchPad.pad().controls())
+                covers |= c.x + c.radius > left && c.x - c.radius < left + w && c.y + c.radius > top && c.y - c.radius < top + h;
+            if (!covers && (best == null || Math.abs(top - centre) < Math.abs(best - centre))) best = top;
+        }
+        if (best == null) { touchEditBar.setAlpha(0.5f); return; }
+        touchEditBar.setAlpha(1f);
+        FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) touchEditBar.getLayoutParams();
+        lp.gravity = android.view.Gravity.TOP | android.view.Gravity.CENTER_HORIZONTAL;
+        lp.topMargin = best;
+        touchEditBar.setLayoutParams(lp);
+    }
+
+    private void endTouchEdit() {
+        if (touchEditBar != null) root.removeView(touchEditBar);
+        touchEditBar = null;
+        touchPad.endEditing();
+    }
+
+    private void saveTouchEdit() {
+        try {
+            TouchLayout mine = touchPad.pad().editedLayout(TouchLayoutStore.MINE, "My layout");
+            touchLayouts.save(mine);
+            endTouchEdit();
+            touchPad.setLayout(mine);
+            Log.i("S2Arm", "Touch layout saved: " + touchLayouts.file().getName());
+        } catch (IllegalArgumentException | java.io.IOException error) {
+            // Stay in the editor: the drags are kept so the player can fix them (e.g. sticks on top of each other).
+            Log.e("S2Arm", "Touch layout not saved: " + error.getMessage());
+            android.widget.Toast.makeText(this, getString(R.string.touch_layout_save_failed, error.getMessage()),
+                android.widget.Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private void resetTouchLayout() {
+        try {
+            touchLayouts.reset();
+            Log.i("S2Arm", "Touch layout restored to default");
+        } catch (java.io.IOException error) {
+            Log.e("S2Arm", "Touch layout reset failed: " + error.getMessage());
+        }
+        touchPad.setLayout(null);
+    }
+
     private void updateTouchPad() {
         if (touchPad == null) return;
-        boolean show = "on".equals(touchMode) || ("auto".equals(touchMode) && !gamepadConnected());
+        boolean show = "on".equals(touchMode) || ("auto".equals(touchMode) && !gamepadConnected())
+            || touchPad.editing();
         touchPad.setControlsVisible(show);
-        touchPad.setVisibility(show || touchPad.gameTouchEnabled() ? android.view.View.VISIBLE : android.view.View.GONE);
+        // 触屏层始终在：按键收起时它只把触摸转给游戏或丢掉、不按键，但四指长按菜单要靠它收手势——
+        // 原先接了手柄就整层 GONE，菜单（编辑位置、显示虚拟手柄、运行模式）就再也叫不出来（不堵门）
+        touchPad.setVisibility(android.view.View.VISIBLE);
     }
     // Window lease (implementation plan §7.3): surfaceCreated offers a new window generation,
     // surfaceChanged and insets publish revisions of it, surfaceDestroyed revokes it. Hand-over
@@ -1245,6 +1612,26 @@ public class MainActivity extends Activity
      * DguardNotice 弹页等到玩家选「仍然启动」。没有前台 Activity / 主线程被调时直接返回
      * ——同 iOS 提示出口拿不到窗口时记日志照走的口径（提示是提醒不是闸门）。
      */
+    /** 停帧看门的屏上提示（NativeBridge.stallNotice，看门线程上来）：派回主线程按 StallNotice 显示 / 收。 */
+    static void stallNotice(int kind, int seconds) {
+        final MainActivity activity = current;
+        if (activity == null) { Log.i("S2Arm", "stall notice " + kind + " dropped: no foreground activity"); return; }
+        Log.i("S2Arm", "stall notice " + kind + " (" + seconds + " s)");
+        activity.runOnUiThread(() -> { activity.stallState.on(kind, seconds, android.os.SystemClock.uptimeMillis()); activity.renderStallNotice(); });
+    }
+    private void renderStallNotice() {
+        if (stallText == null) return;
+        long now = android.os.SystemClock.uptimeMillis();
+        int kind = stallState.visible(now);
+        // 「约 30 秒」= 看门判停帧的窗口（ap_host.c 的 30 秒环、s2a_ap_crawl_due：30 秒里新上屏 ≤ 15 帧才救场）
+        if (kind == StallNotice.PATCH_OFF) stallText.setText(getString(R.string.stall_patch_off, 30));
+        else if (kind == StallNotice.WAIT) stallText.setText(R.string.stall_wait);
+        stallText.setVisibility(kind == StallNotice.NONE ? android.view.View.GONE : android.view.View.VISIBLE);
+        stallText.removeCallbacks(stallRender);
+        long next = stallState.changeIn(now);
+        if (next >= 0) stallText.postDelayed(stallRender, next + 50);
+    }
+
     static void dguardPrompt(String diag) {
         final MainActivity activity = current;
         if (activity == null || activity.dguardNotice == null) { Log.i("S2Arm", "dguard prompt dropped: no foreground activity"); return; }

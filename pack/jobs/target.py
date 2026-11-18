@@ -41,15 +41,15 @@ class TargetError(Exception):
         self.code = code
 
 
-def traits_db(developer_dir):
-    db = Path(developer_dir) / "Platforms/iPhoneOS.platform/usr/standalone/device_traits.db"
+def traits_db(developer_dir, platform="iPhoneOS"):
+    db = Path(developer_dir) / f"Platforms/{platform}.platform/usr/standalone/device_traits.db"
     if not db.is_file():
         raise TargetError("所用 Xcode 里没有设备特征库（device_traits.db），认不出机型的 GPU：请装完整的 Xcode。", code="xcode_unavailable")
     return db
 
 
-def _query(developer_dir, sql, args=()):
-    con = sqlite3.connect(f"file:{traits_db(developer_dir)}?mode=ro", uri=True)
+def _query(developer_dir, sql, args=(), platform="iPhoneOS"):
+    con = sqlite3.connect(f"file:{traits_db(developer_dir, platform)}?mode=ro", uri=True)
     try:
         return con.execute(sql, args).fetchall()
     finally:
@@ -62,11 +62,14 @@ def gen(arch):
 
 
 def gpu_arch(product_type, developer_dir):
+    # Apple Vision Pro（RealityDevice*，按 iPad 兼容装）只登记在 visionOS 平台的设备特征库（XROS.platform），iPhone 平台库里只有一条
+    #   「Apple Vision」家族占位（RealityFamily*），按机型号查不到——原先报「认不出机型的 GPU」挡住出包。理论支持、未真机验证
+    platform = "XROS" if product_type.startswith("RealityDevice") else "iPhoneOS"
     rows = _query(developer_dir, "select distinct t.GPUArchName " + JOIN +
-                  "where (d.ProductType = ? or d.ProductType like ? || '-%') and t.GPUArchName like 'applegpu_%'", (product_type, product_type))
+                  "where (d.ProductType = ? or d.ProductType like ? || '-%') and t.GPUArchName like 'applegpu_%'", (product_type, product_type), platform)
     archs = sorted({r[0] for r in rows})
     if len(archs) != 1:
-        raise TargetError(f"这个 Xcode 认不出机型 {product_type} 的 GPU（{'查到多个：' + '、'.join(archs) if archs else '没有记录'}）：请把 Xcode 更新到最新版。", code="xcode_unavailable")
+        raise TargetError(f"这个 Xcode 认不出机型 {product_type} 的 GPU（{'查到多个：' + '、'.join(archs) if archs else '没有记录'}）：请把 Xcode 更新到最新版。", code="xcode_unavailable")  # 非玩家句
     return archs[0]
 
 
@@ -85,6 +88,12 @@ def models(developer_dir):
     return sorted(out, key=key)
 
 
+def ios_equivalent(product_type, major):
+    """系统大版本按 iOS 口径：Apple Vision Pro 上 iPad 兼容 App 跑同年的 iOS 框架，visionOS 1 / 2 对应 iOS 17 / 18，26 起与 iOS 同号；
+    原样拿 visionOS 2 和 iOS 下限 18 比会判「系统太旧」。其余机型原样"""
+    return major + 16 if product_type.startswith("RealityDevice") and 0 < major < 26 else major
+
+
 def os_choices(env):
     """可选系统大版本：MIN_OS 到所用 iOS SDK 的大版本"""
     cmd = ["xcrun", "--sdk", "iphoneos", "--show-sdk-version"]
@@ -94,24 +103,24 @@ def os_choices(env):
         if isinstance(stderr, bytes):
             stderr = stderr.decode("utf-8", errors="replace")
         lines = (stderr or "").strip().splitlines()
-        tail = lines[-1] if lines else "（空）"
-        return TargetError(f"{reason}；命令：{' '.join(cmd)}；退出码：{rc}；stderr 末行：{tail}", code=code)
+        tail = lines[-1] if lines else "（空）"  # 非玩家句
+        return TargetError(f"{reason}；命令：{' '.join(cmd)}；退出码：{rc}；stderr 末行：{tail}", code=code)  # 非玩家句
 
     try:
         p = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=60)
     except subprocess.TimeoutExpired as e:
-        raise failure("读取 iOS SDK 超时（60 秒）", "未取得（超时）", e.stderr) from e
+        raise failure("读取 iOS SDK 超时（60 秒）", "未取得（超时）", e.stderr) from e  # 非玩家句
     except OSError as e:
-        raise failure(f"无法启动 iOS SDK 探测：{e}", "未启动", None) from e
+        raise failure(f"无法启动 iOS SDK 探测：{e}", "未启动", None) from e  # 非玩家句
     if p.returncode:
-        raise failure("读取 iOS SDK 失败", p.returncode, p.stderr)
+        raise failure("读取 iOS SDK 失败", p.returncode, p.stderr)  # 非玩家句
     version = p.stdout.strip()
     if not re.fullmatch(r"[0-9]+(?:\.[0-9]+)*", version):
-        raise failure(f"iOS SDK 版本输出为空或非法：{version!r}", p.returncode, p.stderr)
+        raise failure(f"iOS SDK 版本输出为空或非法：{version!r}", p.returncode, p.stderr)  # 非玩家句
     try:
         top = int(version.split(".")[0])
     except ValueError as e:
-        raise failure("iOS SDK 版本数值非法", p.returncode, p.stderr) from e
+        raise failure("iOS SDK 版本数值非法", p.returncode, p.stderr) from e  # 非玩家句
     if top < MIN_OS:
         raise failure(f"iOS SDK {version} 太旧，需要 iOS {MIN_OS} 或更新的 SDK", p.returncode, p.stderr,
                       code="xcode_sdk_too_old")
@@ -119,10 +128,11 @@ def os_choices(env):
 
 
 def _keep_device(d):
-    """连着的 iOS / iPadOS 真机：physical + 隧道通或有线已配对（与 connected() 同一判据，10-28 按维护方 A3 第 5 条抽出来共用）"""
-    from diag import reachable
-    h = d.get("hardwareProperties", {})
-    return h.get("reality") == "physical" and h.get("platform") in ("iOS", "iPadOS") and reachable(d)
+    """启动器列给玩家选的设备（connected() 用）"""
+    # 同装机选机（diag.is_candidate）：带硬件 UDID 的就列出来给玩家选，不按 reality / 配对 / 是否在线筛掉（11-13 维护者：插着手机硬说识别不了）。
+    #   在不在线、能不能装由各行的连接状态显示和装的那一步说
+    from diag import is_candidate
+    return is_candidate(d)
 
 
 def _row(d, dev_dir, with_link=False):
@@ -136,7 +146,7 @@ def _row(d, dev_dir, with_link=False):
         arch = ""
     row = dict(id=d.get("identifier", ""), udid=h.get("udid", ""), name=(p.get("name") or "").strip(),
                model=h.get("marketingName") or pt, productType=pt, gpuArch=arch,
-               os=int((p.get("osVersionNumber") or "0").split(".")[0]))
+               os=ios_equivalent(pt, int((p.get("osVersionNumber") or "0").split(".")[0])))
     if with_link:
         row.update(tunnel=cp.get("tunnelState") == "connected",
                    wired=cp.get("transportType") == "wired" and cp.get("pairingState") == "paired")
@@ -166,7 +176,10 @@ def device_list(c, timeout=60):
 def usb_idevices():
     """USB 上看得到的 iPhone / iPad 名称（devicectl 只列 Xcode 配对过的设备，没配对的要靠这里知道「其实插着」）"""
     try:
-        out = subprocess.run(["ioreg", "-r", "-c", "IOUSBHostDevice", "-l", "-w0"], capture_output=True, text=True, timeout=10).stdout
+        # IORegistry 字符串可能包含无效 UTF-8 字节；先拿原始输出，再替换解码，
+        # 不能让 USB 辅助探测中断后续安装流程。
+        raw = subprocess.run(["ioreg", "-r", "-c", "IOUSBHostDevice", "-l", "-w0"], capture_output=True, timeout=10).stdout
+        out = raw.decode("utf-8", errors="replace")
     except (subprocess.TimeoutExpired, OSError):
         return []
     return re.findall(r'"USB Product Name" = "((?:iPhone|iPad)[^"]*)"', out)
@@ -240,7 +253,7 @@ PROFILE_GLOBS = ("~/Library/MobileDevice/Provisioning Profiles/*.mobileprovision
 def profile_udids(paths=()):
     """开发描述文件里登记的设备 UDID（大写）：连着多台时用它缩小到「这个包能装的机器」。没给路径就扫本机两处缺省目录"""
     out = set()
-    files = [Path(p).expanduser() for p in paths if p] or [Path(p) for pat in PROFILE_GLOBS for p in glob.glob(os.path.expanduser(pat))]
+    files = [Path(p).expanduser() for p in paths if p] or [Path(p) for pat in PROFILE_GLOBS for p in glob.glob(os.path.join(glob.escape(os.path.expanduser(os.path.dirname(pat))), os.path.basename(pat)))]
     for f in files:
         try:
             r = subprocess.run(["security", "cms", "-D", "-i", str(f)], capture_output=True, timeout=60)
@@ -286,12 +299,12 @@ def pick(want="", profiles=(), dd=None):
             raise TargetError(f"devicectl 没列出设备「{want}」（没连着这条线，或没在这台电脑上点过信任）", code="target_unknown")
         return _answer(dict(gpuArch=gpu_arch(pt, dd), os=0, productType=pt, model=pt), f"--device {want}（ideviceinfo）")
     live = [d for d in allv if d.get("tunnel") or d.get("wired")]
-    source = "连着的那一台"
+    source = "连着的那一台"  # 非玩家句
     if len(live) != 1:
         uds = profile_udids(profiles)
         narrowed = [d for d in live if d["udid"].upper() in uds]
         if len(narrowed) == 1:
-            live, source = narrowed, "开发描述文件登记的那一台"
+            live, source = narrowed, "开发描述文件登记的那一台"  # 非玩家句
     if len(live) == 1:
         return _answer(live[0], source)
     if not live:
@@ -307,7 +320,8 @@ def check(target, sdk_top=None):
         raise TargetError(f"认不出 {label} 的 GPU：请把 Xcode 更新到最新版。", code="xcode_unavailable")
     if gen(arch) < MIN_GEN:
         raise TargetError(f"{label} 的芯片太老，S2Arm 暂时打不了这台设备的包（需要 A14 / M1 及更新的芯片）。", code="target_unsupported")
-    if osv < MIN_OS:
+    # os=0 = 读不到系统版本（devicectl 列不出、改问 ideviceinfo 只拿到机型）：不知道不等于太旧，不拦（11-14 诊断#6472c1：iPhone14,3 被报「系统是 iOS 0，请先升级系统」）
+    if osv and osv < MIN_OS:
         raise TargetError(f"{label} 的系统是 iOS {osv}，S2Arm 需要 iOS {MIN_OS} 或更新：请先升级系统。", code="target_unsupported")
     if sdk_top and osv > sdk_top:
         raise TargetError(f"{label} 的系统是 iOS {osv}，但所用 Xcode 只带 iOS {sdk_top} 的 SDK，出不了这个系统版本的着色器：请把 Xcode 更新到最新版。", code="xcode_sdk_too_old")
@@ -333,8 +347,13 @@ def probe(c):
                     models=[], osChoices=[])
     env = c.env()
     try:
-        # 带上连接方式（wired / tunnel）：连着多台时出包页列出来让玩家选（#272），默认有线那台
-        return dict(connected=[] if c.r.get("quick") else connected(c, with_link=True), models=models(env["DEVELOPER_DIR"]), osChoices=os_choices(env))
+        # 带上连接方式（wired / tunnel）：连着多台时出包页列出来让玩家选（#272），默认有线那台。
+        #   读不到设备列表（超时 / 组件没装好）时 connectedError 带原因：界面说「读不到」而不是「没插」——玩家插着线却被说没看到 iPhone（11-11 玩家反馈）
+        rows, why = [], ""
+        if not c.r.get("quick"):
+            devices, why, _, _ = device_list(c)
+            rows = [_row(d, env["DEVELOPER_DIR"], True) for d in devices if _keep_device(d)]
+        return dict(connected=rows, connectedError=why, models=models(env["DEVELOPER_DIR"]), osChoices=os_choices(env))
     except TargetError as e:
         from core import Failure
         raise Failure(str(e), code=e.code) from e

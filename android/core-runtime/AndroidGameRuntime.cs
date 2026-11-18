@@ -36,6 +36,7 @@ namespace S2A.Android.Aot
         [DllImport("s2a_native")] private static extern int s2a_android_vk_set_layer_query(delegate* unmanaged<long> query);
         [DllImport("s2a_native")] private static extern int s2a_android_vk_session_stop();
         [DllImport("s2a_native")] private static extern ulong s2a_android_vk_present_count();
+        [DllImport("s2a_native")] private static extern ulong s2a_android_nvn_present_count();
         // t-direct-frametimes：逐帧帧时间局末转储（generic 经此触发；direct 已由 adapter shutdown 转过，空记录无输出）。
         [DllImport("s2a_native")] private static extern void s2a_frame_log_dump();
 
@@ -59,7 +60,11 @@ namespace S2A.Android.Aot
         }
 
         [UnmanagedCallersOnly(EntryPoint = "s2a_android_services_present_count")]
-        public static long GetPresentCount() => _direct ? unchecked((long)s2a_android_vk_present_count()) : PresentCounter.Count;
+        public static long GetPresentCount()
+        {
+            if (_directSession != null) return unchecked((long)s2a_android_nvn_present_count());
+            return _direct ? unchecked((long)s2a_android_vk_present_count()) : PresentCounter.Count;
+        }
         [UnmanagedCallersOnly(EntryPoint = "s2a_android_services_request_applet_exit")]
         public static int RequestAppletExit(ulong session)
         {
@@ -576,7 +581,12 @@ namespace S2A.Android.Aot
                 if (!ownerStopped)
                     Console.Error.WriteLine(
                         "【红】direct owner loop did not stop within its budget; native session/destroy retained (process teardown)");
-                if (stop != DirectAbi.Ok)
+                // #860 / #907 这一片：前端停稳还没有证明手段，活跃会话停局一律保留到进程退出、返回 Retirement——这是既定的正常收局，
+                // 不是故障，记普通信息；其余非 Ok（驱动 / 内部错误等）照旧报红。
+                if (stop == DirectAbi.Retirement && ownerStopped)
+                    Console.Error.WriteLine(
+                        "[s2a] direct stop: session retained until process exit (frontend retirement not proven yet; #860)");
+                else if (stop != DirectAbi.Ok)
                     Console.Error.WriteLine(
                         "【红】direct stop did not prove completion; native context retained, no normal-stop claim");
                 _directOwner = null;

@@ -11,6 +11,7 @@ sys.path.insert(0, os.path.normpath(os.path.join(os.path.dirname(os.path.abspath
 import nxfmt
 # 仓库里唯一的 RomFS 遍历（graphics/nvn/tools/romfs_list.py：walk 同 os.walk，heads 给清单里的文件头，同一份 RomFS 只读一次）
 sys.path.insert(0, os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'nvn', 'tools'))); import romfs_list
+sys.path.insert(0, os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..', 'tools'))); from pool_workers import process_pool_size   # 进程池路数（Windows 至多 61，#1332）
 _NXFMT_SRC = 'graphics/tools/nxfmt.py'  # 字面路径给 pack/stage_inputs.py 收进抽取 / 直连库的源码键
 if os.path.basename(nxfmt.__file__) != os.path.basename(_NXFMT_SRC):
     raise ImportError(_NXFMT_SRC)
@@ -26,12 +27,12 @@ def trpfs_report(root, outdir, stat, rf=None):
     rep = os.path.join(outdir, 'trpfs.tsv')
     for rel in sorted(romfs_list.listdir(root)):
         p = os.path.join(root, rel)
-        if not p.endswith('.trpfs') or not os.path.exists(p[:-1] + 'd'):
+        if not p.endswith('.trpfs') or not romfs_list.exists(p[:-1] + 'd'):
             continue
         # 读不了的容器（打不开 / FlatBuffers 偏移越界抛 struct.error）只记这一个红、接着列下一个，不打断整次抽取（审计 #846 F-trpfs-extract-abort：
         #   原先 open 失败时 finally 里 fsrc 未绑定 → UnboundLocalError，struct.error 也不在捕获列表里，两者都从这里冒出去、后面的 pak / 目录不再扫）
         try:
-            with open(p, 'rb') as fsrc:
+            with romfs_list.open_file(p) as fsrc:
                 for off, name, size, rows in T.walk(p, p[:-1] + 'd'):
                     packs += 1
                     for h, comp, ln, doff in rows:
@@ -541,10 +542,17 @@ def _scan_blob(path, data, rows, blobs, stat):
     if data[:4] == b'BAHS' and len(data) > 0x20: owned |= scan_bahs(path, data, rows, blobs, stat)
     if data[:4] == b'SDF\0': owned |= scan_sdf(path, data, rows, blobs, stat)
     owned |= scan_offhdr(path, data, rows, blobs, stat)
-    if b'HCPS' in data: owned |= scan_spch(path, data, rows, blobs, stat)
-    if RAW and (b'BNSH\0\0\0\0' not in data or path.startswith('nso:')): scan_raw(path, data, rows, blobs, stat)
+    # SPCH 不先判 `b'HCPS' in data`：大文件按 mmap 传进来（work 的 big_split），mmap 不支持子串 in（逐个取单字节和整串比），永远判不中，
+    #   4.7 GB 的 0100F43008C44000 arc/data.trpfs 上还白走 30 秒；scan_spch 自己就按魔数 finditer，没有就是一遍扫描。RAW 的判断同理改 find
+    owned |= scan_spch(path, data, rows, blobs, stat)
+    if RAW and (data.find(b'BNSH\0\0\0\0') < 0 or path.startswith('nso:')): scan_raw(path, data, rows, blobs, stat)
     for k, m in enumerate(re.finditer(b'BNSH\0\0\0\0', data)):
-        b = data[m.start():]; size = struct.unpack_from('<I', b, 0x1c)[0]; b = b[:size] if 0 < size <= len(b) else b
+        # 按头里的长度只切这一支（#711：原先先切到文件尾再截短，几 GB 的容器 mmap 每遇一处 BNSH 就拷一份到文件尾，Windows 提交上限下 MemoryError）
+        o = m.start(); size = struct.unpack_from('<I', data, o + 0x1c)[0]; end = o + size if 0 < size <= len(data) - o else len(data)
+        # 切之前先在原数据上看 +0x60 是不是 grsc（bnsh_codes 头一步就判它，判不中返回 None，结果同「无 grsc」）：大容器里碰巧是 BNSH 魔数的字节，
+        #   头里的长度也是乱的，0100F43008C44000 arc/data.trpfs（4.7 GB）里 148 处、长度最大 4.17 GB，原先每处照长度切一份、合计拷 168 GB，最后全是无 grsc
+        if end - o < 0x64 or data[o + 0x60:o + 0x64] != b'grsc': stat['BNSH 无 grsc'] += 1; continue
+        b = data[o:end]
         try: codes = bnsh_codes(b)
         except Exception: stat['BNSH 解析失败'] += 1; continue
         if codes is None: stat['BNSH 无 grsc'] += 1; continue
@@ -585,7 +593,23 @@ def _zstd_lib():
         _zstd.ZSTD_createDCtx.restype = ctypes.c_void_p
         _zstd.ZSTD_decompress_usingDict.restype = ctypes.c_size_t
         _zstd.ZSTD_decompress_usingDict.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_char_p, ctypes.c_size_t]
+        global _ZBuf
+        class _ZBuf(ctypes.Structure): _fields_ = [('p', ctypes.c_void_p), ('size', ctypes.c_size_t), ('pos', ctypes.c_size_t)]   # ZSTD_inBuffer / ZSTD_outBuffer
+        _zstd.ZSTD_createDStream.restype = ctypes.c_void_p; _zstd.ZSTD_freeDStream.argtypes = [ctypes.c_void_p]; _zstd.ZSTD_initDStream.argtypes = [ctypes.c_void_p]
+        _zstd.ZSTD_decompressStream.restype = ctypes.c_size_t; _zstd.ZSTD_decompressStream.argtypes = [ctypes.c_void_p, ctypes.POINTER(_ZBuf), ctypes.POINTER(_ZBuf)]
     return _zstd
+ZSTD_BLOCK_IN = (128 << 10) + 3 + 18   # 解出帧的头几个字节最多要读到的压缩字节：帧头 ≤ 18 + 首块（块头 3 + 块内容 ≤ 128 KB）
+def zstd_head(b, n=4):   # 不带字典号的 zstd 帧（b 为文件开头，至少 ZSTD_BLOCK_IN 字节或整个文件）只解出前 n 字节；解不开返回已解出的部分
+    import ctypes
+    z = _zstd_lib(); ds = z.ZSTD_createDStream(); z.ZSTD_initDStream(ds)
+    try:
+        src, dst = ctypes.create_string_buffer(b, len(b)), ctypes.create_string_buffer(n)
+        i, o = _ZBuf(ctypes.cast(src, ctypes.c_void_p), len(b), 0), _ZBuf(ctypes.cast(dst, ctypes.c_void_p), n, 0)
+        while o.pos < n and i.pos < i.size:
+            r = z.ZSTD_decompressStream(ds, ctypes.byref(o), ctypes.byref(i))
+            if z.ZSTD_isError(r) or r == 0: break
+        return dst.raw[:o.pos]
+    finally: z.ZSTD_freeDStream(ds)
 # zstd 字典（王国之泪 romfs/Pack/ZsDic.pack.zs 里 3 本：帧头写字典号，不给字典解不开）：扫描前 find_zsdicts 从资源里收齐、写进目录，
 #   经环境变量 NXSH_ZSDICT 交给各工作进程（spawn 起的进程不继承全局变量）；帧头字典号非 0 就按号取字典解
 _zd = None; _zdctx = None
@@ -619,13 +643,22 @@ def find_zsdicts(roots, outd):   # 资源里所有 zstd 字典：文件本身是
         return h[:4] == b'\x28\xb5\x2f\xfd' and bool(z.ZSTD_getDictID_fromFrame(h, len(h)))
     # 按需：先只看每个文件开头 18 字节探有没有带字典号的 zstd 帧；没有就不收（动森这类不用字典的款不必把小文件整读一遍；着色器线审，抽取墙钟增量 ≤ 10%）
     # 文件头取 RomFS 清单（romfs_list.heads：前 32 字节，同一份 RomFS 各阶段只读一次；打不开的文件同原先算「没有」）
-    def uses_dict():
-        return any(head(e.head) for t in trees for e in romfs_list.heads(t.top, tree=t).files() if e.error is None)
-    if not os.listdir(outd) and not uses_dict(): return 0
+    hd = {e.path: e.head for t in trees for e in romfs_list.heads(t.top, tree=t).files() if e.error is None and e.head is not None}
+    if not os.listdir(outd) and not any(head(h) for h in hd.values()): return 0
+    # 只把开头可能带字典的文件交给 dicts：字典本身、SARC、不带字典号的 zstd 帧（解开后可能是 SARC）；别的文件 dicts 整读完也只会返回空（#639：
+    #   用到字典的款原先把每个 ≤ 8 MB 的文件都整读一遍）。头表里没有的（读头失败）照原样交给 dicts
+    def maybe(p):
+        h = hd.get(p)
+        return h is None or h[:4] in (ZDICT_MAGIC, b'SARC') or (h[:4] == b'\x28\xb5\x2f\xfd' and not head(h))
+    paths = [p for p in paths if maybe(p)]
     def dicts(p):   # → 这个文件里的字典（文件本身，或 SARC 成员）
         try:
-            if os.path.getsize(p) > 8 << 20: return []
-            b = open(p, 'rb').read()
+            if romfs_list.file_size(p) > 8 << 20: return []
+            with romfs_list.open_file(p) as f:
+                b = f.read(ZSTD_BLOCK_IN)
+                # 不带字典号的 zstd 帧先只解开头 4 字节：不是 SARC 就不会有字典成员，不必整读整解（#639：0400486024DEC000 这类有 5.9 万个，解出来是 SARC 的只有 1 个）
+                if b[:4] == b'\x28\xb5\x2f\xfd' and not z.ZSTD_getDictID_fromFrame(b, len(b)) and zstd_head(b) != b'SARC': return []
+                b += f.read()
             if b[:4] == ZDICT_MAGIC: return [b]
             if b[:4] == b'\x28\xb5\x2f\xfd' and not z.ZSTD_getDictID_fromFrame(b, len(b)):
                 try: b = zstd_dec(b)
@@ -633,11 +666,18 @@ def find_zsdicts(roots, outd):   # 资源里所有 zstd 字典：文件本身是
             if b[:4] == b'SARC': return [bytes(m.data) for m in nxfmt.Sarc(b).get_files() if bytes(m.data[:4]) == ZDICT_MAGIC]
         except Exception: pass
         return []
+    def take(ds):   # 结果按文件顺序取、写字典在本线程：同一字典号先到先留，同串行版
+        nonlocal n
+        for d in ds:
+            did = z.ZSTD_getDictID_fromDict(d, len(d))
+            if did and not os.path.exists(os.path.join(outd, f'{did}.zsdict')): open(os.path.join(outd, f'{did}.zsdict'), 'wb').write(d); n += 1
+    # 有界提交：同时在排队的任务不超过 4 × 读线程数（ex.map 一开始就把全部文件提交成任务，文件数到几十万时排队本身就占内存，#639）
     with cf.ThreadPoolExecutor(PJ) as ex:
-        for ds in ex.map(dicts, paths, chunksize=64):   # 结果按文件顺序回来、写字典在本线程：同一字典号先到先留，同串行版
-            for d in ds:
-                did = z.ZSTD_getDictID_fromDict(d, len(d))
-                if did and not os.path.exists(os.path.join(outd, f'{did}.zsdict')): open(os.path.join(outd, f'{did}.zsdict'), 'wb').write(d); n += 1
+        pend = collections.deque()
+        for p in paths:
+            pend.append(ex.submit(dicts, p))
+            if len(pend) >= 4 * PJ: take(pend.popleft().result())
+        while pend: take(pend.popleft().result())
     return n
 def zstd_dec(data):
     import ctypes
@@ -646,22 +686,39 @@ def zstd_dec(data):
     buf = ctypes.create_string_buffer(n); r = _zdecompress(buf, n, data, len(data))
     if _zstd.ZSTD_isError(r) or r != n: raise ValueError('zstd 解压失败')
     return buf.raw
-def zstd_frame(data, i):   # data[i:] 起一个 zstd 帧：返回 (解压内容, 压缩长度)；帧头没写原长、过大、解不开都返回 None
+class _PyBuf(__import__('ctypes').Structure):   # CPython 缓冲区协议的 Py_buffer（zstd_frame 取 bytes / 只读 mmap 的内部地址，不复制）
+    import ctypes as _c
+    _fields_ = [('buf', _c.c_void_p), ('obj', _c.c_void_p), ('len', _c.c_ssize_t), ('itemsize', _c.c_ssize_t), ('readonly', _c.c_int), ('ndim', _c.c_int),
+                ('format', _c.c_char_p), ('shape', _c.c_void_p), ('strides', _c.c_void_p), ('suboffsets', _c.c_void_p), ('internal', _c.c_void_p)]
+def _buf_api():
     import ctypes
-    z = _zstd_lib()
-    for w in (1 << 20, 64 << 20):   # 先取 1 MB 窗口找帧尾，帧更长才取 64 MB（Trine 5 主程序 4795 个小帧，每个都复制 64 MB 要几百 GB 内存拷贝）；窗口盖住整帧时两者结果相同
-        b = bytes(data[i:i + w]); cs = z.ZSTD_findFrameCompressedSize(b, len(b))
-        if not z.ZSTD_isError(cs) or i + w >= len(data): break
-    n = z.ZSTD_getFrameContentSize(b, len(b))
-    if z.ZSTD_isError(cs) or n == (1 << 64) - 2 or (n < 1 << 62 and n > 256 << 20): return None
-    if n == (1 << 64) - 1:   # 帧头没写原长（大乱斗 data.arc：原长记在归档自己的表里）：容量从小往大试，解到帧尾为止
-        for cap in (1 << 20, 16 << 20, 256 << 20):
-            buf = ctypes.create_string_buffer(cap); r = _zdecompress(buf, cap, b, cs)
-            if not z.ZSTD_isError(r): return buf.raw[:r], cs
-        return None
-    buf = ctypes.create_string_buffer(n); r = _zdecompress(buf, n, b, cs)
-    if z.ZSTD_isError(r) or r != n: return None
-    return buf.raw, cs
+    g, r = ctypes.pythonapi.PyObject_GetBuffer, ctypes.pythonapi.PyBuffer_Release
+    g.argtypes = [ctypes.py_object, ctypes.POINTER(_PyBuf), ctypes.c_int]; g.restype = ctypes.c_int
+    r.argtypes = [ctypes.POINTER(_PyBuf)]; r.restype = None
+    return g, r
+def zstd_frame(data, i):   # data[i:] 起一个 zstd 帧：返回 (解压内容, 压缩长度)；帧头没写原长、过大、解不开都返回 None
+    """找帧尾与解压都直接用 data 的内部地址 + 偏移（bytes / 只读 mmap / memoryview 经缓冲区协议取，不复制）。
+    原先每遇到一个魔数先 bytes(data[i:i + 1 MB]) 复制 1 MB 再判帧长：每帧约 37 µs，一款 657 万个帧（大文件逐段盲扫）光复制就 245 秒；直接取地址每帧约 0.7 µs。
+    可见长度仍封顶 64 MB，与原先「先 1 MB、不够再 64 MB」两档窗口结果相同（帧在 1 MB 内两档一样；超过 64 MB 的帧两者都判不出帧尾）"""
+    import ctypes
+    z = _zstd_lib(); get, rel = _buf_api(); v = _PyBuf()
+    if get(data, ctypes.byref(v), 0) != 0: return None
+    try:
+        avail = min(v.len - i, 64 << 20)
+        if avail <= 0: return None
+        b = ctypes.cast(v.buf + i, ctypes.c_char_p)
+        cs = z.ZSTD_findFrameCompressedSize(b, avail)
+        n = z.ZSTD_getFrameContentSize(b, avail)
+        if z.ZSTD_isError(cs) or n == (1 << 64) - 2 or (n < 1 << 62 and n > 256 << 20): return None
+        if n == (1 << 64) - 1:   # 帧头没写原长（大乱斗 data.arc：原长记在归档自己的表里）：容量从小往大试，解到帧尾为止
+            for cap in (1 << 20, 16 << 20, 256 << 20):
+                buf = ctypes.create_string_buffer(cap); r = _zdecompress(buf, cap, b, cs)
+                if not z.ZSTD_isError(r): return buf.raw[:r], cs
+            return None
+        buf = ctypes.create_string_buffer(n); r = _zdecompress(buf, n, b, cs)
+        if z.ZSTD_isError(r) or r != n: return None
+        return buf.raw, cs
+    finally: rel(ctypes.byref(v))
 def scan_zstd_frames(path, data, rows, blobs, stat, lo=0, hi=None):
     """顶层打包文件里逐条 zstd 压缩的条目（怪猎崛起 RE 引擎 re_chunk_*.pak：着色器在 SDF 文件里，7 万多个 zstd 帧，10-17 前一个都没抽到）：
     找起点在 [lo, hi) 的帧魔数，按帧头解开，每段照普通文件再走一遍 visit（里面还可能是 SARC / Yaz0）。解不开的跳过（魔数也可能出现在别的压缩数据里）
@@ -847,8 +904,9 @@ def visit(path, data, rows, blobs, stat, depth=0, zl=True, in_pkz=False):
         return
     stat['叶子文件'] += 1; scan_blob(path, data, rows, blobs, stat)
     if b'LSLGS' in data: scan_ue(path, data, rows, blobs, stat)
-    # 内嵌 gzip / xz / LZ4 只在没被整文件解开的顶层文件里搜（10-22 量：15 款 0 命中；塞尔达 4 万个整文件 Yaz0 里盲搜 10.5 GB、CPU +20%）
-    if zl and depth == 0 and b'BNSH\0\0\0\0' not in data and data[:4] != b'BAHS': scan_zlib(path, data, rows, blobs, stat); scan_zstd_frames(path, data, rows, blobs, stat); scan_crilayla(path, data, rows, blobs, stat); not whole and scan_streams(path, data, rows, blobs, stat)   # 认不出容器的顶层文件再按 zlib 流扫一遍（大文件这一遍在 work_zlib 里分段并行）
+    # 内嵌压缩流只在没被整文件解开的顶层文件里搜：gzip / xz / LZ4（10-22 量：15 款 0 命中；塞尔达 4 万个整文件 Yaz0 里盲搜 10.5 GB、CPU +20%），
+    #   zlib 流 / zstd 帧 / CRILAYLA 同样（#744：0400486024DEC000 的 10 万个整文件 zstd 里搜出 5 万多个内嵌帧、38 万个假起点，键 0 个；不搜后抽取 CPU −25%、结果一致）
+    if zl and depth == 0 and not whole and b'BNSH\0\0\0\0' not in data and data[:4] != b'BAHS': scan_zlib(path, data, rows, blobs, stat); scan_zstd_frames(path, data, rows, blobs, stat); scan_crilayla(path, data, rows, blobs, stat); scan_streams(path, data, rows, blobs, stat)   # 认不出容器的顶层文件再按 zlib 流扫一遍（大文件这一遍在 work_zlib 里分段并行）
     undecoded(path, data); _COVER.pop(path, None)
 def flush(blobs, outdir):   # 着色器字节追加进本进程的 src/p<进程号>.pk（srcpack.py 头注：逐支两个小文件九成时间耗在元数据上）
     import srcpack
@@ -860,8 +918,8 @@ def top_wwise(p):   # 顶层文件是确证的 Wwise 音频包 → 'AKPK' / 'BKH
     #   11-01 出包线：异度3 sound/*.pck（AKPK）4.1 GB 逐段 zlib 盲扫、零着色器；12 款现行根抽取记录 0 条来自这类文件。Wwise 包只装 WEM 音频与音频库，不含着色器
     #   AKPK（文件包）：'AKPK' u32 头长 u32 版本 1；头长 + 8 ≤ 文件长。BKHD（音频库）：'BKHD' u32 段长 u32 版本（Wwise 2008–2024 实际取值 < 0x200）；段长 + 8 ≤ 文件长
     try:
-        with open(p, 'rb') as f: h = f.read(12)
-        n = os.path.getsize(p)
+        with romfs_list.open_file(p) as f: h = f.read(12)
+        n = romfs_list.file_size(p)
     except OSError: return None
     if len(h) < 12: return None
     m, a, b = h[:4], *struct.unpack_from('<II', h, 4)
@@ -871,39 +929,41 @@ def top_wwise(p):   # 顶层文件是确证的 Wwise 音频包 → 'AKPK' / 'BKH
 def skip_wwise(root, p, stat):   # 跳过的每个文件记进日志（款由调用方的日志定位，这里写路径与字节数）；核查模式不跳
     w = top_wwise(p)
     if not w or WWISE_AUDIT: return False
-    stat['Wwise 音频包不扫'] += 1; stat['Wwise 音频包不扫（字节）'] += os.path.getsize(p)
-    print(f'跳过 Wwise 音频包（{w}）：{_rel(p, root)}\t{os.path.getsize(p)} 字节', file=sys.stderr, flush=True)
+    stat['Wwise 音频包不扫'] += 1; stat['Wwise 音频包不扫（字节）'] += romfs_list.file_size(p)
+    print(f'跳过 Wwise 音频包（{w}）：{_rel(p, root)}\t{romfs_list.file_size(p)} 字节', file=sys.stderr, flush=True)
     return True
 BIG = 128 << 20   # 超过这么大的顶层文件：zlib 流扫描按 BIG 字节一段分给各进程（暗黑三 Common.cpk 2.5 GB 单进程扫 117 秒，整步被最大的文件卡住）
 def big_split(p):   # 要分段扫 zlib 的大文件：顶层不是 zstd / Yaz0 / SARC（那些照常整读解开）
     try:
-        if os.path.getsize(p) <= BIG: return False
-        with open(p, 'rb') as f: m = f.read(0x80)
+        if romfs_list.file_size(p) <= BIG: return False
+        with romfs_list.open_file(p) as f: m = f.read(0x80)
     except OSError: return False
     return m[:4] not in (b'\x28\xb5\x2f\xfd', b'Yaz0', b'SARC', b'pkzl') and not _vendor(m)   # 厂商归档（Telltale 465 MB 的 ttarch2）整读后按成员 visit
+READ_RED, READ_RED_SHOW = '【红】文件读不了', 3   # 每个工作分片逐条打前 3 个（带路径与原因），总数在收尾的红行与降级表
 def work(args):
     root, files, outdir = args; rows, blobs, stat = [], {}, collections.Counter()
     for p in files:
         if skip_wwise(root, p, stat): continue
         try:
-            with open(p, 'rb') as f:
-                if f.read(4) == b'pkzl':   # 按索引逐成员解压；不整读大 PKZ，也不排盲扫分段作业
-                    import mmap
-                    with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as data:
-                        stat['顶层文件'] += 1; visit(_rel(p, root), data, rows, blobs, stat)
-                    continue
+            # 读内容按路径经 romfs_list（目录形态同 open / mmap；RomFS 不落散文件、只有镜像时从镜像读）
+            with romfs_list.open_file(p) as f: pk = f.read(4) == b'pkzl'
+            if pk:   # 按索引逐成员解压；不整读大 PKZ，也不排盲扫分段作业
+                with romfs_list.map_file(p) as data:
+                    stat['顶层文件'] += 1; visit(_rel(p, root), data, rows, blobs, stat)
+                continue
             if big_split(p):   # 大文件 mmap 着整扫容器与相邻对（不整读进内存），zlib 流由 work_zlib 分段扫
-                import mmap
-                with open(p, 'rb') as f: data = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+                data = romfs_list.map_file(p)
                 stat['顶层文件'] += 1; stat['叶子文件'] += 1; scan_blob(_rel(p, root), data, rows, blobs, stat); continue
-            data = open(p, 'rb').read()
-        except Exception: stat['读失败'] += 1; continue
+            data = romfs_list.read_file(p)
+        except Exception as e:   # 读不了的文件整份漏抽：计红、进降级表（原先只计「读失败」进统计行，RomFS 只有镜像时 19012 个文件这样悄悄跳过）
+            stat[READ_RED] += 1
+            if stat[READ_RED] <= READ_RED_SHOW: print(f'【红】文件读不了：{_rel(p, root)}（{type(e).__name__}：{e}）', file=sys.stderr, flush=True)
+            continue
         stat['顶层文件'] += 1; visit(_rel(p, root), data, rows, blobs, stat)
     flush(blobs, outdir); return rows, stat
 def work_zlib(args):   # 大文件的一段：只认起点在 [lo, hi) 的 zlib 流；往前多解 16 MB 接上跨段的尾巴（单个流不超过 16 MB，见 scan_zlib 的解压上限）
-    import mmap
     root, p, lo, hi, outdir = args; rows, blobs, stat = [], {}, collections.Counter()
-    with open(p, 'rb') as f: data = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+    data = romfs_list.map_file(p)
     # 不再因整个大文件里出现过 BNSH 就跳过流扫描（大乱斗 data.arc 17.6 GB 里有 4 个 BNSH，整份没扫 zstd 帧）：多扫的按键去重
     if data[:4] != b'BAHS': scan_zlib(_rel(p, root), data, rows, blobs, stat, lo, hi, 16 << 20); scan_zstd_frames(_rel(p, root), data, rows, blobs, stat, lo, hi); scan_crilayla(_rel(p, root), data, rows, blobs, stat, lo, hi); scan_streams(_rel(p, root), data, rows, blobs, stat, lo, hi)
     undecoded(_rel(p, root), data, lo, min(hi, len(data))); _COVER.pop(_rel(p, root), None)
@@ -948,14 +1008,14 @@ def work_kpka(args):   # RE 引擎 pak 的一批条目（已按补丁链取最�
     import re_pak
     es, outdir = args; rows, blobs, stat = [], {}, collections.Counter(); fs = {}
     for p, h, off, csz, usz, attr in es:
-        f = fs.get(p) or fs.setdefault(p, open(p, 'rb'))
+        f = fs.get(p) or fs.setdefault(p, romfs_list.open_file(p))
         try: data = re_pak.read(f, off, csz, usz, attr)
         except re_pak.Unsupported as e: stat[f'RE pak 条目不支持：{e}'] += 1; continue
         except Exception: stat['RE pak 条目解码失败'] += 1; continue
         if b'\x34\x12\x76\x98' in data or data[:4] in (b'SARC', b'Yaz0', b'BAHS', b'\x28\xb5\x2f\xfd'): visit(f'kpka:{os.path.basename(p)}@{h:016x}', data, rows, blobs, stat, zl=False)
         else: undecoded(f'kpka:{os.path.basename(p)}@{h:016x}', data)   # 不进 visit 的条目（没有 NVN 魔数 / 容器魔数）也报：里面可能还有一层压缩
     flush(blobs, outdir); return rows, stat
-def scan_unity(root, files, stat):
+def scan_unity(root, files, stat, known=None):
     """Unity 资源（unity_res.py）：先读 UnityFS 资源包（Shader 带类型树，记下借给播放器数据），再读不带类型树的序列化文件。
     每个代码块条目里的着色器来源记 unity:<文件>[//<包内文件>]@<对象>#<平台>.<分段>、变体号 = 条目号（同一条目的 vs + ps = 一个程序，「# 变体组」规则配）。返回 (rows, blobs)"""
     import unity_res
@@ -965,22 +1025,26 @@ def scan_unity(root, files, stat):
             r = []; _scan_blob('e', ent, r, blobs, stat)
             for k, st, _, _ in r: rows.append((k, st, f'unity:{name}@{pid:x}#{plat}.{si}', i))
     heads = {}
-    for p in files:
+    for p in files:   # known = 调用方给的文件头表（RomFS 清单前 32 字节，判下面两种文件够用）；表里没有的才读盘
+        if known is not None and p in known: heads[p] = known[p]; continue
         try:
-            with open(p, 'rb') as f: heads[p] = f.read(48)
+            with romfs_list.open_file(p) as f: heads[p] = f.read(32)
         except OSError: pass
     for p in files:   # 资源包先（类型树在这里）
         if not unity_res.is_bundle(heads.get(p, b'')): continue
-        try: inner = unity_res.read_bundle(open(p, 'rb').read())
+        # 只读映射 + 逐个节点解（unity_res.iter_bundle）：原先整个包读进内存、全部解开再每个节点复制一份，
+        #   v0.3.0 Windows 8 GB 机 3.45 GB 的 Unity 游戏第一个文件就 MemoryError
+        try:
+            with romfs_list.map_file(p) as mm:
+                for n, b in unity_res.iter_bundle(mm):
+                    try: entries(f'{_rel(p, root)}//{n}', b)
+                    except Exception: stat['UnityFS 包内文件不是序列化文件'] += 1
         except Exception as error:
             method = re.search(r'压缩方式 \d+（([^）]+)）', str(error))
             reason = method.group(1) if method else '其他'
             stat[f'UnityFS 解不开（{reason}）'] += 1
             continue
         stat['UnityFS 资源包'] += 1
-        for n, b in inner.items():
-            try: entries(f'{_rel(p, root)}//{n}', b)
-            except Exception: stat['UnityFS 包内文件不是序列化文件'] += 1
     for p in files:   # 播放器数据：Unity 序列化文件 v17–40
         h = heads.get(p, b'')
         if len(h) < 20 or unity_res.is_bundle(h) or h[16] > 1: continue
@@ -989,10 +1053,10 @@ def scan_unity(root, files, stat):
         if version < 22:
             declared_size = struct.unpack_from('>I', h, 4)[0]
         else:
-            if len(h) < 48: continue
+            if len(h) < 32: continue   # 文件长在偏移 24 的 8 字节
             declared_size = struct.unpack_from('>Q', h, 24)[0]
-        if declared_size != os.path.getsize(p): continue   # 头里记的文件长 = 实际长（动森 34 个文件头前几项碰巧像，这一项不像）
-        try: entries(_rel(p, root), open(p, 'rb').read())
+        if declared_size != romfs_list.file_size(p): continue   # 头里记的文件长 = 实际长（动森 34 个文件头前几项碰巧像，这一项不像）
+        try: entries(_rel(p, root), romfs_list.read_file(p))
         except Exception: stat['Unity 序列化文件解析失败'] += 1
     return rows, blobs
 def work_casc(args):
@@ -1018,7 +1082,7 @@ if __name__ == '__main__':
     miss = None
     if '--miss' in a: i = a.index('--miss'); miss = a[i + 1]; del a[i:i + 2]   # 运行时落盘的缺失着色器目录（NX_SHADER_MISS_DIR）
     # 资源目录可写 @<列表文件>（一行一个；11-05 Windows 出包机怪猎崛起 273 个追加内容逐个放进命令行超过 Windows 32767 字符上限）
-    outdir = a[0]; roots = [r for x in a[1:] for r in (open(x[1:], encoding='utf-8').read().splitlines() if x.startswith('@') else [x]) if r]; J = int(os.environ.get('J', '8')); os.makedirs(os.path.join(outdir, 'src'), exist_ok=True)
+    outdir = a[0]; roots = [r for x in a[1:] for r in (open(x[1:], encoding='utf-8').read().splitlines() if x.startswith('@') else [x]) if r]; J = process_pool_size(int(os.environ.get('J', '8'))); os.makedirs(os.path.join(outdir, 'src'), exist_ok=True)
     # PKZ Oodle 成员的游戏解码器（pkz_oodle）：没设 DM_OODLE_MODULES 时按第一个资源目录的父目录（标准产物根）补上，工作进程继承环境变量
     if not os.environ.get('DM_OODLE_MODULES'):
         for rd in roots:
@@ -1031,8 +1095,8 @@ if __name__ == '__main__':
     rf.write('# 包名\t包偏移\t文件哈希\t压缩\t长度\t数据偏移\n')
     try:
         for rd in roots:
-            if os.path.isdir(rd):
-                trpfs_report(os.path.join(rd, 'arc') if os.path.isdir(os.path.join(rd, 'arc')) else rd, outdir, stat, rf)
+            if romfs_list.is_dir(rd):
+                trpfs_report(os.path.join(rd, 'arc') if romfs_list.is_dir(os.path.join(rd, 'arc')) else rd, outdir, stat, rf)
     finally:
         rf.close()
     # 字典目录：调用方给了 NXSH_ZSDICT 就往那里累加（tools/shscan.sh 分批扫：第一批小文件里收到的字典后面各批都用），没给用输出目录下 zsdict/
@@ -1041,6 +1105,10 @@ if __name__ == '__main__':
     for root in roots:
         # 同一次盘点走两遍（原先两次 os.walk 各盘点一次）
         tree = romfs_list.scan(root)
+        # 文件头一次取齐（romfs_list.heads：前 32 字节，并行读、按内容身份落盘，同一份 RomFS 各阶段只读一次）：厂商档案 / Unity 判魔数都查这张表，
+        #   不再各自把全部文件串行打开一遍（#606：Windows 30.4 万个文件，kitpak / hgpak / scan_unity 三遍逐个 open，停在「抽取 3/4」很久）
+        #   读头就失败的文件记空头：厂商档案 / Unity 探魔数一律不认、不再各自重开（kitpak 重开抛 OSError，原先一个读不了的文件让整个抽取退出），由 work() 计红进降级表
+        hd = {e.path: (e.head if e.error is None else b'') for e in romfs_list.heads(tree.top, tree=tree).files() if e.error is not None or e.head is not None}
         cdirs = sorted(dp for dp, dn, fn in tree.walk() if 'build_manifest.psv' in fn)   # 扁平 CASC 归档（暴雪游戏）：按清单逐条解出再扫，归档文件本身不当普通文件扫
         files = sorted(os.path.join(dp, f) for dp, dn, fn in tree.walk() if dp not in cdirs for f in fn)
         import unreal_pak as ue_pak
@@ -1070,20 +1138,20 @@ if __name__ == '__main__':
                 for r, s_ in ex.map(work_kpka, [(E[i::J * 8], outdir) for i in range(J * 8)]): rows += r; stat.update(s_)
         import kitpak, hgpak
         for m in (kitpak, hgpak):   # 带索引 / 分卷的厂商档案（11-02 着色器容器族 B 组：Unravel Two 的 kit! 索引 + 数据卷、No Man's Sky 的 HGPAK）：按条目切成任务逐条解出，档案本身不进普通文件 / 分段扫描
-            try: E, taken = m.jobs(files, pkz_oodle)
+            try: E, taken = m.jobs(files, pkz_oodle, heads=hd)
             except (ValueError, RuntimeError) as e: stat['【红】厂商档案读不了'] += 1; print(f'【红】{m.__name__}：目录读不了（{e}）', file=sys.stderr, flush=True); continue
             if not taken: continue
             files = [f for f in files if f not in taken]; stat[m.__name__] += len(taken)
             with cf.ProcessPoolExecutor(J) as ex:
                 for r, s_ in ex.map(work_members, [(root, m.__name__, e, outdir) for e in E]): rows += r; stat.update(s_)
-        ur, ub = scan_unity(root, files, stat)
+        ur, ub = scan_unity(root, files, stat, hd)
         if ur: rows += ur; flush(ub, outdir); stat['Unity 着色器条目'] += len({(r[2], r[3]) for r in ur})
         for cd in cdirs:
             E = casc_flat.entries(cd); pick = [e for e in E if 'shader' in e[0].lower()] or E   # 路径带 shader 的优先（暗黑2 164 个包）；没有就全扫
             stat['CASC 条目'] += len(E); stat['CASC 扫的条目'] += len(pick)
             with cf.ProcessPoolExecutor(J) as ex:
                 for r, s in ex.map(work_casc, [(cd, pick[i::J * 4], outdir) for i in range(J * 4)]): rows += r; stat.update(s)
-        zt = [(root, p, lo, min(lo + BIG, os.path.getsize(p)), outdir) for p in files if big_split(p) and not (top_wwise(p) and not WWISE_AUDIT) for lo in range(0, os.path.getsize(p), BIG)]
+        zt = [(root, p, lo, min(lo + BIG, romfs_list.file_size(p)), outdir) for p in files if big_split(p) and not (top_wwise(p) and not WWISE_AUDIT) for lo in range(0, romfs_list.file_size(p), BIG)]
         with cf.ProcessPoolExecutor(J) as ex:
             fz = [ex.submit(work_zlib, t) for t in sorted(zt, key=lambda t: t[1])]
             for r, s in ex.map(work, [(root, files[i::J * 8], outdir) for i in range(J * 8)]): rows += r; stat.update(s)
@@ -1112,19 +1180,16 @@ if __name__ == '__main__':
         f.write('# 键\t阶段\t来源\t变体号\n')
         for r in sorted(set(rows), key=lambda r: (r[2], r[3], r[1], r[0])): f.write('\t'.join(map(str, r)) + '\n')
     if WWISE_AUDIT:   # 跳过规则的反例：着色器记录的来源顶层文件是确证 Wwise 包（分母 = 本次扫到的 Wwise 包个数与字节）
-        ww = {os.path.relpath(p, rd) for rd in roots if os.path.isdir(rd) for dp, dn, fn in romfs_list.walk(rd) for f in fn for p in [os.path.join(dp, f)] if top_wwise(p)}
+        ww = {os.path.relpath(p, rd) for rd in roots if romfs_list.is_dir(rd) for dp, dn, fn in romfs_list.walk(rd) for f in fn for p in [os.path.join(dp, f)] if top_wwise(p)}
         bad = [r for r in rows if str(r[2]).split('@')[0].split('#')[0].split('|')[0] in ww]
         stat['Wwise 核查：包个数'] = len(ww); stat['【红】Wwise 核查：来自音频包的着色器记录（跳过规则反例）' if bad else 'Wwise 核查：反例'] = len(bad)
         for r in bad[:20]: print(f'【红】Wwise 核查反例：{r[2]} → {r[0]}', file=sys.stderr, flush=True)
     print('统计', dict(stat)); print('阶段记录', len(rows), '唯一键', len(uniq), '按阶段', dict(collections.Counter(v[0] for v in uniq.values())))
-    # 漏抽是硬错误（10-23 维护者）：分块压缩里续解不了的块 → 退出 1，shader_pack 报红中止，不静默少抽
-    if stat['【红】pak 索引加密']:
-        print(f"【红】抽取：{stat['【红】pak 索引加密']} 个 pak 索引加密、条目读不到（着色器会漏抽），见上方逐条", file=sys.stderr)
-    if stat['【红】zlib 块续解失败']:
-        print(f"【红】抽取：{stat['【红】zlib 块续解失败']} 个 zlib 块回指前块窗口、续解不了（块里的着色器会漏抽），见上方逐条", file=sys.stderr)
-    if stat['【红】PKZ/DAT 解析失败']:
-        print(f"【红】抽取：{stat['【红】PKZ/DAT 解析失败']} 处 PKZ/DAT 解析失败，见上方逐条", file=sys.stderr)
-    if stat['【红】pak 损坏'] or stat['【红】pak 条目解码失败']:
-        print(f"【红】抽取：pak 损坏 {stat['【红】pak 损坏']}、条目解码失败 {stat['【红】pak 条目解码失败']}", file=sys.stderr)
-    if stat['【红】厂商档案读不了']: print(f"【红】抽取：{stat['【红】厂商档案读不了']} 处厂商档案（kit! / HGPAK）读不了，见上方逐条", file=sys.stderr); sys.exit(1)
-    if stat['【红】pak 索引加密'] or stat['【红】pak 损坏'] or stat['【红】pak 条目解码失败'] or stat['【红】zlib 块续解失败'] or stat['【红】PKZ/DAT 解析失败']: sys.exit(1)
+    # 读不了的文件跳过、其余照抽（v0.3.1 拿不准不停；原先 10-23 定「漏抽是硬错误」退 1、整款出不了包）：漏的那部分着色器运行时首遇现编，
+    #   按类计数写进 <输出目录>/degrade.tsv（graphics/tools/direct/extract.sh 并进抽取的降级汇总），逐条原因见上方【红】行
+    skip = [(k, stat[k]) for k in ('【红】pak 索引加密', '【红】pak 损坏', '【红】pak 条目解码失败', '【红】zlib 块续解失败', '【红】PKZ/DAT 解析失败', '【红】厂商档案读不了', READ_RED) if stat[k]]
+    with open(os.path.join(outdir, 'degrade.tsv'), 'w', encoding='utf-8') as f:
+        for k, n in skip:
+            f.write(f"extract\ts2x:{k[3:]}\t{n}\t\tS2Arm 抽取跳过读不了的部分，里面的着色器运行时首遇现编\n")
+    if stat[READ_RED]: print(f'【红】抽取：{stat[READ_RED]} 个文件读不了、整份没抽（前几个见上方「【红】文件读不了」行），其余照抽；这些文件里的着色器运行时首遇现编', file=sys.stderr)
+    if skip: print(f"【黄】抽取：跳过读不了的部分（{'、'.join(f'{k[3:]} {n}' for k, n in skip)}），其余照抽；这些着色器运行时首遇现编，逐条见上方", file=sys.stderr)

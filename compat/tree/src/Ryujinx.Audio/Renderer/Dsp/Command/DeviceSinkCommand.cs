@@ -4,6 +4,7 @@ using System;
 using System.Buffers;
 using System.Runtime.CompilerServices;
 using System.Text;
+using System.Threading;
 
 namespace Ryujinx.Audio.Renderer.Dsp.Command
 {
@@ -25,6 +26,26 @@ namespace Ryujinx.Audio.Renderer.Dsp.Command
         public ushort[] InputBufferIndices { get; private set; }
 
         public Memory<float> Buffers { get; private set; }
+
+        // S2Arm (#1182 无声诊断)：交设备前（饱和转 int16 之前）混音结果里的 NaN 样本累计数。饱和把 NaN 变 0，到设备那边已分不出
+        //   「渲染出 NaN」与「渲染出真 0」，只能在 float 阶段数。全渲染器共用一个计数：本命令只在音频渲染线程上跑，有 NaN 时才原子加一次；
+        //   Apple 后端的 10 秒 [声] 行（S2AOutputDiag）取走清零。
+        public static long S2ANaNSamples;
+
+        private static int S2ACountNaN(ReadOnlySpan<float> buffer)
+        {
+            int count = 0;
+
+            foreach (float sample in buffer)
+            {
+                if (float.IsNaN(sample))
+                {
+                    count++;
+                }
+            }
+
+            return count;
+        }
 
         public DeviceSinkCommand()
         {
@@ -72,6 +93,13 @@ namespace Ryujinx.Audio.Renderer.Dsp.Command
             return Buffers.Span.Slice(index * sampleCount, sampleCount);
         }
 
+        // S2Arm: 5.1 交织内核的声道取数——缓冲区数不足 6（上混）的声道没有数据，给空 span（内核查零向量），
+        //   与原循环先整块清零再只写前 bufferCount 个声道的行为一致。
+        private ReadOnlySpan<float> BufferOrEmpty(uint bufferCount, int index, int sampleCount)
+        {
+            return index < (int)bufferCount ? GetBuffer(InputBufferIndices[index], sampleCount) : default;
+        }
+
         public void Process(CommandList context)
         {
             IHardwareDevice device = context.OutputDevice;
@@ -95,16 +123,56 @@ namespace Ryujinx.Audio.Renderer.Dsp.Command
                     inputCount = bufferCount;
                 }
 
-                short[] outputBuffer = ArrayPool<short>.Shared.Rent((int)inputCount * SampleCount);
-                Array.Fill(outputBuffer, (short)0, 0, (int)inputCount * SampleCount);
+                // S2Arm (#1182)：饱和前数 NaN（见 S2ANaNSamples）
+                int nanSamples = 0;
 
                 for (int i = 0; i < bufferCount; i++)
                 {
-                    ReadOnlySpan<float> inputBuffer = GetBuffer(InputBufferIndices[i], SampleCount);
+                    nanSamples += S2ACountNaN(GetBuffer(InputBufferIndices[i], SampleCount));
+                }
 
-                    for (int j = 0; j < SampleCount; j++)
+                if (nanSamples != 0)
+                {
+                    Interlocked.Add(ref S2ANaNSamples, nanSamples);
+                }
+
+                short[] outputBuffer = ArrayPool<short>.Shared.Rent((int)inputCount * SampleCount);
+                Array.Fill(outputBuffer, (short)0, 0, (int)inputCount * SampleCount);
+
+                // S2Arm: 立体声设备 + 双声道输入（最常见的设备形态）走 S2ADspMixHelper 的饱和窄化 + 交织内核；
+                //   5.1（6 声道）设备走 6 声道交织内核（缓冲区数不足 6 的上混，静音声道传空 span 查零，
+                //   与原循环先整块清零再只写前面的声道一致）；其余布局照原逐样本循环。
+                //   各路径逐样本一致（FCVTZS+SQXTN ≡ 夹取后截断）。
+                if (channelCount == 2 && bufferCount == 2)
+                {
+                    S2ADspMixHelper.SaturateInterleaveStereo(
+                        outputBuffer,
+                        GetBuffer(InputBufferIndices[0], SampleCount),
+                        GetBuffer(InputBufferIndices[1], SampleCount),
+                        (int)SampleCount);
+                }
+                else if (channelCount == 6)
+                {
+                    S2ADspMixHelper.SaturateInterleave6(
+                        outputBuffer,
+                        BufferOrEmpty(bufferCount, 0, (int)SampleCount),
+                        BufferOrEmpty(bufferCount, 1, (int)SampleCount),
+                        BufferOrEmpty(bufferCount, 2, (int)SampleCount),
+                        BufferOrEmpty(bufferCount, 3, (int)SampleCount),
+                        BufferOrEmpty(bufferCount, 4, (int)SampleCount),
+                        BufferOrEmpty(bufferCount, 5, (int)SampleCount),
+                        (int)SampleCount);
+                }
+                else
+                {
+                    for (int i = 0; i < bufferCount; i++)
                     {
-                        outputBuffer[i + j * channelCount] = PcmHelper.Saturate(inputBuffer[j]);
+                        ReadOnlySpan<float> inputBuffer = GetBuffer(InputBufferIndices[i], SampleCount);
+
+                        for (int j = 0; j < SampleCount; j++)
+                        {
+                            outputBuffer[i + j * channelCount] = PcmHelper.Saturate(inputBuffer[j]);
+                        }
                     }
                 }
 

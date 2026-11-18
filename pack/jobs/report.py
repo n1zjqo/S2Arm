@@ -13,7 +13,7 @@ import sys
 import time
 from pathlib import Path
 
-from core import Failure, _job_dirs, journal, logs_root, read, request_path, shared_redact
+from core import Failure, _job_dirs, journal, logs_root, read, request_path, resolve_path, shared_redact
 
 FAILED_STATES = ("failed", "interrupted")
 LOG_CHARS = 12000
@@ -68,6 +68,31 @@ def tail(path, limit=LOG_CHARS):
         return handle.read().decode(errors="replace")[-limit:]
 
 
+CRASH_SCAN = 32 << 20   # 往前找崩溃现场的最大字节（现场后面的全线程表可达几 MB）
+CRASH_LINES = 60        # 现场节最多几行（寄存器 + 回溯）
+
+
+def crash_excerpt(path):
+    """宿主崩溃现场（runtime/src/crash.c：一行「【红】CRASH 信号 … pc … lr …」，后跟缩进的寄存器与 #0…#N 回溯）：
+    取最后一次的那行与其后缩进行，外加它之前最近 5 条【红】行。现场后面是所有线程的等待栈（「[现场] 线程 …」，一百多条线程几百 KB），
+    原先只截日志末尾就只剩别的线程在等锁，崩溃线程被挤掉、玩家贴了摘要也定不了因（#806 / #786）。没有现场返回空串"""
+    try:
+        with path.open("rb") as handle:
+            size = path.stat().st_size; handle.seek(max(0, size - CRASH_SCAN))
+            lines = handle.read().decode(errors="replace").splitlines()
+    except OSError:
+        return ""
+    at = max((i for i, line in enumerate(lines) if "【红】CRASH" in line), default=-1)  # 非玩家句
+    if at < 0:
+        return ""
+    keep = [line for line in lines[max(0, at - 400):at] if "【红】" in line and "崩溃原始现场" not in line][-5:] + [lines[at]]  # 非玩家句
+    for line in lines[at + 1:]:
+        if len(keep) >= CRASH_LINES + 6 or not line.startswith("[s2a]   "):
+            break
+        keep.append(line)
+    return "\n".join(line[:300] for line in keep)
+
+
 def memory_bytes():
     if os.name == "nt":
         class Status(ctypes.Structure):
@@ -111,9 +136,9 @@ def disk_lines(label, path):
     while path and not Path(path).exists() and Path(path).parent != Path(path):
         path = Path(path).parent
     try:
-        return [f"{label}可用：{bytes_text(shutil.disk_usage(path).free)}（{volume_format(Path(path).resolve())}）"]
+        return [f"{label}可用：{bytes_text(shutil.disk_usage(path).free)}（{volume_format(resolve_path(path))}）"]  # 非玩家句
     except OSError:
-        return [f"{label}可用：-"]
+        return [f"{label}可用：-"]  # 非玩家句
 
 
 def own_bytes(package, packages):
@@ -128,19 +153,19 @@ def own_bytes(package, packages):
 def game_lines(request, game_id):
     if not game_id:
         return []
-    lines = ["", "【游戏】", "程序号：" + game_id]
+    lines = ["", "【游戏】", "程序号：" + game_id]  # 非玩家句
     library = request.get("library")
     games = (read(Path(library) / "catalog.json") or {}).get("games", []) if library else []
     game = next((g for g in games if isinstance(g, dict) and g.get("id") == game_id), None)
     if not game:
         return lines
     packages = [p for p in game.get("packages") or [] if isinstance(p, dict)]
-    lines += ["名称：" + str(game.get("name") or "-"), "版本：" + str(game.get("display") or "-")]
+    lines += ["名称：" + str(game.get("name") or "-"), "版本：" + str(game.get("display") or "-")]  # 非玩家句
     for package in packages:
-        lines.append(f"包：{package.get('type') or '?'} v{package.get('version', '?')} {package.get('format') or 'NSP/XCI'} {bytes_text(own_bytes(package, packages))}")
+        lines.append(f"包：{package.get('type') or '?'} v{package.get('version', '?')} {package.get('format') or 'NSP/XCI'} {bytes_text(own_bytes(package, packages))}")  # 非玩家句
     sources = {p["sha256"]: p for p in packages if p.get("sha256")}
     source_packages = list(sources.values()) + [p for p in packages if not p.get("sha256")]
-    lines.append("原包合计：" + bytes_text(sum(p.get("size") or 0 for p in source_packages)))
+    lines.append("原包合计：" + bytes_text(sum(p.get("size") or 0 for p in source_packages)))  # 非玩家句
     return lines
 
 
@@ -150,19 +175,19 @@ def build(private, task, extra=None):
     request = read(request_path(private, task)) or {}
     lines = ["S2Arm 错误摘要", "", "【出错】"]
     if extra.get("platform"):
-        lines.append("平台：" + str(extra["platform"]))
-    lines += ["任务号：" + task, "操作：" + str(record.get("operation") or "-"), "结果：" + str(record.get("state") or "-"),
-              "出错阶段：" + str(record.get("milestone") or record.get("stage") or "-"), "原因：" + str(record.get("message") or "-"),
-              "开始：" + when(record.get("started")), "结束：" + when(record.get("ended"))]
+        lines.append("平台：" + str(extra["platform"]))  # 非玩家句
+    lines += ["任务号：" + task, "操作：" + str(record.get("operation") or "-"), "结果：" + str(record.get("state") or "-"),  # 非玩家句
+              "出错阶段：" + str(record.get("milestone") or record.get("stage") or "-"), "原因：" + str(record.get("message") or "-"),  # 非玩家句
+              "开始：" + when(record.get("started")), "结束：" + when(record.get("ended"))]  # 非玩家句
     if isinstance(record.get("attemptNo"), int) and record["attemptNo"] > 1:
         lines.append(f"第 {record['attemptNo']} 次尝试")
     diagnostics = [d for d in record.get("diagnostics") or [] if isinstance(d, dict)]
     for item in diagnostics:
-        lines.append(f"错误码：{item.get('code') or '-'}（{item.get('component') or '-'}，阶段 {item.get('stage') or '-'}" +
-                     (f"，退出码 {item['exitCode']}" if item.get("exitCode") is not None else "") + "）")
-        lines.append("  说明：" + str(item.get("summary") or "-"))
+        lines.append(f"错误码：{item.get('code') or '-'}（{item.get('component') or '-'}，阶段 {item.get('stage') or '-'}" +  # 非玩家句
+                     (f"，退出码 {item['exitCode']}" if item.get("exitCode") is not None else "") + "）")  # 非玩家句
+        lines.append("  说明：" + str(item.get("summary") or "-"))  # 非玩家句
         if item.get("suggestion"):
-            lines.append("  建议：" + str(item["suggestion"]))
+            lines.append("  建议：" + str(item["suggestion"]))  # 非玩家句
     if not diagnostics:
         lines.append("错误码：无（作业没有写出诊断，通常是进程被结束或崩溃）")
     started = record.get("milestoneStarted") or {}
@@ -173,29 +198,32 @@ def build(private, task, extra=None):
         lines += ["", "【阶段用时】", "；".join(spans)]
     lines += game_lines(request, record.get("gameId"))
     library = request.get("library")
-    lines += ["", "【电脑】", f"S2Arm：{extra.get('app') or '-'}（{extra.get('build') or '-'}）",
-              "系统：" + platform.platform(), "处理器：" + str(processor()), "内存：" + bytes_text(memory_bytes())]
+    lines += ["", "【电脑】", f"S2Arm：{extra.get('app') or '-'}（{extra.get('build') or '-'}）",  # 非玩家句
+              "系统：" + platform.platform(), "处理器：" + str(processor()), "内存：" + bytes_text(memory_bytes())]  # 非玩家句
     if library:
-        lines += disk_lines("游戏库所在盘", library)
-    lines += disk_lines("数据目录所在盘", str(private))
+        lines += disk_lines("游戏库所在盘", library)  # 非玩家句
+    lines += disk_lines("数据目录所在盘", str(private))  # 非玩家句
     for label, key in (("Xcode", "xcode"), ("目标设备", "device")):
         if extra.get(key):
             lines.append(f"{label}：{extra[key]}")
     if sys.platform == "darwin":
         try:
             from install import signing_summary
-            lines.append("Xcode 签名：" + signing_summary())
+            lines.append("Xcode 签名：" + signing_summary())  # 非玩家句
         except Exception:
             pass   # 诊断附带信息，取不到不影响摘要
-    lines.append("密钥：" + ("已放入" if (Path(private) / "keys/prod.keys").is_file() else "没有"))
+    lines.append("密钥：" + ("已放入" if (Path(private) / "keys/prod.keys").is_file() else "没有"))  # 非玩家句
     checks = [c for c in extra.get("checks") or [] if isinstance(c, dict)]
     if checks:
-        lines += ["", "【环境检查未通过】"] + [f"{c.get('name')}：{c.get('message')}" for c in checks]
+        lines += ["", "【环境检查未通过】"] + [f"{c.get('name')}：{c.get('message')}" for c in checks]  # 非玩家句
     logs = log_paths(private, record)
     body = "\n\n".join(f"--- {p.name} ---\n{tail(p)}" for p in logs[-2:])
     if not body:
         details = [str(d["detail"]) for d in diagnostics if d.get("detail")]
         body = "\n\n".join(details) or "（这条作业没有留下日志文件）"
+    crash = next((c for c in (crash_excerpt(p) for p in reversed(logs[-2:])) if c), "")
+    if crash:
+        lines += ["", "【崩溃现场】", crash]
     lines += ["", "【日志末尾】", body, "", FEEDBACK]
     # 任务号是 UUID，脱敏规则会当成设备号抹掉；它不敏感，分析时要靠它对上日志
     mark = "S2ARMTASKMARK"

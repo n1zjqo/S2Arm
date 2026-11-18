@@ -136,6 +136,15 @@ void *module_sym(module_t *m, const char *name) {
     return NULL;
 }
 void *guest_sym(const char *name) { for (int i = 0; i < g_nmod; i++) { void *p = module_sym(&g_mod[i], name); if (p) return p; } return NULL; }
+// 同 guest_sym，另给符号表里记的函数长度（字节，0 = 没记）与所在模块
+static void *guest_sym_sized(const char *name, uint64_t *size, const module_t **mod) {
+    *size = 0; *mod = NULL;
+    for (int i = 0; i < g_nmod; i++) { module_t *m = &g_mod[i];
+        for (unsigned j = sym_hash(name) & m->symh_mask; m->symh[j]; j = (j + 1) & m->symh_mask) {
+            const Elf64_Sym *s = &m->symtab[m->symh[j]];
+            if (!strcmp(m->strtab + s->st_name, name)) { *size = s->st_size; *mod = m; return m->base + s->st_value; } } }
+    return NULL;
+}
 module_t *module_of(const void *p) {
     for (int i = 0; i < g_nmod; i++) {
         const uint8_t *b = g_mod[i].base;
@@ -148,12 +157,33 @@ module_t *module_of(const void *p) {
 // ---------- 改写器随行表 ----------
 static char g_main_build_id[40];
 const char *s2a_main_build_id(void) { return g_main_build_id; }
-// 金手指目录给 C#（services Cheats.cs）：有界面入口的宿主（ios/vpad_cheats.m 装载时）先登记，才回 <文档根>/cheats（s2a_docs.h 唯一取法）；
-//   没登记（Mac / 安卓，没有金手指界面）回空串，C# 就不起线程、不碰用户文稿夹。平台差异落在平台层登记这一步，共享代码不判平台
+// 金手指目录给 C#（services Cheats.cs）：有开关入口的宿主（iOS ios/vpad_cheats.m、Mac macos/front_mac.m 装载时）先登记，才回目录；
+//   没登记（安卓）回空串，C# 就不起线程。目录：起局方给了 S2A_CHEATS_DIR 就用它（Mac 启动器 pack/jobs/build.py = 这款游戏文件夹的 cheats/，
+//   与启动器「游戏设置 → 金手指」同一份），否则 <文档根>/cheats（s2a_docs.h 唯一取法；iOS）。平台差异落在平台层登记这一步，共享代码不判平台
 static _Atomic int g_cheats_host;
 void s2a_cheats_host_enable(void) { atomic_store(&g_cheats_host, 1); }
-const char *s2a_cheats_dir(void) { static char d[1024]; if (!atomic_load(&g_cheats_host)) return ""; s2a_docs_path(d, sizeof d, "cheats"); return d; }
+const char *s2a_cheats_dir(void) {
+    static char d[1024]; if (!atomic_load(&g_cheats_host)) return "";
+    const char *e = getenv("S2A_CHEATS_DIR");
+    if (e && *e) snprintf(d, sizeof d, "%s", e); else s2a_docs_path(d, sizeof d, "cheats");
+    return d;
+}
 uint64_t s2a_main_base(void) { return g_nmod ? (uint64_t)(uintptr_t)g_mod[0].base : 0; }   // 主程序（Horizon 序第一个模块）装载基址：金手指 Atmosphere「main」区（services Cheats.cs）
+// 金手指 Atmosphere「main」区偏移 → 真实地址（services Cheats.cs）：Horizon 把起局模块按 main → subsdk0..N → sdk 首尾相接装（各自映像尾 4 KB 对齐），
+//   金手指作者照这个排布写偏移，超出 main 的落进后面的模块（11-13 实测：一款的帧率金手指写 main+0x24191F4 = sdk 里的变量）；我们的模块按 2 MB 对齐各自摆放，
+//   直接加 main 基址会写到别的模块的别处。映像尾取各模块 MOD0 的 bss 结尾（与 NSO 头算的映像尾 4 KB 取整后一致，11-13 量 20 款 50 个模块全同）。
+//   直连不装的 GPU 驱动模块不知道大小：排在它后面的偏移、超出最后一个起局模块的偏移都回 0（读写落空，不写错地方）；nn::ro 后装的 NRO 不在 Horizon 这段里
+static int g_nboot, g_boot_cut = 1 << 30;   // 起局装的模块数（之后是 NRO）；第一个前面有没装模块的下标
+uint64_t s2a_main_region_va(uint64_t off) {
+    uint64_t h = 0;
+    for (int i = 0; i < g_nboot && i < g_boot_cut; i++) {
+        const uint8_t *b = g_mod[i].base; uint32_t mod0 = *(const uint32_t *)(b + 4);
+        uint64_t end = ((uint64_t)mod0 + (int64_t)*(const int32_t *)(b + mod0 + 0xC) + 0xFFF) & ~0xFFFull;
+        if (off - h < end) return (uint64_t)(uintptr_t)b + (off - h);
+        h += end;
+    }
+    return 0;
+}
 // 同一表解析器读取目录流或已验证 APK 的借用字节；后者不落地、也不二次打开。
 struct loader_text {
     FILE *file;
@@ -367,6 +397,9 @@ static int jump_slot_addend(void) {
 }
 void s2a_nro_table_load(const char *dir); const char *s2a_nro_defer_lookup(const char *name);   // nrodefer.c：romfs NRO 导出表
 uint64_t s2a_direct_lookup(const char *name);
+#if !defined(__ANDROID__)
+uint64_t s2a_direct_stub(const char *name);   // gfxmode.c：找遍之后，直连模式下 gl* 核心名的安全空实现
+#endif
 static uint64_t resolve_global(const char *name) {   // 按装载顺序找已装模块里的定义（ELF 缺省语义 = Horizon rtld）
     for (int i = 0; i < g_nmod; i++) { void *p = module_sym(&g_mod[i], name); if (p) return (uint64_t)p; }
     return 0;
@@ -450,6 +483,7 @@ static void relocate(module_t *m) {
     for (const Elf64_Dyn *d = m->dyn; d->d_tag; d++) switch (d->d_tag) {
         case DT_RELA: rela = d->d_un.d_ptr; break; case DT_RELASZ: relasz = d->d_un.d_val; break;
         case DT_JMPREL: jmprel = d->d_un.d_ptr; break; case DT_PLTRELSZ: pltsz = d->d_un.d_val; break;
+        case 3 /* DT_PLTGOT */: m->pltgot = d->d_un.d_ptr; break;
     }
     unsigned cnt[3] = {0}, nlibc = 0, nweak0 = 0, ntls = 0, nforeign = 0;
     const int rdbg = reloc_foreign_debug(); char foreign[160] = "";
@@ -461,6 +495,9 @@ static void relocate(module_t *m) {
             const Elf64_Rela *r = &tabs[t][i];
             uint64_t *where = (uint64_t *)(m->base + r->r_offset);
             unsigned type = ELF64_R_TYPE(r->r_info), si = ELF64_R_SYM(r->r_info);
+            // 同游戏 SDK nn::ro::detail::RoModule::Relocation：JUMP_SLOT 槽的原值（链接时填的 PLT 表头）+ 基址 = 懒绑定入口，
+            //   ro_handoff 写进本模块的 RoModule（游戏的 nn::ro 卸 NRO 时 RevertReference 把指向它的函数槽改回这个入口）
+            if (type == R_AARCH64_JUMP_SLOT && !m->plt_stub && *where) m->plt_stub = (uint64_t)m->base + *where;
             enum reloc_class rc = reloc_class(type);
             if (rc == RELOC_RELATIVE) { *where = (uint64_t)m->base + r->r_addend; cnt[0]++; continue; }
             if (rc == RELOC_TLS_LEFT) { ntls++; continue; }   // 同任天堂 rtld：TLS 重定位留给游戏 sdk 的 __nnmusl_init_dso（reloc_class.h）
@@ -482,6 +519,14 @@ static void relocate(module_t *m) {
                 v = s2a_direct_lookup(nm);   // 直连模式（gfxmode.c）：游戏导入的 nvnBootstrapLoader 解析到直连图形层；通用模式恒 0，走下面原路径
                 if (!v) v = resolve_global(nm);
                 if (!v) { void *f = s2a_libc_lookup(nm); if (f) { v = (uint64_t)sw_xstack_wrap(nm, f); nlibc++; } }
+#if !defined(__ANDROID__)   // 安卓没有直连 GL 层（s2a_direct_lookup 在 android/native 自给）
+                if (!v && !s2a_nro_defer_lookup(nm)) v = s2a_direct_stub(nm);   // 都没定义（romfs NRO 也没有）的 gl* 核心名：安全空实现，放最后免得顶掉游戏模块自己的定义（#601）
+#endif
+                if (!v && (s->st_info >> 4) == 2) {   // D-WSFE：按名记下来（含槽位偏移），崩在「往全局指针写」时能对上是哪个；游戏自带 NRO 定义的另报红（起局置 0、nn::ro 装进来后不补）
+                    const char *wnro = s2a_nro_defer_lookup(nm);
+                    if (wnro) LOG("【红】%s: 无定义弱符号 %s 置 0（槽 %s+%#llx、%s），但 romfs/nro/%s 定义了它：装进来后这里仍是 0", m->name, nm, m->name, (unsigned long long)((uint8_t *)where - (uint8_t *)m->base), type == R_AARCH64_JUMP_SLOT ? "函数" : "数据", wnro);
+                    else LOG("%s: 无定义弱符号 %s 置 0（槽 %s+%#llx、%s）", m->name, nm, m->name, (unsigned long long)((uint8_t *)where - (uint8_t *)m->base), type == R_AARCH64_JUMP_SLOT ? "函数" : "数据");
+                }
                 if (!v && (s->st_info >> 4) == 2) { nweak0++; *where = type == R_AARCH64_JUMP_SLOT ? 0 : (uint64_t)r->r_addend; cnt[type == R_AARCH64_JUMP_SLOT ? 2 : 1]++; continue; }   // 无定义弱符号 = 0（ELF / rtld 语义）
                 if (!v) {   // 游戏自带 NRO（romfs/nro）的导出：Horizon 上要等 nn::ro 装进来才解析，记普通日志不计红；桩不变，真被调到照旧报红中止
                     const char *nro = s2a_nro_defer_lookup(nm);
@@ -885,6 +930,40 @@ static void *ro_local_init(void) {
     if (guest_sym("_ZN2nn2ro6detail15g_pAutoLoadListE")) LOG("nn::ro 交接：游戏 SDK 有自动装载表头却既不导出 RoModule::Initialize 也不导出 LoadModule，自动装载表留空（LookupSymbol 查不到符号）");
     return NULL;
 }
+// RoModule 里「懒绑定入口」字段的偏移（rtld 填、SDK 的 Initialize 清零）：从游戏 SDK 导出的 RoModule::RestoreFunctions 读——
+//   它把指向被卸模块的函数槽写回这个字段：ldr Xt, [x0, #偏移] 紧跟 str Xt, [Xn, Xm]。本机 11 份 SDK（10.x–20.x）都是 0xc8；读不出回 -1。
+//   老 SDK（11-13 一款第一方游戏）函数名是单数 RoModule::RestoreFunction、字段在 +0xb0，同样两条指令；
+//   更新的 SDK（11-13 两款 Switch 2 游戏）多一个回调参数 RestoreFunctions(RoModule*, void (*)(const char*))、开头先有一条 retab 早退，字段仍在 +0xc8：三个名字都认
+//   函数开头常有提前返回（表空就 ret；11-13 0100F7E00C70E000 的 SDK：第一个 ret 在 +0x24，那两条指令在 +0x90 / +0x94）：按符号表记的函数长度扫全身，
+//   不在第一个 ret 停；符号没记长度时照旧扫到 ret 为止（不越过模块映像末）。
+//   记的长度越出模块映像（符号表与映像对不上）、或范围内认出两个不同偏移：报红回 -1，不猜
+static long ro_stub_off(void) {
+    uint64_t size = 0; const module_t *m = NULL;
+    const uint32_t *f = guest_sym_sized("_ZN2nn2ro6detail8RoModule16RestoreFunctionsEPS2_", &size, &m);
+    if (!f) f = guest_sym_sized("_ZN2nn2ro6detail8RoModule16RestoreFunctionsEPS2_PFvPKcE", &size, &m);
+    if (!f) f = guest_sym_sized("_ZN2nn2ro6detail8RoModule15RestoreFunctionEPS2_", &size, &m);
+    if (!f) return -1;
+    uint64_t at = (uint64_t)((const uint8_t *)f - m->base), end = m->patch_off < 0 ? m->image_size : m->key_page_off;   // 映像末：同 ro_handoff 的模块对象边界
+    if (at >= end || size > end - at) {
+        LOG("【红】nn::ro 交接：%s 的 RestoreFunctions（+%#llx，记长 %#llx 字节）越出模块映像（%#llx），不读", m->name, (unsigned long long)at, (unsigned long long)size, (unsigned long long)end);
+        return -1;
+    }
+    uint64_t room = (end - at) / 4;
+    int n = size ? (int)(size / 4 < 0x400 ? size / 4 : 0x400) : (int)(room < 0x100 ? room : 0x100);
+    long found = -1;
+    for (int i = 1; i < n && (size || f[i - 1] != 0xd65f03c0); i++) {
+        uint32_t s = f[i], l = f[i - 1];
+        if ((s & 0xffe00c00) == 0xf8200800 && (l & 0xffc00000) == 0xf9400000 && ((l >> 5) & 31) == 0 && (l & 31) == (s & 31)) {
+            long off = (long)((l >> 10) & 0xfff) * 8;
+            if (found >= 0 && off != found) {
+                LOG("【红】nn::ro 交接：%s 的 RestoreFunctions 里认出两个懒绑定入口偏移（+%#lx / +%#lx），不猜", m->name, (unsigned long)found, (unsigned long)off);
+                return -1;
+            }
+            found = off;
+        }
+    }
+    return found;
+}
 static void ro_handoff(void) {
     g_nauto = g_nmod;
     void *init5 = guest_sym("_ZN2nn2ro6detail8RoModule10InitializeEmmPKNS1_3Elf5Elf643DynEb");   // (基址, 大小, 动态段, 布尔)
@@ -893,7 +972,7 @@ static void ro_handoff(void) {
     if (!init5 && !init2 && !init6 && !guest_sym("_ZN2nn2ro6detail15g_pAutoLoadListE")) { LOG("nn::ro 交接：游戏 SDK 没有 RoModule::Initialize（不用 nn::ro），不建自动装载表"); return; }
     // 有交接全局却建不了模块对象（初始化内联进 LoadModule 的 SDK）：全局照写、自动装载表留空环——LookupSymbol 返回「找不到」而不是读空表头，nn::ro 装 NRO 照常挂手动装载表
     void *bad = init6 ? sw_xstack_wrap("nn::ro RoModule 初始化报错", (void *)ro_init_bad) : NULL;
-    unsigned n = 0;
+    unsigned n = 0, nlazy = 0; long stub_off = ro_stub_off(); void *bind = guest_sym("_ZN2nn2ro9BindEntryEv");
     for (int i = 0; (init5 || init2 || init6) && i < g_nmod; i++) {
         module_t *m = &g_mod[i];
         uint32_t mod0 = *(uint32_t *)(m->base + 4); int32_t rel = *(int32_t *)(m->base + mod0 + 0x18);
@@ -909,19 +988,26 @@ static void ro_handoff(void) {
             if (!hb || !hd) { LOG("【红】nn::ro 交接：%s 的模块对象里没有基址 / 动态段（%d / %d），找来的初始化参数不对，不进自动装载表", m->name, hb, hd); continue; }
         }
         o->prev = g_ro_auto.prev; o->next = &g_ro_auto; g_ro_auto.prev->next = o; g_ro_auto.prev = o; n++;
+        // rtld 的懒绑定交接（同 SDK RoModule::Relocation 末尾）：模块对象记 PLT 表头，GOT[1] = 模块对象、GOT[2] = nn::ro::BindEntry。
+        //   缺了它，游戏的 nn::ro 卸 NRO 时把本模块指向它的函数槽改回 0，重装后一调就跳 0（#858：换角色后 pc 0、lr 在 main）
+        if (m->plt_stub && stub_off >= 0) *(uint64_t *)((uint8_t *)o + stub_off) = m->plt_stub;
+        if (m->pltgot && bind) { uint64_t *got = (uint64_t *)(m->base + m->pltgot); got[1] = (uint64_t)o; got[2] = (uint64_t)bind; nlazy++; }
     }
+    if (n && (stub_off < 0 || !bind)) LOG("【红】nn::ro 交接：游戏 SDK 里认不出懒绑定交接（RestoreFunctions 偏移 %ld、BindEntry %s）：卸 NRO 后主程序调它的函数会跳 0", stub_off, bind ? "有" : "没有");
     void *look = sw_xstack_wrap("nn::ro LookupGlobalAuto", (void *)ro_lookup_auto);
     static const char *const k[4] = {"_ZN2nn2ro6detail15g_pAutoLoadListE", "_ZN2nn2ro6detail17g_pManualLoadListE",
                                      "_ZN2nn2ro6detail14g_pRoDebugFlagE", "_ZN2nn2ro6detail34g_pLookupGlobalAutoFunctionPointerE"};
     const uint64_t v[4] = {(uint64_t)&g_ro_auto, (uint64_t)&g_ro_manual, (uint64_t)&g_ro_debug, (uint64_t)look};
     unsigned w = 0;
     for (int i = 0; i < g_nmod; i++) for (int j = 0; j < 4; j++) { uint64_t *p = module_sym(&g_mod[i], k[j]); if (p) { *p = v[j]; w++; } }
-    LOG("nn::ro 交接：自动装载表 %u 个模块（RoModule::Initialize %s），交接全局写了 %u 处", n, init5 ? "导出四参" : init2 ? "导出二参" : init6 ? "LoadModule 里的五参" : "没有，表留空", w);
+    LOG("nn::ro 交接：自动装载表 %u 个模块（RoModule::Initialize %s），交接全局写了 %u 处；懒绑定交接 %u 个模块（入口字段 +%#lx）", n, init5 ? "导出四参" : init2 ? "导出二参" : init6 ? "LoadModule 里的五参" : "没有，表留空", w, nlazy, (unsigned long)stub_off);
 }
 static uint64_t g_rtld_lookup_manual_slot;
+__attribute__((weak)) void s2a_nvos_trace_install(void) {}   // nvos_trace.c 强定义（诊断，只 Mac）；只链 loader.c 的单测用这个空的
 static void finish_modules(void) {
     for (int i = 0; i < g_nmod; i++) relocate(&g_mod[i]);
     ro_handoff();
+    s2a_nvos_trace_install();   // 诊断：S2A_NVOS_TRACE 设了才改道 sdk 的 NvOs 分配函数（nvos_trace.c，只 Mac）
     // rtld 职责：各模块的 nn::ro::detail::g_pLookupGlobalManualFunctionPointer（初值 0、无重定位）指到 rtld 的「手动装载模块查符号」槽。
     // 不装 rtld、也没有手动装载的模块：给一个宿主自有的槽，nn::ro 写进来的指针没人读（真机 rtld 只在解析手动模块时调它）
     for (int i = 0; i < g_nmod; i++) { uint64_t *p = module_sym(&g_mod[i], "_ZN2nn2ro6detail36g_pLookupGlobalManualFunctionPointerE"); if (p && !*p) *p = (uint64_t)&g_rtld_lookup_manual_slot; }
@@ -953,7 +1039,7 @@ void load_modules(const char *dir, const char **names_in, int n_in) {
     const char **names = calloc(n_in > 0 ? (size_t)n_in : 1, sizeof *names); int n = 0;
     if (!names) die("模块名表分配失败");
     for (int i = 0; i < n_in; i++) {
-        if (gpu_driver_skip(dir, names_in[i])) { LOG("直连：%s 是 GPU 驱动模块（gpu_drivers.tsv），不装——游戏对它的调用由直连图形层答", names_in[i]); continue; }
+        if (gpu_driver_skip(dir, names_in[i])) { LOG("直连：%s 是 GPU 驱动模块（gpu_drivers.tsv），不装——游戏对它的调用由直连图形层答", names_in[i]); if (g_boot_cut > n) g_boot_cut = n; continue; }
         names[n++] = names_in[i];
     }
     int cap = n;
@@ -984,6 +1070,7 @@ void load_modules(const char *dir, const char **names_in, int n_in) {
         LOG("%s: 基址 %p 大小 %#zx", names[i], m->base, m->size);
         g_nmod++;
     }
+    g_nboot = g_nmod;
     s2a_nro_table_load(dir);   // 模块目录的 nro_exports.tsv（出包 tools/nro_exports.py 写；没有 romfs/nro 的款没有这张表）
     finish_modules();          // 统一重定位、填 rtld 手动装载查符号槽、报未解析导入
     if (g_deferred) LOG("装载：%u 个导入延迟到 nn::ro 装载（romfs NRO 导出，游戏用 nn::ro 装进来时才解析；起局前没装就被调到照旧报红中止）", g_deferred);
@@ -1030,6 +1117,11 @@ void load_modules_from_source(const struct s2a_loader_source *source, const char
         s2a_widen_source_policy(i, blob.bytes, blob.length);
         source->release(source->context, &blob);
     }
+    // 社区补丁表（#48 D2，make_pack 放在 modules/，与宽屏表同一读面验签）：整包一张表，读一次，每个模块各装一遍，全部装完再还
+    void s2a_cpatch_load_source(module_t *, const void *, size_t);
+    struct s2a_loader_blob cpatch = {0};
+    int cpatch_rc = source->read(source->context, "cpatch.tsv", &cpatch);
+    if (cpatch_rc != ENOENT && (cpatch_rc || (!cpatch.bytes && cpatch.length))) die("APK 读取 cpatch.tsv 失败 rc=%d", cpatch_rc);
     create_keys();
     if (plat_tsd_init()) die("TSD 初始化失败");
     for (int i = 0; i < n; i++) {
@@ -1059,9 +1151,11 @@ void load_modules_from_source(const struct s2a_loader_source *source, const char
             s2a_widen_load_source(m, widen.bytes, widen.length);
             source->release(source->context, &widen);
         }
+        if (cpatch_rc != ENOENT) s2a_cpatch_load_source(m, cpatch.bytes, cpatch.length);   // 同目录装载：宽屏之后、统一重定位之前
         LOG("%s: APK 基址 %p 大小 %#zx", names[i], m->base, m->size);
         g_nmod++;
     }
+    if (cpatch_rc != ENOENT) source->release(source->context, &cpatch);
     free(fixups);
     finish_modules();
 }
@@ -1150,11 +1244,33 @@ __attribute__((visibility("default"), used)) int s2a_nro_unmap(uint64_t base) {
     for (int i = 0; i < g_nnro; i++) if (g_nro[i].loaded && g_nro[i].mod >= 0 && (uint64_t)g_mod[g_nro[i].mod].base == base) { g_nro[i].loaded = 0; rc = 0; LOG("nn::ro 卸 NRO %s：基址 %#llx", g_nro[i].name, (unsigned long long)base); }
     pthread_mutex_unlock(&g_nro_mu); return rc;
 }
+// 包里没有改写映像的 NRO（s2a_nro_map 返回 1）：游戏此刻已在内存里解开了整份 NRO（#8be819：一款把 NRO 藏在自有加密归档里，出包时 romfs 里认不出），
+//   原样存一份到 <文档根>/wire/<程序号>/nro/<SHA-256>.nro，下次准备这款时收进改写（runtime/rewriter/nro_to_nso.py 的「运行时留下的 NRO」来源）。
+//   sha 由调用方（ro 服务）按这份字节算好、且已核过在游戏的 NRR 登记里。0 = 新存下；2 = 早已存过（还没重新准备）；1 = 存不了
+__attribute__((weak)) uint64_t s2a_program_id(void) { return 0; }   // svc_mem.c 强定义；只链 loader.c 的单测（loader_ro_lookup / jumpslot / order）用这个
+__attribute__((visibility("default"), used)) int s2a_nro_keep(const uint8_t sha[32], const uint8_t *data, uint64_t size) {
+    if (!sha || !data || !size || size > (1ull << 30)) return 1;
+    char hex[65], dir[1100], p[1200], tmp[1240];
+    for (int i = 0; i < 32; i++) snprintf(hex + 2 * i, 3, "%02x", sha[i]);
+    s2a_docs_path(dir, sizeof dir, "wire"); mkdir(dir, 0755);
+    s2a_docs_path(dir, sizeof dir, "wire/%016llX", (unsigned long long)s2a_program_id()); mkdir(dir, 0755);
+    strlcat(dir, "/nro", sizeof dir); mkdir(dir, 0755);
+    snprintf(p, sizeof p, "%s/%s.nro", dir, hex);
+    struct stat st;
+    if (!stat(p, &st) && (uint64_t)st.st_size == size) { LOG("【红】nn::ro：NRO %.8s… 上次已存下（%s），这款还没用 Mac 版启动器重新准备，包里仍没有它", hex, p); return 2; }
+    snprintf(tmp, sizeof tmp, "%s.%d.tmp", p, (int)getpid());
+    int fd = open(tmp, O_CREAT | O_TRUNC | O_WRONLY, 0644); if (fd < 0) { LOG("【红】nn::ro：存 NRO %.8s… 失败（%s：%s）", hex, tmp, strerror(errno)); return 1; }
+    uint64_t at = 0; while (at < size) { ssize_t w = write(fd, data + at, (size_t)(size - at > (1u << 26) ? (1u << 26) : size - at)); if (w <= 0) break; at += (uint64_t)w; }
+    int ok = at == size && !fsync(fd); close(fd);
+    if (!ok || rename(tmp, p)) { unlink(tmp); LOG("【红】nn::ro：存 NRO %.8s… 失败（写了 %llu / %llu 字节）", hex, (unsigned long long)at, (unsigned long long)size); return 1; }
+    LOG("【红】nn::ro：包里没有 NRO %.8s…（%llu 字节），已把游戏解开的这份存到 %s：用 Mac 版启动器重新准备这款后就能装上（Windows 版启动器收不回它）", hex, (unsigned long long)size, p);
+    return 0;
+}
 // The coordinator replaces guest pages before releasing loader registrations.
 // Signed iOS images are remapped from their pristine original segments.
 void s2a_loader_session_reset(void) {
     for (int i = 0; i < g_mod_cap; i++) free(g_mod[i].symh);
-    free(g_mod); g_mod = NULL; g_mod_cap = 0; g_nmod = 0;
+    free(g_mod); g_mod = NULL; g_mod_cap = 0; g_nmod = 0; g_nboot = 0; g_boot_cut = 1 << 30;
 #if defined(__APPLE__)
     g_modcur = g_slot_at = 0;
 #endif

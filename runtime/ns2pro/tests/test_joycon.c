@@ -53,6 +53,68 @@ int main(void) {
     ns2_raw_input raw; ns2_decode_input_report(5, left05, sizeof left05, &raw);
     CK(raw.buttons == BIT(UP) && ns2_decode_side_buttons(left05, sizeof left05) == NS2_SIDE_SL_L,
        "⑫ SL / SR 不进按键位：左只按住上 + SL，按键只有上，SL 只在横握专用的 side 位里（实 %llx）", (unsigned long long)raw.buttons);
+    // 扫描策略（11-11 实机：记着左只、左只没开机，右只长按 SYNC 连不上）。期望按「另一侧能不能在直连等待期间被找到」手算：
+    //   只剩一只 Joy-Con、还在连（没就绪、没失败）也要扫另一侧；失败了就不扫；Pro / 空不扫另一侧；Joy-Con 失败不停扫描、Pro 失败照旧停
+    CK(ns2_scan_wants_other_side(NS2_KIND_JOYCON_L, 0, 0) && ns2_scan_wants_other_side(NS2_KIND_JOYCON_R, 0, 0) && ns2_scan_wants_other_side(NS2_KIND_JOYCON_L, 1, 0),
+       "⑬ 只有一只 Joy-Con：还在连（未就绪）也继续扫另一侧，已就绪照旧扫");
+    CK(!ns2_scan_wants_other_side(NS2_KIND_JOYCON_L, 0, 1) && !ns2_scan_wants_other_side(NS2_KIND_PRO, 1, 0) && !ns2_scan_wants_other_side(NS2_KIND_NONE, 0, 0),
+       "⑭ 那一只已失败 / 是 Pro / 没有型号：不扫另一侧");
+    CK(!ns2_link_failure_stops_scan(NS2_KIND_JOYCON_L) && !ns2_link_failure_stops_scan(NS2_KIND_JOYCON_R) && ns2_link_failure_stops_scan(NS2_KIND_PRO),
+       "⑮ 链路失败：Joy-Con 不停扫描（另一侧还在窗口里），Pro 照旧停");
+    // 对外输出型号（#520）：期望按「两只都在出输入且一左一右才算一对」手算
+    CK(ns2_output_kind(NS2_KIND_JOYCON_L, 1, NS2_KIND_JOYCON_R, 1) == NS2_KIND_JOYCON_PAIR && ns2_output_kind(NS2_KIND_JOYCON_R, 1, NS2_KIND_JOYCON_L, 1) == NS2_KIND_JOYCON_PAIR,
+       "⑯ 左右都在出输入：一对（槽位顺序无关）");
+    CK(ns2_output_kind(NS2_KIND_JOYCON_L, 1, NS2_KIND_JOYCON_R, 0) == NS2_KIND_JOYCON_L && ns2_output_kind(NS2_KIND_JOYCON_L, 0, NS2_KIND_JOYCON_R, 1) == NS2_KIND_JOYCON_R,
+       "⑰ 另一只还在连 / 已失败：只报在出输入的那只");
+    CK(ns2_output_kind(NS2_KIND_PRO, 1, NS2_KIND_NONE, 0) == NS2_KIND_PRO && ns2_output_kind(NS2_KIND_NONE, 0, NS2_KIND_NONE, 0) == NS2_KIND_NONE &&
+       ns2_output_kind(NS2_KIND_JOYCON_L, 1, NS2_KIND_JOYCON_L, 1) == NS2_KIND_JOYCON_L,
+       "⑱ Pro 照报 Pro；都没有报 NONE；两只同侧不算一对");
+    // 单只原始方向（#520 A）：期望按「照真机，按键 / 摇杆不动、只把这只的 SL / SR 放进扩展位 21 / 22」手算
+    ns2_state rr = {BIT(X) | BIT(RS) | BIT(PLUS), 5, 6, 300, -400};
+    ns2_joycon_raw(NS2_KIND_JOYCON_R, NS2_SIDE_SL_R | NS2_SIDE_SR_L, &rr);
+    CK(rr.buttons == (BIT(X) | BIT(RS) | BIT(PLUS) | BIT(NS2_BUTTON_SL)) && rr.lx == 5 && rr.ly == 6 && rr.rx == 300 && rr.ry == -400,
+       "⑲ 右只原始方向：键 / 摇杆原样，只收自己的 SL（左只的 SR 不算）（实 %llx）", (unsigned long long)rr.buttons);
+    ns2_state lr = {BIT(UP) | BIT(MINUS), 100, 200, 0, 0};
+    ns2_joycon_raw(NS2_KIND_JOYCON_L, NS2_SIDE_SR_L, &lr);
+    CK(lr.buttons == (BIT(UP) | BIT(MINUS) | BIT(NS2_BUTTON_SR)) && lr.lx == 100 && lr.ly == 200, "⑳ 左只原始方向：SR → 扩展位 22");
+    ns2_state pro2 = {BIT(A), 1, 2, 3, 4}; ns2_joycon_raw(NS2_KIND_PRO, NS2_SIDE_SL_L, &pro2);
+    CK(pro2.buttons == BIT(A) && pro2.lx == 1, "㉑ Pro：原始方向不动");
+    // 原始方向再转横握 = 直接横握（宿主退回 Pro 时用；同 ④ / ⑤ 的输入）
+    ns2_state a1 = {BIT(UP) | BIT(MINUS) | BIT(CAPTURE) | BIT(L) | BIT(ZL), 100, 200, 7, 8}, a2 = a1;
+    ns2_joycon_raw(NS2_KIND_JOYCON_L, NS2_SIDE_SL_L, &a1); ns2_joycon_raw_to_sideways(NS2_KIND_JOYCON_L, &a1);
+    ns2_joycon_sideways(NS2_KIND_JOYCON_L, NS2_SIDE_SL_L, &a2);
+    ns2_state b1 = {BIT(X) | BIT(RS) | BIT(HOME) | BIT(R) | BIT(ZR), 5, 6, 300, -400}, b2 = b1;
+    ns2_joycon_raw(NS2_KIND_JOYCON_R, NS2_SIDE_SR_R, &b1); ns2_joycon_raw_to_sideways(NS2_KIND_JOYCON_R, &b1);
+    ns2_joycon_sideways(NS2_KIND_JOYCON_R, NS2_SIDE_SR_R, &b2);
+    CK(!memcmp(&a1, &a2, sizeof a1) && !memcmp(&b1, &b2, sizeof b1) && a1.buttons == (BIT(Y) | BIT(PLUS) | BIT(HOME) | BIT(L)),
+       "㉒ 原始方向再转横握：与传输层直接横握一致（左只 SL → L、右只 SR → R），扩展位不留");
+    // 两只拼着时拆成各一位玩家（#520 D）：只有这一只自己的 SL 和 SR 同时按着才拆；
+    //   负对照：只按一个、按的是另一只的 SL / SR（位不属于这一只）、Pro / 没型号都不拆
+    CK(ns2_joycon_split_wanted(NS2_KIND_JOYCON_L, NS2_SIDE_SL_L | NS2_SIDE_SR_L) && ns2_joycon_split_wanted(NS2_KIND_JOYCON_R, NS2_SIDE_SL_R | NS2_SIDE_SR_R),
+       "㉓ 拼着时同按这一只的 SL + SR：拆成各一位玩家");
+    CK(!ns2_joycon_split_wanted(NS2_KIND_JOYCON_L, NS2_SIDE_SL_L) && !ns2_joycon_split_wanted(NS2_KIND_JOYCON_L, NS2_SIDE_SL_R | NS2_SIDE_SR_R) &&
+       !ns2_joycon_split_wanted(NS2_KIND_JOYCON_R, NS2_SIDE_SR_R) && !ns2_joycon_split_wanted(NS2_KIND_PRO, 15) && !ns2_joycon_split_wanted(NS2_KIND_NONE, 15),
+       "㉔ 负对照：只按一个 / 按的不是自己那侧 / Pro / 没型号都不拆");
+    // 分配玩家的登记手势（#520 E）：手算真机规则——整只 L + R、单只 SL + SR、左只 L / 右只 R 是「半边」（两只同时各按一边才合成一对）
+    CK(ns2_assign_gesture_of(NS2_KIND_PRO, BIT(L) | BIT(R), 0) == NS2_ASSIGN_WHOLE && ns2_assign_gesture_of(NS2_KIND_JOYCON_PAIR, BIT(L) | BIT(R) | BIT(A), 0) == NS2_ASSIGN_WHOLE,
+       "㉕ Pro / 一对同按 L + R：整只登记");
+    CK(ns2_assign_gesture_of(NS2_KIND_JOYCON_L, 0, NS2_SIDE_SL_L | NS2_SIDE_SR_L) == NS2_ASSIGN_SINGLE &&
+       ns2_assign_gesture_of(NS2_KIND_JOYCON_R, BIT(R), NS2_SIDE_SL_R | NS2_SIDE_SR_R) == NS2_ASSIGN_SINGLE,
+       "㉖ 单只同按自己的 SL + SR：单只登记（顺带压到 R 也算单只）");
+    CK(ns2_assign_gesture_of(NS2_KIND_JOYCON_L, BIT(L), 0) == NS2_ASSIGN_HALF && ns2_assign_gesture_of(NS2_KIND_JOYCON_R, BIT(R), 0) == NS2_ASSIGN_HALF,
+       "㉗ 左只按 L / 右只按 R：半边（等另一只配成一对）");
+    CK(ns2_assign_gesture_of(NS2_KIND_PRO, BIT(L), 0) == NS2_ASSIGN_NONE && ns2_assign_gesture_of(NS2_KIND_JOYCON_L, BIT(R), 0) == NS2_ASSIGN_NONE &&
+       ns2_assign_gesture_of(NS2_KIND_JOYCON_R, BIT(L), NS2_SIDE_SL_L | NS2_SIDE_SR_L) == NS2_ASSIGN_NONE && ns2_assign_gesture_of(NS2_KIND_NONE, ~0ull, 15) == NS2_ASSIGN_NONE,
+       "㉘ 负对照：Pro 只按 L / 左只按 R / 右只按左边的 SL + SR / 没型号都不算");
+    // Switch 2 Pro 直连期间扫描（11-16 D-MT6K：直连 30 秒期间不扫描、超时不转扫描，长按 SYNC 的配对广播没人接）。期望按「直连还没建起链路时，配对广播要有人接」手算
+    CK(ns2_pro_direct_pending(NS2_KIND_PRO, 0, 0) && !ns2_pro_direct_pending(NS2_KIND_PRO, 1, 0) && !ns2_pro_direct_pending(NS2_KIND_PRO, 0, 1) && !ns2_pro_direct_pending(NS2_KIND_JOYCON_L, 0, 0),
+       "㉙ Pro 直连还没就绪、没失败：继续扫描；已就绪 / 已失败 / Joy-Con 不走这条");
+    CK(ns2_pro_take_pairing(NS2_KIND_PRO, 0, 0, NS2_KIND_PRO, NS2_WAKE_PAIRING) && !ns2_pro_take_pairing(NS2_KIND_PRO, 0, 1, NS2_KIND_PRO, NS2_WAKE_PAIRING) &&
+       !ns2_pro_take_pairing(NS2_KIND_PRO, 1, 0, NS2_KIND_PRO, NS2_WAKE_PAIRING) && !ns2_pro_take_pairing(NS2_KIND_PRO, 0, 0, NS2_KIND_PRO, NS2_WAKE_OTHER) &&
+       !ns2_pro_take_pairing(NS2_KIND_PRO, 0, 0, NS2_KIND_JOYCON_L, NS2_WAKE_PAIRING) && !ns2_pro_take_pairing(NS2_KIND_JOYCON_L, 0, 0, NS2_KIND_PRO, NS2_WAKE_PAIRING),
+       "㉚ 挂着直连的 Pro 只被 Pro 的配对广播接管；链路已建 / 已就绪 / 唤醒别的主机 / Joy-Con 都不接管");
+    CK(ns2_pro_rescan_after_drop(NS2_KIND_PRO, 0, 0) && !ns2_pro_rescan_after_drop(NS2_KIND_PRO, 1, 0) && !ns2_pro_rescan_after_drop(NS2_KIND_PRO, 0, 1) && !ns2_pro_rescan_after_drop(NS2_KIND_JOYCON_R, 0, 0),
+       "㉛ Pro 从没就绪就断了：转扫描；用过的断开（重挂等它回来）/ 已重挂 / Joy-Con 不转");
     printf("%s test_joycon：%d 项不符\n", bad ? "✗" : "✓", bad);
     return bad ? 1 : 0;
 }

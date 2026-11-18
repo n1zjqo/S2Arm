@@ -8,6 +8,7 @@
 //   ④ 一次映射的池照旧直接用影子（宿主地址 = H 的影子），不另建视图
 //   ⑤ GPU 写记账（gpw_add，块线性渲染目标被画时）对远端池的客人地址取指纹不碰客人地址（P1-160：客人地址没有映射，原先直接读它；单测里没有远端缺页代执行，读了就崩）：
 //      记下的指纹 = 按语义从影子字节算的同一个 512 字节指纹
+//   ⑧ 池跨近区 / 远端边界（诊断#0ece63）建得出、是同一份内存；⑨ 远端那段没映射：不登记、不中止
 //   ⑥ 过期判定（gpw_stale，#357 无人引用扫描与贴图上传前都走它）同样读影子：没改的那块仍算 GPU 写的（1 段 512 字节）；经影子改了 1 字节的那块判为已改写（不再算）
 #include "../gfx/nvn/nvn_mtl.m"
 
@@ -55,6 +56,44 @@ int main(void) { @autoreleasepool {
         uint64_t *runs = NULL, bytes = 0; int n = gpw_stale((const uint8_t *)(uintptr_t)(G + MB2 + 4096), 1024, &runs, &bytes);
         CHECK(n == 1 && runs && runs[0] == 0 && runs[1] == 512 && bytes == 512, "⑥ 过期判定读影子：没改的块仍算 GPU 写的、改过的块不算（%d 段 %llu 字节）", n, (unsigned long long)bytes);
         free(runs);
+    }
+    {   // ⑦ 页 / GOB 指纹哈希（span_hash：打包贴图每个写过的 16 KB 页上传时取一次、检查时再取一次；gob_hash 每个 GPU 写记账的 512 B GOB 一次）改动必检得出来的性质，
+        //      不依赖具体哈希值（换哈希实现只要性质保持就过）：同一输入两次取值相同；任一字节翻转（主循环整词、不足 32 字节的余词、< 8 字节的尾段全覆盖，
+        //      逐个位置各判一次——实现漏看任何一个字节，对应位置当场红，每个位置自证、不需要另设负对照）；同前缀长度少一字节指纹必变；
+        //      n 覆盖 GOB 整块、整页、整页少 5 字节（主循环 + 余词 + 尾段）、512+13（主循环 + 1 余词 + 5 尾字节）、40（1 圈主循环 + 1 余词、无尾）、29（不足 32 字节整段余词 + 尾）
+        static const size_t ns[] = {512, 512 + 13, 29, 40, 16384, 16384 - 5};
+        static uint8_t buf[16384];
+        for (size_t i = 0; i < sizeof buf; i++) buf[i] = (uint8_t)(i * 131 + 7);
+        for (size_t j = 0; j < sizeof ns / sizeof *ns; j++) { size_t n = ns[j];
+            uint64_t h0 = span_hash(buf, n);
+            int det = h0 == span_hash(buf, n), len_ok = h0 != span_hash(buf, n - 1), ok = det && len_ok;
+            for (size_t bi = 0; bi < n && ok; bi++) { buf[bi] ^= 0x80; ok = span_hash(buf, n) != h0; buf[bi] ^= 0x80; }
+            CHECK(ok, "⑦ 指纹哈希 n=%zu：同一输入稳定、逐字节翻转必变、长度少一字节必变（%d）", n, ok);
+        }
+    }
+    {   // ⑧ 池跨近区 / 远端边界（诊断#0ece63：16 MB 的池前 8 MB 在近区、后 8 MB 在远端，原先只看起点、按游戏地址建，后半段没映射 → 中止）：
+        //      近区 [G − 2M, G) 是宿主自己的内存（游戏地址 = 宿主地址），远端 [G, G + 2M) 在影子 A。期望：建得出、宿主地址是一段新视图（既不是 G − 2M 也不是 A − 2M），
+        //      近区与影子两边写的字节都从视图对应偏移读得到，GPU 经池的缓冲读远端那段读到 A 里的字节
+        vm_address_t nb = (vm_address_t)(G - MB2);
+        REQUIRE(vm_allocate(mach_task_self(), &nb, MB2, VM_FLAGS_FIXED) == KERN_SUCCESS && nb == (vm_address_t)(G - MB2));
+        uint8_t *near_ = (uint8_t *)(uintptr_t)nb; near_[500] = 0x55; A[600] = 0x66;
+        nvn_be_pool_add(near_, 2 * MB2);
+        uint8_t *v8 = (uint8_t *)host_of(G - MB2);
+        int same8 = v8 && v8 != near_ && v8 != A - MB2 && v8[500] == 0x55 && v8[MB2 + 600] == 0x66;
+        if (v8) { v8[700] = 0x77; v8[MB2 + 800] = 0x78; }
+        same8 = same8 && near_[700] == 0x77 && A[800] == 0x78;
+        id<MTLBuffer> s8 = nil; pthread_mutex_lock(&g_mu); for (int i = 0; i < g_npool; i++) if (g_pools[i].lo == G - MB2) s8 = g_pools[i].buf; pthread_mutex_unlock(&g_mu);
+        for (int i = 0; i < 16; i++) A[i] = (uint8_t)(0xc0 + i);
+        id<MTLBuffer> d8 = [g_dev newBufferWithLength:16 options:MTLResourceStorageModeShared]; memset(d8.contents, 0, 16);
+        id<MTLCommandBuffer> c8 = [q commandBuffer]; id<MTLBlitCommandEncoder> e8 = [c8 blitCommandEncoder];
+        if (s8) [e8 copyFromBuffer:s8 sourceOffset:MB2 toBuffer:d8 destinationOffset:0 size:16];
+        [e8 endEncoding]; [c8 commit]; [c8 waitUntilCompleted];
+        int gpu8 = !!s8; for (int i = 0; i < 16; i++) gpu8 &= ((uint8_t *)d8.contents)[i] == (uint8_t)(0xc0 + i);
+        CHECK(same8 && gpu8, "⑧ 跨近区 / 远端的池建得出、是新视图（%p；近区 %p），两段双向读写都看得到（%d），GPU 读远端那段对（%d）", v8, near_, same8, gpu8);
+        nvn_be_pool_del(near_);
+        // ⑨ 远端那段没映射（[G + 6M, G + 8M) 没 s2a_far_map）：近区 [G + 4M .. ) 不存在，这里用近区 near_ 加一段没分块的远端——拼不起来，不中止、不登记
+        nvn_be_pool_add((const void *)(uintptr_t)(G + 6 * (uint64_t)MB2), MB2);
+        CHECK(!host_of(G + 6 * (uint64_t)MB2), "⑨ 远端没映射的池：不登记、进程照跑（宿主地址 %#lx）", (unsigned long)host_of(G + 6 * (uint64_t)MB2));
     }
     printf("%s t_nvn_far_pool: %u checks %u failures; backend %s\n", failures ? "✗" : "✓", checks, failures, g_m3 ? "Metal3" : "Metal4");
     return failures != 0;

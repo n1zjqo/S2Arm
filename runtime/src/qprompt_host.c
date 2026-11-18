@@ -38,12 +38,21 @@ int s2a_widen_force_native(int on);
 // 满屏自检自动退回（11-06 满屏泛化：大范围默认开的安全网，取代「问玩家要不要退回」）：一局最多一次。
 //   why 1 = 满屏判据局内没铺满累计 20 秒（黑带 / 接缝 / 暗带 / 核心异常）；2 = 拉伸（场景 3D 笔按 k 横拉）；3 = 收窄（场景 3D 笔被收进中间 1/k）。
 //   只放宽了宿主侧的款当场热切回 16:9（s2a_widen_force_native）；游戏自己出宽图的款（第二层值槽装载时填死）下次启动 16:9
+// 玩家手动开的我方通用满屏（11-15 维护者「没补丁的游戏手动打开满屏就走咱们通用方案」，启动层写 S2A_WIDEN_VERIFIED=1 + S2A_WIDESCREEN=1：
+//   pack/jobs/community.py launch_env、ios/settings.m）：一次不成功就记住、下次起局关掉并提示（失败或崩了下一局自动关），不等两次启动
+static int own_manual(void) {
+    const char *v = getenv("S2A_WIDEN_VERIFIED"), *w = getenv("S2A_WIDESCREEN");
+    return v && !strcmp(v, "1") && w && !strcmp(w, "1");
+}
 static void widen_auto_revert(int why, int secs) {
     static int done; if (done) return; done = 1;
-    int r = s2a_widen_force_native(1);
-    // 记不记住本款：两次不同启动都触发才持久（runtime/src/widen_remember.c）；只一次的下次启动重新试满屏
+    int r = s2a_widen_force_native(1), manual = own_manual();
+    // 记不记住本款：两次不同启动都触发才持久（runtime/src/widen_remember.c）；只一次的下次启动重新试满屏。玩家手动开的通用满屏一次就记住
     char path[1100]; s2a_docs_path(path, sizeof path, "widen_auto.txt");
-    int n = r != 0 ? s2a_wr_note(path) : s2a_wr_load(path), persist = r != 0 && s2a_wr_persist(n);
+    int n = r != 0 ? s2a_wr_note(path) : s2a_wr_load(path), persist = r != 0 && (manual || s2a_wr_persist(n));
+    // Mac 启动器收局读这个标记：满屏开关写关、记自动关原因 widen_fit、下次开始时提示（pack/jobs/cheats.py note_widen）；iPhone 由 s2a_ios_widen_auto 自己记
+    if (persist && manual) { char mk[1100]; s2a_docs_path(mk, sizeof mk, "widen_auto_off"); FILE *f = fopen(mk, "w");
+        if (f) { fprintf(f, "%d\n", why); fclose(f); } else LOG("【红】满屏自检：自动关标记写不了 %s", mk); }
     static const char *const w[] = {"", "局内满屏判据报没铺满", "场景 3D 画面被横向拉伸", "场景 3D 画面被收进中间"};
     LOG("满屏自检：过去 %d 秒%s，%s", secs, w[why < 1 || why > 3 ? 1 : why], r > 0 ? "已当场退回 16:9 原比例" : r < 0 ? "本款画面由游戏自己按宽屏画，当场退不回" : "画面没在放宽，不动");
     if (r != 0) LOG("满屏自检：第 %d 次启动触发退回，%s", n, persist ? "两次启动都触发，记住本款、之后起局 16:9" : "只记次数，下次启动重新试满屏");
@@ -68,11 +77,12 @@ __attribute__((weak)) int s2a_ios_qp_asked(int kind) { (void)kind; return 0; }  
 __attribute__((weak)) void s2a_ios_qprompt(int kind, int secs) { (void)kind; (void)secs; }   // app.m：弹提示（secs = 文案里「过去 XX 秒」）；Mac 宿主没有界面
 __attribute__((weak)) void s2a_ios_fps_native60(int on) { (void)on; }   // app.m：记住本款是不是原生 60 帧（设置页 60 帧那行据此显示「本款原生 60 帧」、开关置灰）
 void s2a_ql_host_frame(uint64_t now, int game, uint64_t dt, int game_itv); int s2a_ql_host_on(void);   // 档位梯子（runtime/src/qladder_host.c）
+void s2a_cpatch_frame(uint64_t now, int game, uint64_t dt);   // 社区补丁量效果（runtime/src/cpatch.c）
 void s2a_qp_frame(uint32_t draws, int video, int cutscene, int game_itv) {
     static int cfg, quiet, native = -1; static uint64_t prev;
     if (!cfg) { cfg = 1; quiet = s2a_unattended();
         // 档位梯子开着时帧率不再问玩家：跟不上由梯子自动落档（维护者 11-06 优雅降级）；满屏照旧问
-        int f = !s2a_ios_qp_asked(S2A_QP_FPS) && !s2a_ql_host_on(), w = !s2a_ios_qp_asked(S2A_QP_FIT);
+        int f = !s2a_ios_qp_asked(S2A_QP_FPS) && !s2a_ql_host_on(), w = own_manual() || !s2a_ios_qp_asked(S2A_QP_FIT);   // 玩家手动开的通用满屏一直自检（问过 / 退回过的款玩家又打开了也要看）
         s2a_qp_config(f, w);
         pthread_t th; if (w && !pthread_create(&th, NULL, fit_sampler, NULL)) pthread_detach(th);
         LOG("撑不住就问玩家：帧率提示%s、满屏提示%s（开局 60 帧%s、宽屏%s）%s", f ? "可问" : s2a_ql_host_on() ? "交档位梯子" : "问过", w ? "可问" : "问过", s2a_fps_effective() ? "生效" : "没生效", fit_live() ? "生效" : "没生效",
@@ -81,7 +91,7 @@ void s2a_qp_frame(uint32_t draws, int video, int cutscene, int game_itv) {
     // 帧率：只有真来源（表里 w / slot / speed / 改指令行、社区补丁）或游戏自设间隔 ≥ 2 时 60 帧才改得动；只有 present display 而游戏自己就设间隔 1 = 原生 60 帧，切了也一样，不问
     int real = s2a_fps_real_source();
     int r = s2a_qp_present(t, draws, video, cutscene, unfit, s2a_fps_effective() && (real || game_itv >= 2), fit_live(), game_itv);
-    { uint64_t dt = prev ? t - prev : 0; stretch_window(s2a_qp_game(), dt); s2a_ql_host_frame(t, s2a_qp_game(), dt, game_itv); prev = t; }
+    { uint64_t dt = prev ? t - prev : 0; stretch_window(s2a_qp_game(), dt); s2a_ql_host_frame(t, s2a_qp_game(), dt, game_itv); s2a_cpatch_frame(t, s2a_qp_game(), dt); prev = t; }   // 社区补丁量效果（runtime/src/cpatch.c）
     int n = s2a_qp_native60();
     if (n >= 0 && n != native) { native = n; int v = n == 1 && !real;
         LOG("原生 60 帧判定：%s（游戏画面里%s；%s）", v ? "是，设置页 60 帧那行显示「本款原生 60 帧」" : "否",

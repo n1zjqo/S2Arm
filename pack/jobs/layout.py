@@ -15,10 +15,14 @@ import contextlib
 import json
 import os
 import re
+import socket
+import sys
 import shutil
+import time
 from pathlib import Path
 
-from core import Failure, atomic, contained, read
+from core import Failure, atomic, contained, read, resolve_path
+from errors import library_lock_failure
 
 VERSION = 4   # 2：每款进 games/<英文名>/；3：iPhone 产物进每款 image/ios、装机产物与设备记录进默认位置根（_upgrade_3）；4：库外的工具缓存 / 日志搬进默认位置（_upgrade_4）
 GAME_JSON = "game.json"
@@ -40,6 +44,10 @@ def folder_name(english, gid, taken=()):
         name = (name[:NAME_MAX - 7].strip(" .") + " [" + gid[-4:] + "]")
         if name.lower() in used:
             name = gid
+            # #765：游戏号本身也被占时原先就回游戏号，接着 mkdir 撞 File exists；加序号找一个空名（游戏号 + 「 (2)」「 (3)」…）
+            n = 2
+            while name.lower() in used:
+                name = f"{gid} ({n})"; n += 1
     return name
 
 
@@ -65,20 +73,49 @@ def _index_path(c):
 
 def load_index(c):
     idx = getattr(c, "_layout_idx", None)
-    if idx is None:
+    fresh = idx is None
+    if fresh:
         idx = read(_index_path(c), {}) or {}
         idx.setdefault("schema", 1); idx.setdefault("locations", []); idx.setdefault("games", {})
         c._layout_idx = idx
     want = default_id(c)   # 默认位置总在表里、排第一；它的号以库里的标识文件为准（迁移写标识后，旧的 "default" 引用跟着改）
     old = next((l for l in idx["locations"] if l.get("path") == str(c.library)), None)
-    if old is None or old.get("id") != want:
+    changed = old is None or old.get("id") != want
+    if changed:
         if old is not None:
             idx["locations"].remove(old)
             for e in idx["games"].values():
                 if e.get("location") == old.get("id"):
                     e["location"] = want
-        idx["locations"].insert(0, dict(id=want, path=str(c.library)))
+        idx["locations"].insert(0, dict(id=want, path=str(c.library), library=True))
+    elif not old.get("library"):
+        old["library"] = True
+    if fresh or changed:
+        _drop_other_libraries(c, idx, want)
     return idx
+
+
+def _drop_other_libraries(c, idx, want):
+    """索引在私有目录、换过游戏库的都共用这一份：别的游戏库的根不是本库的存放位置，从表里去掉（存储总览不再列、找游戏不去那里找）。
+    认法（都不含当前库）：① 和本库同号的另一行——整库搬家时位置标识跟着搬，旧路径那行留下来同号；② 记过是游戏库根（library）的行；
+    ③ 那里有游戏库标识 .s2arm-library.json（v0.3.6 以前的旧表没记 library）。②③ 的位置号下的游戏记录一并去掉：那是别的库的款，
+    留着会让本库导入同一款时认到别的库的文件夹、往那边写（存储总览「存放位置」一直列着换库前的 C 盘路径）。①的游戏记录本来就指向本库，不动"""
+    here = str(c.library)
+    # #946：上一个库根下还记着游戏（索引里有游戏指向它），就不去掉，改当一个普通存放位置留着。0.2.x 换库时没搬文件的玩家，游戏全在旧库根里，
+    #   升到 v0.3.6 后整行连同游戏记录被去掉，库里所有游戏一下变成「未出包」。看不到自己的游戏比总览多列一行严重得多：有游戏的旧库根照留
+    used = {e.get("location") for e in idx["games"].values()} - {want}
+    stale = [l for l in idx["locations"][1:] if l.get("path") != here and
+             (l.get("id") == want or ((l.get("library") or (Path(l.get("path", "")) / ".s2arm-library.json").is_file()) and l.get("id") not in used))]
+    for l in idx["locations"][1:]:
+        if l.get("id") in used and l.get("library") and l.get("path") != here:
+            l.pop("library")   # 留下来的旧库根降成普通存放位置
+    if not stale:
+        return
+    gone = {l.get("id") for l in stale} - {want}
+    idx["locations"] = [l for l in idx["locations"] if l not in stale]
+    idx["games"] = {g: e for g, e in idx["games"].items() if e.get("location") not in gone}
+    if idx.get("last") in gone:
+        idx.pop("last")   # 上次用的是别的库根：不再当默认（#922）
 
 
 def default_id(c):
@@ -182,14 +219,18 @@ def indexed_dir(c, gid):
     if not entry or not entry.get("folder") or root is None or not root.is_dir():
         return None
     d = games_root(c, root) / entry["folder"]
+    other = str(read(d / GAME_JSON, {}).get("id", "") or gid).upper()   # game.json 删没了（删到一半）照认；写着别款的号就不是这款的
+    if other != gid.upper():
+        print(f"[s2a] {gid.upper()}：索引记的文件夹 {d.name} 是另一款 {other} 的，不当这款的删", file=sys.stderr)
+        return None
     return d if d.is_dir() else None
 
 
 def require_in_location(c, p):
     """路径必须在某个已登记存放位置的 games/ 下（运行镜像校验用，挡住指到库外的路径）"""
-    p = Path(p).resolve()
+    p = resolve_path(p)
     for _, root, ok in locations(c):
-        if ok and p.is_relative_to(games_root(c, root).resolve()):
+        if ok and p.is_relative_to(resolve_path(games_root(c, root))):
             return p
     raise Failure("运行文件不在任何存放位置里。", code="runtime_invalid")
 
@@ -223,10 +264,25 @@ def game_dir(c, gid, english=None, location=None):
         register_location(c, root)
     g = games_root(c, root)
     g.mkdir(parents=True, exist_ok=True)
-    taken = [p.name for p in g.iterdir()]
-    d = g / folder_name(english, gid, taken)   # 返回原样路径（不解析软链）：调用方按位置根前缀比对（library._rm）
-    contained(root, d)
-    d.mkdir()
+    # #765（[Errno 17] File exists: games/<游戏号>，每次添加都失败）：首选名那里已有东西时，反防御处理——
+    #   是这款的空壳文件夹（没有 game.json，或 game.json 就是这款：上次添加到一半留下的）→ 沿用；是文件 / 断链 → 挪开（改名 .s2a-moved-<时刻>，不删）再建；
+    #   是别款的文件夹 → 按已占用的名字另取（folder_name 加号后 4 位 / 序号）
+    want = g / folder_name(english, gid)
+    if want.is_symlink() or (want.exists() and not want.is_dir()):   # 先挪开：断链可能指到库外，contained 会按解析后的路径判越界
+        os.replace(want, want.with_name(want.name + f".s2a-moved-{time.strftime('%Y%m%d-%H%M%S')}"))
+    contained(root, want)
+    if want.is_dir() and str(read(want / GAME_JSON, {}).get("id", "") or gid).upper() == gid:
+        d = want
+    else:
+        d = g / folder_name(english, gid, [p.name for p in g.iterdir()])   # 返回原样路径（不解析软链）：调用方按位置根前缀比对（library._rm）
+        contained(root, d)
+        try:
+            d.mkdir()
+        except FileExistsError:   # 列目录到建之间这个名字被占了：是这款（或没有 game.json 的空壳）就沿用，否则重新列一遍另取
+            if not (d.is_dir() and not d.is_symlink() and str(read(d / GAME_JSON, {}).get("id", "") or gid).upper() == gid):
+                d = g / folder_name(english, gid, [p.name for p in g.iterdir()])
+                contained(root, d)
+                d.mkdir()
     atomic(d / GAME_JSON, dict(schema=1, id=gid))
     _remember(c, gid, d)
     return d
@@ -270,9 +326,9 @@ def _move_folder(c, gid, src, dest_root):
         try:
             copy_tree_links(src, temporary)
             _verify_copy(src, temporary, strict=False)
-            for sub in ("saves", "save-backups"):
-                if (src / sub).is_dir():
-                    _verify_copy(src / sub, temporary / sub, strict=True)
+            for sub in save_entries(src):   # 存档类逐字节核（唯一来源 save_entries）
+                if sub.is_dir():
+                    _verify_copy(sub, temporary / sub.name, strict=True)
         except Failure:
             shutil.rmtree(temporary, ignore_errors=True)
             raise Failure("拷到新位置后核对不一致，没有移动（原位置的文件都还在）。", code="job_failed")
@@ -315,6 +371,8 @@ def game_info(c, gid):
 def update_info(c, gid, **fields):
     d = game_dir(c, gid)
     atomic(d / GAME_JSON, dict(read(d / GAME_JSON, {}), **fields))
+    if "ios" in fields:   # 程序件的兼容记录（壳号 / 宿主约定号 / 直连链号…）同存一份到专用文件夹：游戏文件夹被删了，更新手机照样判得出能不能带这款
+        atomic(program_store(c, gid, create=True) / PROGRAM_INFO, fields["ios"])
 
 
 def read_sizes(c, gid):
@@ -348,6 +406,12 @@ def path(c, gid, *parts, create=True):
     return d.joinpath(*parts)
 
 
+def nro_kept(c, gid, create=False):
+    """运行时留下的 NRO（#8be819：游戏自有加密归档里的 NRO，出包时认不出；宿主 LoadNro 缺表时把游戏解开的那份存成 <SHA-256>.nro，
+    Mac 局收局后 / 装 iPhone 前收回这里），出包改写阶段经 S2A_NRO_KEPT_DIR 读（runtime/rewriter/nro_to_nso.py 第三来源）"""
+    return path(c, gid, "nro_kept", create=create)
+
+
 def image_mac(c, gid, create=True):
     return path(c, gid, "image", "mac", create=create)
 
@@ -361,7 +425,9 @@ def build_dir(c, gid, create=True):
 #   game.json 的 ios 记 {shellId 出它的壳, hostAbi, dmshChain（host_update 判兼容）, pack 资源包 index_sha256}。不再保留单款 ipa。
 # 出包工作目录 build/ios（一键出包 --out）；默认位置根：S2Arm.ipa（最近一次装的）、S2Arm.previous.ipa（换壳前那一版，回滚用）；
 # devices/<设备>.json：这台手机装了哪些款（各款资源包号）、壳号、包名（Windows 由 plumesign 定）、装回过上一版的壳号 failedShells。
-IOS_KIT, IOS_PACK = "kit", "pack"
+# 资源包目录叫 .pack 且隐藏（D-9ZF9，v0.3.10 后）：里面的 game.img 不带着色器库、不能单独导入手机，玩家翻游戏库时不该看见一个「看起来能导」的 .img；
+#   自签玩家要的是「S2Arm 自签导出」文件夹里以游戏名命名的 .img。旧库的 pack/ 第一次用到时改名过来（ios_pack）
+IOS_KIT, IOS_PACK, LEGACY_IOS_PACK = "kit", ".pack", "pack"
 PHONE_IPA, PHONE_PREVIOUS = "S2Arm.ipa", "S2Arm.previous.ipa"
 DEVICES = "devices"
 LEGACY_DEVICE = "legacy"   # 迁移来的旧容器记录：还不知道是哪台手机，第一台装机的设备认领它
@@ -371,12 +437,91 @@ def image_ios(c, gid, create=True):
     return path(c, gid, "image", "ios", create=create)
 
 
+# ---- 游戏程序常驻（11-16 维护者：玩家打完包常删输出目录、之后不碰电脑，更新 S2Arm 时组容器要的游戏程序跟着丢了；又定「极致压缩」）----
+# 默认位置根 .programs/<程序号>/：exefs.tar.zst（原始程序）、recipe.tar.zst（配方）、ios.json（程序件的兼容记录，同 game.json 的 ios）。
+#   按程序号分、不在游戏文件夹里：删游戏文件夹、换存放位置删旧位置、「释放空间」都不碰它；只有「删除游戏」（library.delete）才删。
+#   kit 与解开的原始程序是缓存（工具缓存 cache/programs/<程序号>），缺了按配方现建：见 pack/jobs/programs.py
+PROGRAMS, PROGRAM_INFO, PROGRAM_EXEFS = ".programs", "ios.json", "original-exefs"
+
+
+def program_store(c, gid, create=False):
+    d = c.library / PROGRAMS / gid.upper()
+    if create:
+        d.mkdir(parents=True, exist_ok=True)
+        hide(c.library / PROGRAMS)
+    return d
+
+
 def ios_kit(c, gid):
-    return image_ios(c, gid, create=False) / IOS_KIT
+    """iPhone 程序件（组容器读）：缓存在就用、缺了按常驻配方现建（programs.kit_dir）；只问「有没有」用 has_ios_kit（不现建）"""
+    import programs
+    return programs.kit_dir(c, gid)
+
+
+def ios_kit_present(c, gid):
+    """已有的 iPhone 程序件目录（缓存 kit，或还没迁移的旧布局）→ 路径 | None。只看文件，不迁移、不现建：给游戏库清单这类只读的地方用
+    （11-16：清单画金色 S 调 ios_kit，升级首启在读库里做旧布局迁移，与后台作业撞上 WinError 32，整个清单读失败）"""
+    import programs
+    for kit in (programs.cache(c, gid) / "kit", program_store(c, gid) / IOS_KIT, image_ios(c, gid, create=False) / IOS_KIT):
+        if (kit / "main.npdm").is_file():
+            return kit
+    return None
+
+
+def has_ios_kit(c, gid):
+    """有没有 iPhone 程序件（游戏库清单每款都问：只看文件，不迁移、不现建——旧布局的迁移要压缩 + 现建对拍，留到真用程序件时做）"""
+    import programs
+    if programs.has_kit(c, gid):
+        return True
+    for kit in (program_store(c, gid) / IOS_KIT, image_ios(c, gid, create=False) / IOS_KIT):   # 还没迁移的旧布局
+        try:
+            if (kit / "main.npdm").stat().st_size > 0 and any(kit.glob("*.fixups.tsv")):
+                return True
+        except OSError:
+            pass
+    return False
+
+
+def program_exefs(c, gid):
+    """解开的原始程序目录（缓存，缺了从常驻归档解）；没有 → 不存在的路径"""
+    import programs
+    programs.adopt(c, gid)
+    return programs.exefs_dir(c, gid) or programs.cache(c, gid) / "exefs"
+
+
+def program_info(c, gid):
+    """程序件的兼容记录：游戏文件夹 game.json 的 ios 优先，没有（游戏文件夹被删了）读专用文件夹的那份"""
+    return game_info(c, gid).get("ios") or read(program_store(c, gid) / PROGRAM_INFO, {}) or {}
 
 
 def ios_pack(c, gid):
-    return image_ios(c, gid, create=False) / IOS_PACK
+    image = image_ios(c, gid, create=False)
+    legacy, pack = image / LEGACY_IOS_PACK, image / IOS_PACK
+    if legacy.is_dir() and not pack.exists():
+        try:
+            os.rename(legacy, pack)
+            hide(pack)
+        except OSError:
+            # 审计 P1-183：改名失败可能是另一路（装机页轮询 / 出包）刚改完：.pack 已在就用它，不退回已经不存在的 pack/；
+            #   真被占着（老位置还在）才照旧用老位置，下次再改。不加锁、不要求重新出包
+            if pack.is_dir():
+                return pack
+            return legacy
+    return pack
+
+
+def hide(path):
+    """Windows 上给文件夹加隐藏属性（名字带点在资源管理器里照样看得见）；Mac / Linux 名字带点已隐藏。失败不碍事"""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        import winproc
+        attrs = ctypes.windll.kernel32.GetFileAttributesW(winproc.win_path(str(path)))   # 游戏库在深目录时裸长路径会 WinError 3 / 123
+        if attrs != -1 and attrs != 0xFFFFFFFF:
+            ctypes.windll.kernel32.SetFileAttributesW(winproc.win_path(str(path)), attrs | 0x2)   # FILE_ATTRIBUTE_HIDDEN
+    except (OSError, AttributeError):
+        pass
 
 
 def ios_work(c, gid, create=True):
@@ -418,14 +563,24 @@ def save_device(c, ident, rec):
 def install_record(c, gid):
     """这款最近一次装机签名的记录 {at, free, device}（游戏库页「还有几天到期 / 续签」）：各台手机记录里带这款的取最新一次；没装过 → None"""
     gid = gid.upper()
-    recs = [r.get("signed") for _, r in devices(c) if gid in (r.get("games") or {}) and isinstance(r.get("signed"), dict)]
+    # deviceKey：那台设备的记录键（UDID）。续签 / 重装装回当初那台，不替玩家换一台（维护者 11-11：续签时 iPad 被装上）
+    recs = [dict(r["signed"], deviceKey=k) for k, r in devices(c) if gid in (r.get("games") or {}) and isinstance(r.get("signed"), dict)]
     return max(recs, key=lambda r: r.get("at") or 0) if recs else None
 
 
 def devices(c):
-    """[(设备键, 记录)…]"""
+    """[(设备键, 记录)…]。访达往 exFAT 等非 APFS 盘搬库会给每个记录配一份 ._<名>.json 附属文件（4 KB 非 UTF-8 元数据），
+    按 os_junk 跳过（#911：读它抛 UnicodeDecodeError，整次刷新游戏库失败）；单个记录读不出只记一行、跳过这一台，不拖垮整个请求"""
     d = c.library / DEVICES
-    return [(p.stem, read(p, {})) for p in sorted(d.glob("*.json"))] if d.is_dir() else []
+    out = []
+    for p in (sorted(d.glob("*.json")) if d.is_dir() else []):
+        if os_junk(p.name):
+            continue
+        try:
+            out.append((p.stem, read(p, {})))
+        except (OSError, ValueError) as e:   # UnicodeDecodeError / JSONDecodeError 都是 ValueError
+            print(f"[s2a] 设备记录 {p.name} 读不出，跳过：{type(e).__name__}: {e}", file=sys.stderr)
+    return out
 
 
 # ---- 迁移（旧布局 → VERSION 2）----
@@ -453,8 +608,12 @@ def _split_release(c, gid, d):
     link, releases = d / "current", d / "releases"
     image = d / "image" / "mac"
     if os.path.lexists(link) and not image.exists():
-        cur = link.resolve()
-        if cur.parent == releases.resolve() and cur.is_dir():
+        if link.is_symlink() or getattr(os.path, "isjunction", lambda _: False)(link):
+            target = Path(os.readlink(link))
+            cur = resolve_path(target if target.is_absolute() else link.parent / target)
+        else:
+            cur = resolve_path(link)
+        if cur.parent == resolve_path(releases) and cur.is_dir():
             app = cur / "S2ArmGame.app"
             if app.is_dir():
                 sha = _host_digest(app)
@@ -477,7 +636,7 @@ def _split_release(c, gid, d):
         _rm(c, c.library, releases)
 
 
-_NACP_GLOBS = ("games/{gid}/current/ctl/control.nacp", "games/{gid}/current/exefs/control.nacp", "iPhone/{gid}/*资源包/ctl/control.nacp",
+_NACP_GLOBS = ("games/{gid}/current/ctl/control.nacp", "games/{gid}/current/exefs/control.nacp", "iPhone/{gid}/*资源包/ctl/control.nacp",  # 非玩家句
                "iPhone/{gid}/roots/*/ctl/control.nacp", "iPhone/{gid}/container-kit/ctl/control.nacp", "cache/{gid}/*/roots/*/ctl/control.nacp",
                # 新布局里还叫游戏号的文件夹（heal_folder_names）：Mac / iPhone 产物、出包解包目录
                "games/{gid}/image/mac/ctl/control.nacp", "games/{gid}/image/ios/*/ctl/control.nacp", "games/{gid}/build/*/extract/ctl/control.nacp")
@@ -509,49 +668,45 @@ def _ascii_name(name):
 
 def heal_folder_names(c):
     """还叫游戏号的文件夹（导入时没拿到英文名：读取器早先不给英文名、拷封面时这款还没进 catalog）按英文名改名，英文名记进 catalog。
-    每个作业开始时看一眼（只列各位置的 games/，没有游戏号文件夹就返回）；拿不到执行锁（有游戏在跑 / 在出包）这次跳过，下个作业再试。
+    只在英文名可能刚拿到的那一刻调（启动器剃刀 H3：原先每个作业开头都抢一次执行锁，中文名、没出过包的款永远在待改名单里，正撞上起局 / 出包就报忙）：
+    导入、出包（Mac / iPhone）作业结束时（main.HEAL_AFTER，锁都已放），后台商店查询拿到英文名后（store_meta_bg）。
+    执行锁、目录锁（改名动执行区，写 catalog 要目录锁）有一把被占就这次不改：文件夹叫游戏号只是不好看，下次这三处任一再试。
     英文名按 catalog 的 englishName → catalog 名字（有 ASCII 时）→ 这款已有产物里的 control.nacp；都没有（还没出过包的中文名游戏）就留着，出过包后再改"""
     roots = [r for _, r, online in locations(c) if online]
     stuck = [d for r in roots if (games_root(c, r)).is_dir() for d in games_root(c, r).iterdir()
              if _GID.fullmatch(d.name.upper()) and (d / GAME_JSON).is_file()]
     if not stuck:
         return 0
-    import filelock
     renamed = 0
-    with (c.library / ".execution.lock").open("a") as f:
-        try:
-            filelock.try_lock(f)
-        except BlockingIOError:
+    with c.idle("execution") as idle, c.idle("catalog") as idle_catalog:
+        if not (idle and idle_catalog):
             return 0
-        try:
-            cat_path = c.library / "catalog.json"
-            cat = read(cat_path, {}) or {}
-            games = {g.get("id", "").upper(): g for g in cat.get("games", []) if isinstance(g, dict)}
-            changed = False
-            for d in stuck:
-                gid = d.name.upper()
-                g = games.get(gid, {})
-                english = g.get("englishName") or (g.get("name") if _ascii_name(g.get("name")) else "") or _english_from_disk(c, gid)
-                if not _ascii_name(english):
-                    continue
-                name = folder_name(english, gid, [p.name for p in d.parent.iterdir() if p != d])
-                dest = d.parent / name
-                if name.upper() == gid or os.path.lexists(dest):
-                    continue
-                try:
-                    os.replace(d, dest)
-                except OSError:   # Windows 上文件夹里有打开的文件：整款不动（文件夹、索引、catalog 都留原样），下次再试
-                    continue
-                from library import _retarget_links
-                _retarget_links(dest, d, dest)
-                _remember(c, gid, dest)
-                if g and not g.get("englishName"):   # 改名成了才记英文名：与文件夹、索引一起变
-                    g["englishName"] = english; changed = True
-                renamed += 1
-            if changed:
-                atomic(cat_path, cat)
-        finally:
-            filelock.unlock(f)
+        cat_path = c.library / "catalog.json"
+        cat = read(cat_path, {}) or {}
+        games = {g.get("id", "").upper(): g for g in cat.get("games", []) if isinstance(g, dict)}
+        changed = False
+        for d in stuck:
+            gid = d.name.upper()
+            g = games.get(gid, {})
+            english = g.get("englishName") or (g.get("name") if _ascii_name(g.get("name")) else "") or _english_from_disk(c, gid)
+            if not _ascii_name(english):
+                continue
+            name = folder_name(english, gid, [p.name for p in d.parent.iterdir() if p != d])
+            dest = d.parent / name
+            if name.upper() == gid or os.path.lexists(dest):
+                continue
+            try:
+                os.replace(d, dest)
+            except OSError:   # Windows 上文件夹里有打开的文件：整款不动（文件夹、索引、catalog 都留原样），下次再试
+                continue
+            from library import _retarget_links
+            _retarget_links(dest, d, dest)
+            _remember(c, gid, dest)
+            if g and not g.get("englishName"):   # 改名成了才记英文名：与文件夹、索引一起变
+                g["englishName"] = english; changed = True
+            renamed += 1
+        if changed:
+            atomic(cat_path, cat)
     return renamed
 
 
@@ -642,7 +797,7 @@ def _upgrade_3(c, marker):
             done.add(gid); atomic(marker, dict(state, iphone=sorted(done))); continue   # 游戏库里已经没有这款：留着的旧产物下面随 iPhone/ 一起删
         kit = d / "container-kit"
         if not (kit / "main.npdm").is_file():
-            root = next((r for r in [*sorted(d.glob("roots/*@现行")), d / "work/pkg/product"] if (r / "main.npdm").is_file()), None)
+            root = next((r for r in [*sorted(d.glob("roots/*@现行")), d / "work/pkg/product"] if (r / "main.npdm").is_file()), None)  # 非玩家句
             if root is not None and any(p.suffix == ".ipa" for p in d.iterdir()):
                 save_container_kit(c, gid, root, dest=d)
         image = image_ios(c, gid)
@@ -692,47 +847,27 @@ def _legacy_ids(c, spec):
 
 
 def ensure(c):
-    """作业开始前：库还是旧布局就拿执行锁迁移；之后把库建好前退回私有目录写的日志 / 任务记录收进默认位置（每个作业都看一眼，没有就只读一次索引表）"""
+    """作业开始前：库还是旧布局就拿执行锁迁移；之后（非探测作业）起后台商店查询。日志 / 任务记录的迁回在建任务时（follow_task）"""
     _ensure_layout(c)
-    if (c.library / ".s2arm-library.json").is_file():
-        adopt_private_logs(c)
-        heal_folder_names(c)             # 已有英文名、文件夹还叫游戏号的改名（不联网）
-        if c.operation != "launch":      # 起局时玩家在等：连后台也不起
-            from library import store_meta_background
-            store_meta_background(c)     # 缺横图 / 英文名、7 天内没查过的款：后台查，查到英文名在那里接着改名
+    if (c.library / ".s2arm-library.json").is_file() and c.operation not in ("installCheck", "targetDevice", "locations", "launch"):   # 每几秒一次的只读探测不起；起局时玩家在等，连后台也不起
+        from library import store_meta_background
+        store_meta_background(c)     # 缺横图 / 英文名、7 天内没查过的款：后台查，查到英文名在那里接着改名
 
 
 def _ensure_layout(c):
-    """库还是旧布局就拿执行锁迁移（拿不到每 2 秒再试，最多 120 秒：别的作业在跑时它已经迁过了，再看一眼标记）"""
-    import time
-    import filelock
+    """库还是旧布局就拿执行锁迁移：按库锁同一语义排队（剃刀 H2：原先另写一套每 2 秒再试、120 秒后报另一句话）；
+    拿到锁先看标记（排队期间别的作业可能已迁完，migrate 已迁完直接返回）"""
     if read(c.library / ".s2arm-layout.json", {}).get("version") == VERSION or not (c.library / ".s2arm-library.json").is_file():
         return
-    c.require_library()
-    t0 = time.time()
-    while True:
-        with (c.library / ".execution.lock").open("a") as f:
-            try:
-                filelock.try_lock(f)
-            except BlockingIOError:
-                if time.time() - t0 > 120:
-                    raise Failure("游戏库正在被别的任务使用，结构整理没能开始，请稍后重试。") from None
-            else:
-                try:
-                    migrate(c)
-                finally:
-                    filelock.unlock(f)
-                return
-        if read(c.library / ".s2arm-layout.json", {}).get("version") == VERSION:
-            return
-        time.sleep(2)
+    with c.lock("execution"):
+        migrate(c)
 
 
 # ---- 3→4（游戏库结构 P3）：库外的东西搬进默认位置 ----
 # 目标：玩家指定的库是入口，私有目录（Mac ~/Library/Application Support/S2Arm，Windows %LOCALAPPDATA%\S2Arm\WindowsLauncher）只留设置、密钥和控制口文件。
 #   工具缓存：原 work_root（库在私有目录里时 = 私有目录，否则 = 库/.s2arm-work）下的 cache/、run/ → <默认位置>/tool-cache/{cache,run}（core.Context.work_root）。
 #     都能重建：同一卷改名（逐个子项，目标已有的不盖），跨卷直接删、不拷。
-#   日志、任务记录：<私有目录>/logs、jobs → <默认位置>/logs/（任务记录 logs/jobs/，core.logs_root），见 adopt_private_logs。
+#   日志、任务记录：v0.3.0 起固定在 <私有目录>/logs（剃刀 H6），不再搬进默认位置；旧的在建任务时收回（adopt_library_logs）。
 #   引擎副本在 embedded.install 里搬（它在 ensure 之前跑）。
 # 每步都是逐项改名 / 删，中途被杀下次接着做；布局标记最后才写 4。
 
@@ -743,7 +878,6 @@ def _upgrade_4(c):
             _absorb_rebuildable(c, old / name, new / name)
     with contextlib.suppress(OSError):
         (c.library / ".s2arm-work").rmdir()
-    adopt_private_logs(c)
 
 
 def _absorb_rebuildable(c, src, dst):
@@ -791,45 +925,37 @@ def _moved(src, dst):
 
 
 def follow_task(c):
-    """Context 建任务时调（任务记录在默认位置时）：索引表第一项核成这个默认位置（core.default_home 只拿私有目录时靠它找日志）；
-    这个任务号上次的记录还在私有目录（库建好前跑的、resume 续跑）就先搬过来，attemptNo 等接得上"""
-    if c.logs.parent == c.private:
-        return
-    try:
-        disk = (read(_index_path(c), {}) or {}).get("locations") or []
-    except (OSError, ValueError):
-        disk = []
-    if not disk or not isinstance(disk[0], dict) or disk[0].get("path") != str(c.library):
-        save_index(c)
-    if c.jobpath.exists():
-        return
-    for old in (c.private / "logs" / "jobs", c.private / "jobs"):
-        if (old / c.jobpath.name).is_file():
-            for suffix in (".json", ".events.jsonl", ".request.json"):
-                try:
-                    _moved(old / (c.task + suffix), c.jobpath.parent / (c.task + suffix))
-                except OSError:
-                    pass
-            return
+    """Context 建任务时调：索引表第一项核成这个默认位置（core.default_home 只拿私有目录时靠它找工具缓存 / 引擎副本）；
+    旧位置还有日志 / 任务记录（v0.3.0 之前库建好后写在 <库>/logs）就迁回私有目录（adopt_library_logs），续跑的同一任务号 attemptNo 接得上"""
+    if (c.library / ".s2arm-library.json").is_file():
+        try:
+            disk = (read(_index_path(c), {}) or {}).get("locations") or []
+        except (OSError, ValueError):
+            disk = []
+        if not disk or not isinstance(disk[0], dict) or disk[0].get("path") != str(c.library):
+            save_index(c)
+    adopt_library_logs(c)
 
 
-def adopt_private_logs(c):
-    """<私有目录>/logs、jobs（P3 之前的位置，以及库建好前 core.logs_root 退回私有目录写下的）收进默认位置的 logs/。
-    先按保留规则清一遍（core.prune_jobs）再搬，跨卷时少拷；还没写终态、进程还在的任务（日志名以任务号开头）不动，等它结束后的下一个作业再收。
-    顺手核索引表第一项是这个默认位置（core.default_home 只拿私有目录时靠它找日志）"""
+def adopt_library_logs(c):
+    """日志与任务记录固定在 <私有目录>/logs（core.logs_root，剃刀 H6）。旧位置——v0.3.0 之前库建好后写的 <默认位置>/logs，以及 P3 之前的
+    <私有目录>/jobs——收回来：先按保留规则清一遍（core.prune_jobs）再搬，跨卷时少拷；还没写终态、进程还在的任务（日志名以任务号开头）不动，
+    等它结束后的下一个作业再收（读的一方 core._job_dirs 照样找得到）。没有旧目录时只是两次 is_dir"""
     from core import TERMINAL_STATES, pid_alive, prune_jobs
     target = c.logs
-    if target.parent == c.private:
-        return
-    sources = [(c.private / "jobs", target / "jobs"), (c.private / "logs" / "jobs", target / "jobs"), (c.private / "logs", target)]
+    old = c.library / "logs"
+    sources = [(c.private / "jobs", target / "jobs")]
+    if (c.library / ".s2arm-library.json").is_file():   # 只收游戏库自己的旧日志：setup 时玩家选的文件夹还不是库，里面的 logs 是玩家自己的东西
+        sources += [(old / "jobs", target / "jobs"), (old, target)]
+    sources = [(s, d) for s, d in sources if s != d and s != target / "jobs"]
     if not any(s.is_dir() for s, _ in sources):
         return
     running = set()
-    for src, _ in sources[:2]:
-        if not src.is_dir():
+    for src, _ in sources:
+        if src.name != "jobs" or not src.is_dir():
             continue
         prune_jobs(c.private, jobs=src)
-        for p in src.glob("*.json"):
+        for p in entries(src, "*.json"):
             if p.name.endswith(".request.json"):
                 continue
             try:
@@ -841,14 +967,13 @@ def adopt_private_logs(c):
     for src, dst in sources:
         if not src.is_dir() or src.is_symlink():
             continue
-        # 每个作业起跑都收一次（ensure）：别的作业可能同时在收，判完 is_dir 到列目录之间目录已被它收空删掉（启动器同时起两个 catalog：
-        #   WorkerIntegrationTests 偶发「任务所需的文件或目录不存在」，main 全套两次红在这里）——被对方收走的就算收完了
+        # 每个作业建任务时都收一次：别的作业可能同时在收，判完 is_dir 到列目录之间目录已被它收空删掉——被对方收走的就算收完了
         try:
             children = sorted(src.iterdir())
         except FileNotFoundError:
             continue
         for child in children:
-            if src == c.private / "logs" and child.name == "jobs":
+            if src == old and child.name == "jobs":
                 continue
             if any(child.name.startswith(t) for t in running):
                 continue
@@ -856,7 +981,7 @@ def adopt_private_logs(c):
                 _moved(child, dst / child.name)
             except OSError:
                 continue   # 这一项这次搬不动，留着下次再试；读的一方（core._job_dirs）照样找得到
-    for d in (c.private / "logs" / "jobs", c.private / "logs", c.private / "jobs"):
+    for d in (old / "jobs", old, c.private / "jobs"):
         with contextlib.suppress(OSError):
             d.rmdir()
 
@@ -874,6 +999,39 @@ OS_JUNK_PREFIX = "._"
 
 def os_junk(name):
     return name in OS_JUNK or name.startswith(OS_JUNK_PREFIX)
+
+
+def entries(d, pattern="*", recursive=False):
+    """d 下按 pattern 列出的业务文件 / 目录（排好序）：路径里任何一级是系统附属文件都不算（d 不存在 / 不是目录 → []）。
+    玩家能放到外置盘上的目录（游戏库、数据目录、mod / 金手指 / 导出文件夹）一律经这里列：exFAT / FAT 上 macOS 给每个带扩展属性的文件
+    配一份 ._<名>（4 KB AppleDouble，含 NUL、非 UTF-8），pathlib 的 glob("*.json") / rglob 照样匹配它；逐个调用点各自补过滤，
+    换个调用点又漏（#812 #816 #911 #1010 #369 #382 都是这一类）"""
+    d = Path(d)
+    if not d.is_dir():
+        return []
+    found = d.rglob(pattern) if recursive else d.glob(pattern)
+    return sorted(p for p in found if not any(os_junk(part) for part in p.relative_to(d).parts))
+
+
+# 每款游戏文件夹里「存档类」的东西：唯一来源（维护者 11-17：删除游戏只留了 saves/、save-backups/，把 SaveData*（Mac 原生格式存档位置）
+#   和 save_backup/（iPhone / Apple TV 装机前拉回的存档备份，手机存档在电脑上唯一的一份）一起删了）。删除游戏、腾空间、换位置核对、空间统计都读这一份。
+#   saves/：Ryujinx 数据根（build.py）；save-backups/：存档管理的备份；save_backup/：装机前 / 电视拉回（install.py、tvos.py）；
+#   SaveData、SaveData-<玩家>：原生格式存档位置（build.py、saves.py）。金手指、mod 不算存档
+SAVE_DIRS = ("saves", "save-backups", "save_backup")
+SAVE_DATA = re.compile(r"SaveData(-.+)?")
+
+
+def is_save_entry(name):
+    """游戏文件夹里这一项（名字）是不是存档类"""
+    return name in SAVE_DIRS or bool(SAVE_DATA.fullmatch(name))
+
+
+def save_entries(gdir):
+    """游戏文件夹里现有的存档类各项（不跟软链认不认：按名字认，删除 / 保留由调用方定）；文件夹不在 → []"""
+    try:
+        return sorted(p for p in Path(gdir).iterdir() if is_save_entry(p.name))
+    except (FileNotFoundError, NotADirectoryError):
+        return []
 
 
 def has_content(d):
@@ -918,31 +1076,23 @@ def relocate_default(private, library):
 
 @contextlib.contextmanager
 def _relocate_lock(private):
+    """判断和改名只许一个作业做：排队等前一个做完（最多 RELOCATE_LOCK_WAIT 秒），到上限报 library_busy（剃刀 H2：原先等不到就不拿锁照常判断，等于没锁）。
+    私有目录写不了（建不了锁文件）照旧判断：后面写标记也会失败、原样返回"""
     import filelock
-    import time
-    f = None
     try:
         private.mkdir(parents=True, exist_ok=True)
-        f = (private / RELOCATE_LOCK).open("a")
+        (private / RELOCATE_LOCK).open("a").close()
     except OSError:
-        yield   # 私有目录写不了：照旧判断（后面写标记也会失败、原样返回）
-        return
-    held, deadline = False, time.monotonic() + RELOCATE_LOCK_WAIT
-    try:
-        while True:
-            try:
-                filelock.try_lock(f); held = True
-                break
-            except BlockingIOError:
-                if time.monotonic() >= deadline:
-                    break   # 那边卡住了：不再等，照旧判断（标记已写就按标记走）
-                time.sleep(0.05)
         yield
-    finally:
-        if held:
-            with contextlib.suppress(OSError):
-                filelock.unlock(f)
-        f.close()
+        return
+    try:
+        with filelock.held(private / RELOCATE_LOCK, wait_s=RELOCATE_LOCK_WAIT, poll=0.05,
+                           holder=dict(operation="relocate", pid=os.getpid(), host=socket.gethostname(),
+                                       startedAt=round(time.time(), 3))):
+            yield
+    except filelock.Busy as busy:
+        detail = f"等了 {RELOCATE_LOCK_WAIT} 秒，旧默认游戏库搬家锁仍被占（{busy.holder}）"  # 非玩家句
+        raise library_lock_failure(busy.holder, "另一个任务正在使用游戏库，请稍后重试。", detail) from None  # 非玩家句
 
 
 def _relocate_locked(private, library):
@@ -981,18 +1131,11 @@ def _relocate_locked(private, library):
 def _idle(library):
     """库里没有任务在跑（同整库搬家：执行锁、目录锁都拿得到）才搬。拿到就放：Windows 上库里有打开的文件时目录改不了名"""
     import filelock
-    handles = []
     try:
-        for name in (".execution.lock", ".catalog.lock"):
-            f = (library / name).open("a")
-            handles.append(f)
-            filelock.try_lock(f)
-        return True
-    except BlockingIOError:
+        with filelock.held(library / ".execution.lock"), filelock.held(library / ".catalog.lock"):
+            return True
+    except filelock.Busy:
         return False
-    finally:
-        for f in handles:
-            f.close()
 
 
 def _finish_relocate(private, old, new):
@@ -1023,7 +1166,7 @@ def _finish_relocate(private, old, new):
 
 def _same_path(text, path):
     try:
-        return Path(str(text)).expanduser().resolve() == Path(path).resolve() or str(text) == str(path)
+        return resolve_path(Path(str(text)).expanduser()) == resolve_path(path) or str(text) == str(path)
     except (OSError, ValueError):
         return False
 

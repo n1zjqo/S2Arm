@@ -5,6 +5,10 @@
 #include <unwind.h>
 #include <dlfcn.h>
 #include <sys/system_properties.h>
+#include <malloc.h>   // mallopt：:game 进程的堆分配器策略（JNI_OnLoad 前的 s2a_tune_heap_for_game）
+#ifndef M_CACHE_COUNT_MAX
+#define M_CACHE_COUNT_MAX (-200)   // bionic 的选项号（次级分配器空闲大块缓存的条数）；NDK 的 malloc.h 未必带这个宏
+#endif
 
 #include "capture_jpeg.h"
 #include "debug_environment.h"
@@ -12,6 +16,7 @@
 #include "system_tuning.h"
 #include "capacity_affinity.h"
 #include "adpf_hint.h"
+#include "cpu_floor.h"
 #include "aaudio_sink.h"
 #include "wsi_qa.h"
 #include "redlog.h"
@@ -52,6 +57,7 @@ Java_org_s2arm_android_NativeBridge_configureDebugEnvironment(JNIEnv *env, jclas
 #include "loader.h"
 extern "C" void s2a_host_shutdown(const char *why);
 extern "C" int64_t s2a_android_services_present_count(void);
+extern "C" uint64_t s2a_android_nvn_present_count(void);   // native/direct_session.c：新回放层 / 旧层的上屏计数
 extern "C" int s2a_android_readonly_configure_bounded(int enabled);
 extern "C" int s2a_android_services_request_applet_exit(uint64_t session);
 extern "C" int s2a_gfx_mode(void);
@@ -142,6 +148,9 @@ Java_org_s2arm_android_NativeBridge_gamePresentCount(JNIEnv *, jclass) {
     // UI diagnostics must not initialize NativeAOT before the native loader/memory startup.
     struct s2a_android_runtime_status status{};
     if (s2a_android_runtime_status(1, &status) != 0 || status.last_phase < S2A_RUNTIME_GUEST_RUNNING) return 0;
+    // 原生的上屏计数有值就用它：新回放层（安卓缺省）起局不经过托管侧的 DirectSession，托管侧
+    // GetPresentCount 会落到没人递增的计数器上、浮层一直是 0。两层原生计数都没有时照旧问托管侧。
+    if (uint64_t native = s2a_android_nvn_present_count()) return static_cast<jlong>(native);
     return static_cast<jlong>(s2a_android_services_present_count());
 #else
     return -1;
@@ -478,6 +487,7 @@ Java_org_s2arm_android_NativeBridge_offerSurface(JNIEnv *env, jclass, jlong hand
     if (!handle) return text(env, "Native host unavailable");
     ANativeWindow *window = surface ? ANativeWindow_fromSurface(env, surface) : nullptr;
     s2a_adpf_set_surface(window != nullptr);
+    s2a_cpu_floor_set_surface(window != nullptr);
     return text(env, get(handle)->window.offer(window));
 }
 extern "C" JNIEXPORT jstring JNICALL
@@ -613,9 +623,11 @@ static int missing_policy_error(const std::string &path) {
     return status == 0 ? ENOENT : EIO;
 }
 
-static bool optional_widen_policy(const char *name) {
-    static const char *const names[] = {"widen_enable.handheld.tsv", "widen_enable.docked.tsv", "widen_full.handheld.tsv", "widen_full.docked.tsv", "widen_verified.tsv"};
-    for (const char *candidate : names) if (!strcmp(name, candidate)) return true;
+// 整包一份、放在 modules/ 的可选表（main 旁边）：宽屏策略表 + 社区补丁表（#48 D2）。与 GameSession.java 准入名单一致
+static const char *const k_optional_tables[] = {"widen_enable.handheld.tsv", "widen_enable.docked.tsv", "widen_full.handheld.tsv",
+                                                "widen_full.docked.tsv", "widen_verified.tsv", "cpatch.tsv"};
+static bool optional_table(const char *name) {
+    for (const char *candidate : k_optional_tables) if (!strcmp(name, candidate)) return true;
     return false;
 }
 
@@ -631,7 +643,7 @@ static int read_game_asset(void *context, const char *filename, s2a_loader_blob 
         FILE *file = fopen(found->second.c_str(), "rb");
         if (!file) {
             if (errno != ENOENT) return errno;
-            return optional_widen_policy(filename) ? missing_policy_error(found->second) : EIO;
+            return optional_table(filename) ? missing_policy_error(found->second) : EIO;
         }
         if (fseeko(file, 0, SEEK_END) != 0) { fclose(file); return EIO; }
         off_t length = ftello(file);
@@ -647,7 +659,7 @@ static int read_game_asset(void *context, const char *filename, s2a_loader_blob 
         return 0;
     }
     AAsset *asset = AAssetManager_open(host->assets, found->second.c_str(), AASSET_MODE_BUFFER);
-    if (!asset) return optional_widen_policy(filename) ? missing_policy_error(found->second) : EIO;
+    if (!asset) return optional_table(filename) ? missing_policy_error(found->second) : EIO;
     off64_t length = AAsset_getLength64(asset);
     const void *bytes = AAsset_getBuffer(asset);
     if (length < 0 || (length && !bytes) || !verify_game_bytes(found->second, bytes, static_cast<size_t>(length))) {
@@ -728,7 +740,7 @@ static void *stop_game(void *context) {
 extern "C" JNIEXPORT jint JNICALL
 Java_org_s2arm_android_NativeBridge_configureInlineSmeContext(JNIEnv *, jclass, jboolean enabled) {
 #ifdef S2A_ANDROID_GAME_RUNTIME
-    if (enabled && !s2a_debug_entries_open()) return EPERM;   // 非缺省值是调试入口（debug_gate.h）
+    if (!enabled && !s2a_debug_entries_open()) return EPERM;   // 缺省开（#573：SME 核心的信号帧必带 TPIDR2 / ZA）；关掉才是调试入口（debug_gate.h）
     return s2a_android_fault_configure_inline_sme(enabled ? 1 : 0);
 #else
     (void)enabled;
@@ -929,6 +941,31 @@ Java_org_s2arm_android_NativeBridge_configureFrameLogDir(JNIEnv *env, jclass, js
     return ::setenv("S2A_FRAME_LOG_DIR", value.c_str(), 1) == 0 ? 0 : errno;
 }
 
+// 外挂 Vulkan 驱动目录（direct_session.c 的 custom_driver_open 读）：内部目录用于复制与 dlopen，
+// 外部私有目录用于 adb push（selected.txt 与驱动文件）。没选驱动时两边都不碰。
+// 另一个读者：会话标记（lifecycle_android.c 的 s2a_sesmark_clear_home，#528 第 15 项）在优雅收尾最后用 files 目录删 end 标记。
+//   所以外壳每次装载运行库后都要调 configureGpuDriver（不管选没选驱动）；不调的话每次正常退局库页都会误报「上一局异常结束」。
+static std::string g_gpu_driver_files_dir, g_gpu_driver_external_dir;
+extern "C" const char *s2a_android_gpu_driver_files_dir(void) { return g_gpu_driver_files_dir.c_str(); }
+extern "C" const char *s2a_android_gpu_driver_external_dir(void) { return g_gpu_driver_external_dir.c_str(); }
+// 隔离探针（direct_session.c）：诊断 / 非 game 构建里没有这个符号。
+extern "C" int s2a_android_vk_probe_driver(void) __attribute__((weak));
+
+extern "C" JNIEXPORT jint JNICALL
+Java_org_s2arm_android_NativeBridge_configureGpuDriver(JNIEnv *env, jclass, jstring files_dir, jstring external_dir) {
+    std::string files = jstring_or(env, files_dir, "");
+    std::string external = jstring_or(env, external_dir, "");
+    if (files.empty() || files[0] != '/') return EINVAL;
+    if (!external.empty() && external[0] != '/') return EINVAL;
+    g_gpu_driver_files_dir = files;
+    g_gpu_driver_external_dir = external;
+    fprintf(stderr, "[vk-direct] 驱动目录配置：files=%s external=%s\n",
+            files.c_str(), external.empty() ? "(空)" : external.c_str());
+    // 隔离探针（direct_session.c）：有选择时只打开驱动并枚举设备，不改渲染路径。
+    if (s2a_android_vk_probe_driver) s2a_android_vk_probe_driver();
+    return 0;
+}
+
 // 拆线程：宿主创建前设 S2A_ANDROID_THREADED_RENDERER（0|1|auto，外壳每次游戏启动都显式设）；
 // AndroidVulkanRuntime.CreateRenderer 读它决定是否给 GAL 套 ThreadedRenderer（GPU 模拟 / Vulkan 录制提交分两条线程），
 // auto = 按本游戏上局记录决定。别的值 EINVAL，不按关处理。
@@ -942,6 +979,19 @@ Java_org_s2arm_android_NativeBridge_configureThreadedRenderer(JNIEnv *env, jclas
     return ::setenv("S2A_ANDROID_THREADED_RENDERER", value.c_str(), 1) == 0 ? 0 : errno;
 #else
     (void)env; (void)mode;
+    return ENOSYS;
+#endif
+}
+
+// 玩家画质选项：宿主创建前设 S2A_HIGH_QUALITY（1 = 高画质，0 = 更省电），后端上屏读它决定是否走 EASU（调试开关 nvk_upscale 可覆盖）。
+//   玩家入口，发布包也认（不走 s2a_debug_entries_open）
+extern "C" JNIEXPORT jint JNICALL
+Java_org_s2arm_android_NativeBridge_configureHighQuality(JNIEnv *, jclass, jboolean on) {
+#ifdef S2A_ANDROID_GAME_RUNTIME
+    if (g_game_host) return EBUSY;
+    return ::setenv("S2A_HIGH_QUALITY", on ? "1" : "0", 1) == 0 ? 0 : errno;
+#else
+    (void)on;
     return ENOSYS;
 #endif
 }
@@ -1015,7 +1065,7 @@ Java_org_s2arm_android_NativeBridge_startGame(JNIEnv *env, jclass, jlong handle,
             const std::string &root = host->asset_root.empty() ? host->game_data : host->asset_root;
             std::string directory = image.substr(0, image.size() - base.size());
             if (i == 0) {
-                for (const char *policy : {"widen_enable.handheld.tsv", "widen_enable.docked.tsv", "widen_full.handheld.tsv", "widen_full.docked.tsv", "widen_verified.tsv"})
+                for (const char *policy : k_optional_tables)
                     host->asset_paths.emplace(policy, root + "/" + directory + policy);
             }
             if (!host->asset_paths.emplace(name + ".patched.bin", root + "/" + image).second) return EINVAL;
@@ -1158,14 +1208,11 @@ extern "C" __attribute__((visibility("default"))) long long s2a_android_copy_ass
 #endif
 }
 
-// 接口 v2.15（缺口扫描族 1，#1228）：前后台转给服务层。平台壳写焦点 / 睡眠（onPause → 失焦 + 睡眠，
-//   onResume → 唤醒 + 焦点，与 iOS s2a_ios_suspend 同一时机）；安卓不像 iOS 整体冻结客机——失焦且游戏
-//   开着「失焦就暂停」（s2a_focus_suspend，缺省开）时按 Mac display_focus_publish_ex 冻客机与游戏时钟，
+// 接口 v2.15（缺口扫描族 1，#1228）：前后台转给服务层。平台壳写焦点（onPause → 失焦，onResume → 焦点；不发睡眠，
+//   见 setForeground）；退后台一律冻客机与游戏时钟（同 iOS 后台整体冻结，#855），
 //   时钟原因位 4 是安卓专属（1=后台会话、2=系统键盘、3=Mac 失焦），回前台放开；停机路径不冻、冻着先放开，
 //   stopGame 之后迟到的 onPause 也不再冻结（stop_started；收尾要等客机应答，冻回去会卡到硬预算）。
 extern "C" void s2a_host_focus_set(int focused);                   // runtime/src/os.c
-extern "C" int  s2a_focus_suspend(void);                           // runtime/src/os.c
-extern "C" void s2a_host_sleep_set(int sleeping);                  // runtime/src/os.c
 extern "C" void guest_clock_freeze_for(int reason, int on);        // runtime/src/os.c
 extern "C" void s2a_guest_freeze(int on) __attribute__((weak));    // runtime/src/thread.c：诊断目标不链它
 extern "C" void s2a_android_link_stop(void) __attribute__((weak)); // nvn/nvn_vsync_android.c：只在直连源里，诊断目标不链
@@ -1183,6 +1230,7 @@ Java_org_s2arm_android_NativeBridge_stopGame(JNIEnv *env, jclass, jlong handle, 
     if (!host || host != g_game_host || !host->game_runtime || host->stop_started.exchange(true)) return;
     s2a_capacity_stop();
     s2a_adpf_stop();
+    s2a_cpu_floor_stop();
     host->stop_reason = jstring_or(env, why, "game stop requested");
     host->stop_normal.store(normal == JNI_TRUE);
     // 后台冻着的客机先放开（同 Mac display_focus_publish_ex(NO, NO) 的「收尾只报不冻」）：
@@ -1294,19 +1342,20 @@ Java_org_s2arm_android_NativeBridge_setForeground(JNIEnv *, jclass, jlong handle
     s2a_aaudio_set_foreground(foreground != JNI_FALSE);
     s2a_capacity_foreground(foreground != JNI_FALSE);
     s2a_adpf_set_foreground(foreground != JNI_FALSE);
+    s2a_cpu_floor_set_foreground(foreground != JNI_FALSE);
     // 退后台停显示节拍源（直连 vsync 拍；前台回时由 acquire 路径按需懒重启）
     if (!foreground && s2a_android_link_stop) s2a_android_link_stop();
     host->window.set_foreground(foreground);
-    if (foreground) { s2a_host_sleep_set(0); s2a_host_focus_set(1); }
-    else            { s2a_host_focus_set(0); s2a_host_sleep_set(1); }
+    // 退后台只算失焦、不算睡眠（同 Mac 切窗口；Switch 按 HOME 也只是失焦）：系统选文件框、通知栏、切应用都会走到这里，
+    // 不是熄屏休眠。客机由下面的冻结停住（#855）。
+    s2a_host_focus_set(foreground ? 1 : 0);
     // 停机已开始的迟到 onPause 只报焦点 / 睡眠，不再冻结：stopGame 已经放开过，收尾线程要等客机
     // 应答与客机线程退出，再冻回去只能卡到硬预算（Home 路径 finishAndRemoveTask 还有 10 秒延迟）。
     bool stop_started = false;
 #ifdef S2A_ANDROID_GAME_RUNTIME
     stop_started = host->stop_started.load();
 #endif
-    switch (s2a_android_foreground_action(foreground != JNI_FALSE, stop_started, s_foreground_frozen,
-                                          s2a_focus_suspend())) {
+    switch (s2a_android_foreground_action(foreground != JNI_FALSE, stop_started, s_foreground_frozen)) {
     case S2A_ANDROID_FOREGROUND_FREEZE:
         if (s2a_guest_freeze) {
             s_foreground_frozen = true; guest_clock_freeze_for(4, 1); s2a_guest_freeze(1);
@@ -1326,7 +1375,7 @@ Java_org_s2arm_android_NativeBridge_setForeground(JNIEnv *, jclass, jlong handle
 // 直连安全网 JNI 出口（dguard_android.c 包装共用 dguard.c，未武装 / 已清零时空转）：
 // onTrimMemory 前台内存告警记失败证据；setHostBuild 在起局前传一次宿主版本号
 // （BuildConfig.VERSION_NAME，dguard 用它区分「另一个包」）；pollSaveAtomic 由 Java 侧
-// 每秒轮询，服务层报出不能原子提交的原因位时提示一次（判定在共用 direct_prompt.c）。
+// 每秒轮询，服务层报出不能原子提交的原因位时提示一次；负数是状态未知（服务层缺导出），不提示（判定在共用 direct_prompt.c）。
 extern "C" JNIEXPORT void JNICALL
 Java_org_s2arm_android_NativeBridge_memoryWarning(JNIEnv *, jclass) {
     s2a_android_dguard_memory_warning();
@@ -1345,6 +1394,13 @@ Java_org_s2arm_android_NativeBridge_setHostBuild(JNIEnv *env, jclass, jstring bu
 extern "C" JNIEXPORT jint JNICALL
 Java_org_s2arm_android_NativeBridge_pollSaveAtomic(JNIEnv *, jclass) {
     return s2a_save_atomic_poll();
+}
+// 游玩时间落盘（共用 runtime/src/playtime.c，口径同 iOS app.m 的 10 秒心跳与进后台）：Java 侧游戏在前台时每 10 秒、
+//   onPause 与收局前各调一次；攒着不满 1 秒时内部空转。诊断目标不链 playtime.c，弱引用取不到就跳过。
+extern "C" int s2a_playtime_flush(void) __attribute__((weak));
+extern "C" JNIEXPORT void JNICALL
+Java_org_s2arm_android_NativeBridge_flushPlaytime(JNIEnv *, jclass) {
+    if (s2a_playtime_flush) s2a_playtime_flush();
 }
 // 直连安全网提示出口（dguard_android.c 弱引用，这里是强实现）：在游戏线程上被调，
 // 经 JNI 上叫 NativeBridge.dguardPrompt 弹阻塞对话框；玩家选「仍然启动」才返回
@@ -1374,6 +1430,29 @@ extern "C" void s2a_android_dguard_prompt(const char *diag) {
     if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
     if (attached) vm->DetachCurrentThread();
 }
+// 停帧看门的屏上提示（runtime/src/ap_host.c stall_watch 按名字 dlsym 这三个，取不到就只打日志）：安卓用和 iOS 同名的出口接上，
+//   共用看门不改。三个调用方各只有一种用途——横幅 = 停帧救场关了帧率补丁（定时收）、消息 = 「可能还在加载」（帧又走了用清除收），
+//   所以这里只把「哪一种」交给 Java，文案由 Java 按界面语言取 strings.xml（看门传来的是 s2a_ui_text.h 的中文缺省，提到 iOS 的设置入口）。
+//   在看门线程上被调：挂上 JVM、调 NativeBridge.stallNotice(种类, 秒)，Java 侧派回主线程，不阻塞。
+static void stall_notice(int kind, int seconds) {
+    JavaVM *vm = g_vm;
+    JNIEnv *env = nullptr;
+    bool attached = false;
+    if (!vm || !g_bridge) { __android_log_print(ANDROID_LOG_ERROR, "S2Arm", "stall notice %d dropped: no bridge", kind); return; }
+    if (vm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6) != JNI_OK) {
+        if (vm->AttachCurrentThread(&env, nullptr) != JNI_OK) return;
+        attached = true;
+    }
+    jmethodID method = env->GetStaticMethodID(g_bridge, "stallNotice", "(II)V");
+    if (method) env->CallStaticVoidMethod(g_bridge, method, static_cast<jint>(kind), static_cast<jint>(seconds));
+    else __android_log_print(ANDROID_LOG_ERROR, "S2Arm", "stall notice: NativeBridge.stallNotice missing");
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+    if (attached) vm->DetachCurrentThread();
+}
+// 种类与 StallNotice.java 同值。横幅的秒数是显示多久（看门给 8）；文案里的「约 30 秒」是看门判停帧的窗口（ap_host.c 的 30 秒环、s2a_ap_crawl_due）
+extern "C" void s2a_ios_banner(const char *text, double seconds) { (void)text; stall_notice(1, seconds > 0 ? static_cast<int>(seconds + 0.5) : 8); }
+extern "C" void s2a_ios_show_message(const char *text) { (void)text; stall_notice(2, 0); }
+extern "C" void s2a_ios_clear_message(const char *text) { (void)text; stall_notice(0, 0); }
 // 接口 v2.15（#1228）：运行中切掌机 / 主机走宿主 display->set_console_mode（其内部转
 //   s2a_console_mode_set，服务层再转 ChangeDockedModeState）。与 os.c 其它符号同一强引用
 //   （能链接通过就说明 os.c 在）；仅会话运行中由 Java 调来。
@@ -1396,7 +1475,7 @@ Java_org_s2arm_android_NativeBridge_presentPeriodNs(JNIEnv *, jclass) {
 }
 extern "C" JNIEXPORT jstring JNICALL
 Java_org_s2arm_android_NativeBridge_releaseSurface(JNIEnv *env, jclass, jlong handle) {
-    if (handle) s2a_adpf_set_surface(0);
+    if (handle) { s2a_adpf_set_surface(0); s2a_cpu_floor_set_surface(0); }
     return text(env, handle ? get(handle)->window.release() : "Native host unavailable");
 }
 extern "C" JNIEXPORT void JNICALL
@@ -1478,12 +1557,53 @@ extern "C" void __real_exit(int);
 extern "C" void __wrap__exit(int code) { s2a_log_exit("_exit", code); __real__exit(code); }
 extern "C" void __wrap_exit(int code) { s2a_log_exit("exit", code); __real_exit(code); }
 
+// :game 进程的堆分配器策略（#1145）。世界场景里回放线程每帧约 460 次缺页（占进程缺页的 100%），其中 93.9% 来自 Adreno 驱动在
+// 每次 vkCmdBeginRenderPass / vkCmdEndRenderPass 里 calloc 出来的块：scudo 在 free 后按间隔把空闲页还给系统，下一次 calloc
+// 清零时又要重新缺页。
+//   M_DECAY_TIME = -1：不按时间归还空闲页（取 1 在读数上没有效果，缺页不降）。
+//   M_CACHE_COUNT_MAX = 0：次级分配器不留空闲大块的缓存。只设上一条时，缓存里的大块一直不归还、每次复用都要 calloc 整块清零，
+//     Native Heap 的 PSS 会多约 205 MB；关掉缓存后大块一释放就还，常驻只多约 18 MB（同包同局 A/B，见 docs/坑记录.md）。
+// mallopt 是进程级的；JNI_OnLoad 在每个加载本库的进程里都会跑，启动器进程不需要这个策略，所以按进程名只在 :game 进程设。
+static bool s2a_is_game_process() {
+    char name[256] = {0};
+    const int fd = open("/proc/self/cmdline", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    const ssize_t n = read(fd, name, sizeof name - 1);
+    close(fd);
+    if (n <= 0) return false;
+    const size_t len = strlen(name);   // cmdline 以 NUL 分隔参数，进程名是第一段（<包名>:game）
+    return len > 5 && strcmp(name + len - 5, ":game") == 0;
+}
+static void s2a_tune_heap_for_game() {
+    if (!s2a_is_game_process()) return;
+    const int rc_decay = mallopt(M_DECAY_TIME, -1);
+    const int rc_cache = mallopt(M_CACHE_COUNT_MAX, 0);
+    // mallopt 返回 1 = 生效，0 = 这台设备的分配器不认这个选项（照常往下走，只是没有这条优化）。
+    __android_log_print(ANDROID_LOG_INFO, "S2Arm", "heap: M_DECAY_TIME=-1 rc=%d, M_CACHE_COUNT_MAX=0 rc=%d", rc_decay, rc_cache);
+}
+
 // JNI 装载即重定向 stderr（debug.s2a.stderr）并注册 exit 探针（debug.s2a.exitlog），
-// 早于任何 Java/游戏逻辑。exit() 会触发 atexit；_exit()/abort() 不会。
+// 早于任何 Java/游戏逻辑。exit() 会触发 atexit；_exit()/abort() 不会。:game 进程同时设好堆分配器策略（见上）。
 extern "C" int JNI_OnLoad(JavaVM *vm, void *reserved) {
     (void)vm; (void)reserved;
     s2a_redirect_stderr_once();
     __system_property_get("debug.s2a.exitlog", g_exitlog_path);
     if (g_exitlog_path[0]) atexit(s2a_exit_probe);
+    s2a_tune_heap_for_game();
     return 0x00010006;   // JNI_VERSION_1_6
+}
+
+// P10 transport only; no UI and no independent save format or startup lock.
+#include "save_transfer.h"
+#if defined(S2A_CS_STATIC) && defined(S2A_ANDROID_GAME_RUNTIME)
+extern "C" char *S2A_SaveTransfer(const char *request);
+extern "C" void S2A_SaveTransferFree(void *response);
+#endif
+extern "C" JNIEXPORT jbyteArray JNICALL
+Java_org_s2arm_android_NativeBridge_saveTransfer(JNIEnv *env, jclass, jbyteArray request) {
+#if defined(S2A_CS_STATIC) && defined(S2A_ANDROID_GAME_RUNTIME)
+    return s2a::save_transfer(env, request, S2A_SaveTransfer, S2A_SaveTransferFree);
+#else
+    return s2a::save_transfer(env, request, nullptr, nullptr);
+#endif
 }

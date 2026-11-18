@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# 直连缓存按容量预算淘汰（LRU；11-02 出包线，维护者「存储换时间」：缓存放 2T，超预算才删最久没用的，不按天数删）。tools/gc.sh 每轮调：
+# 直连缓存按容量预算淘汰（LRU；11-02 出包线，维护者「存储换时间」：缓存放 2T，超预算才删最久没用的，不按天数删）。维护方内部清扫器每轮调：
 #   python3 tools/direct_cache_lru.py <cache/direct 目录> --budget-gb <预算> [--in-use <程序号,…>] [--dry]
 # 统计：<目录>/<程序号>/ 下全部文件的字节（合计）；能淘汰的只有内容寻址仓条目 <程序号>/store/**/*.e（C# 出库链 Store，graphics/tools/direct/dsh/batch/Build.cs：
 #   翻译结果与 Metal 库，删了下次按需重算；出库整理只给本次用到的条目刷新修改时间、不删——修改时间就是「最近用过」）。
@@ -9,19 +9,28 @@ import argparse, os, sys
 
 
 def scan(root):
-    """→ (合计字节, [(修改时间, 字节, 路径, 程序号)] 仓条目)"""
+    """→ (合计字节, [(修改时间, 字节, 路径, 程序号)] 仓条目)。
+    逐层 os.scandir、取目录项自带的 stat（11-16 极速出包定因：原先 os.walk + 逐个 os.lstat，Windows 上每个文件一次真系统调用，
+    Windows 出包机共用缓存八十多万个文件每单 87–300 秒；目录项在 Windows 上枚举时就带大小与修改时间，POSIX 上等于一次 lstat）。
+    口径与原先相同：指向目录的链接不进、也不计；其余（文件、指向文件的链接）按 lstat 计"""
     total, ents = 0, []
     for tid in sorted(os.listdir(root)):
         d = os.path.join(root, tid)
         if not os.path.isdir(d) or os.path.islink(d): continue
-        for dp, dns, fns in os.walk(d):
-            dns[:] = [n for n in dns if not os.path.islink(os.path.join(dp, n))]
-            for fn in fns:
-                p = os.path.join(dp, fn)
-                try: st = os.lstat(p)
-                except OSError: continue
-                total += st.st_size
-                if fn.endswith('.e') and os.sep + 'store' + os.sep in p[len(d):] + os.sep: ents.append((st.st_mtime, st.st_size, p, tid))
+        stack = [d]
+        while stack:
+            try: it = os.scandir(stack.pop())
+            except OSError: continue
+            with it:
+                for e in it:
+                    try:
+                        if e.is_dir(follow_symlinks=True):
+                            if not e.is_symlink(): stack.append(e.path)
+                            continue
+                        st = e.stat(follow_symlinks=False)
+                    except OSError: continue
+                    total += st.st_size
+                    if e.name.endswith('.e') and os.sep + 'store' + os.sep in e.path[len(d):] + os.sep: ents.append((st.st_mtime, st.st_size, e.path, tid))
     return total, ents
 
 

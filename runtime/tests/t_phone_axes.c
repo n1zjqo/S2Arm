@@ -29,7 +29,37 @@ int main(void) {
     // ⑧ 重力和用户加速度相加：重力 (0, −1, 0) 加用户 (0.25, 0, 0.5) → 取反 (−0.25, +1, −0.5)；角速度 (1, −2, 0.5) rad/s 换成度/秒
     { double gravity[3] = {0, -1, 0}, user[3] = {0.25, 0, 0.5}, rotation[3] = {1, -2, 0.5}; s2a_gc_motion_axes(gravity, user, rotation, a, g);
       near3("⑧ 手柄 加速度合成", a, -0.25, 1, -0.5); near3("⑧ 手柄 角速度换算", g, deg, -2 * deg, 0.5 * deg); }
+    // ⑨ iPhone Duo 内屏（#804 玩家实测）：原生面板是横的，界面横屏时屏幕右 = 机身 x、屏幕上 = 机身 y（不转）。
+    //   上沿朝玩家翻（绕屏幕右轴）→ raw x；右沿翻（绕屏幕上轴）→ raw y；方向盘（绕出屏轴）→ raw z；平放 → raw (0, 0, +1)
+    { static const int r[2] = {1, 0}, u[2] = {0, 1};
+      double tx[3] = {1, 0, 0}, ty[3] = {0, 1, 0}, tz[3] = {0, 0, -1}, flat[3] = {0, 0, -1};
+      s2a_phone_axes_basis(r, u, zero, tx, a, g); near3("⑨ Duo 内屏 上沿翻", g, deg, 0, 0);
+      s2a_phone_axes_basis(r, u, zero, ty, a, g); near3("⑨ Duo 内屏 右沿翻", g, 0, deg, 0);
+      s2a_phone_axes_basis(r, u, zero, tz, a, g); near3("⑨ Duo 内屏 方向盘右转", g, 0, 0, -deg);
+      s2a_phone_axes_basis(r, u, flat, zero, a, g); near3("⑨ Duo 内屏 平放", a, 0, 0, 1); }
+    // ⑩ 通用形式在竖屏面板横屏右的基（右 = −y、上 = x）上与 s2a_phone_axes(1, …) 逐分量相同（同一组任意读数）
+    { static const int r[2] = {0, -1}, u[2] = {1, 0}; double acc[3] = {0.3, -0.5, -0.8}, gyr[3] = {0.7, 0.2, -0.4}; float a2[3], g2[3];
+      s2a_phone_axes_basis(r, u, acc, gyr, a, g); s2a_phone_axes(1, acc, gyr, a2, g2);
+      near3("⑩ 通用形式 = 横屏右 加速度", a, a2[0], a2[1], a2[2]); near3("⑩ 通用形式 = 横屏右 角速度", g, g2[0], g2[1], g2[2]); }
+    // ⑪ 折叠屏内屏补转（#804 D-KBVC）：Duo 内屏面板 2007x2853，屏幕坐标空间算出 右 (0, 1)、上 (−1, 0) → 补转后 右 (1, 0)、上 (0, 1)（= ⑨ 的基）；
+    //   另一侧横屏算出 右 (0, −1)、上 (1, 0) → 右 (−1, 0)、上 (0, −1)；普通 iPhone 面板 1320x2868 不动；面板横放 2853x2007 不动
+    { int r1[2] = {0, 1}, u1[2] = {-1, 0}; s2a_phone_panel_fix(2007, 2853, 1, r1, u1);
+      if (r1[0] != 1 || r1[1] != 0 || u1[0] != 0 || u1[1] != 1) { printf("✗ ⑪ Duo 内屏补转：得 右 (%d, %d) 上 (%d, %d)\n", r1[0], r1[1], u1[0], u1[1]); bad++; }
+      int r2[2] = {0, -1}, u2[2] = {1, 0}; s2a_phone_panel_fix(2007, 2853, 1, r2, u2);
+      if (r2[0] != -1 || r2[1] != 0 || u2[0] != 0 || u2[1] != -1) { printf("✗ ⑪ Duo 内屏另一侧：得 右 (%d, %d) 上 (%d, %d)\n", r2[0], r2[1], u2[0], u2[1]); bad++; }
+      int r3[2] = {0, -1}, u3[2] = {1, 0}; s2a_phone_panel_fix(1320, 2868, 1, r3, u3);
+      if (r3[0] != 0 || r3[1] != -1 || u3[0] != 1 || u3[1] != 0) { printf("✗ ⑪ 普通 iPhone 面板不该动\n"); bad++; }
+      int r4[2] = {0, 1}, u4[2] = {-1, 0}; s2a_phone_panel_fix(2853, 2007, 1, r4, u4);
+      if (r4[0] != 0 || r4[1] != 1 || u4[0] != -1 || u4[1] != 0) { printf("✗ ⑪ 横放面板不该动\n"); bad++; } }
+    // ⑫ iPad 不补（#1360）：iPad mini 面板 1512x2316（高÷宽 1.53，同样 < 1.6），两种横握 UIKit 算出的 右 / 上 原样保留（期望按玩家 0.3.9 实机记录：
+    //   朝向 3 右 (0, −1)、上 (1, 0)；朝向 4 右 (0, 1)、上 (−1, 0)）；同一面板若误当 iPhone 传进来才会补转（反证判据靠的是界面类型，不是面板比例）
+    { int r1[2] = {0, -1}, u1[2] = {1, 0}; s2a_phone_panel_fix(1512, 2316, 0, r1, u1);
+      if (r1[0] != 0 || r1[1] != -1 || u1[0] != 1 || u1[1] != 0) { printf("✗ ⑫ iPad mini 横握一侧不该动：得 右 (%d, %d) 上 (%d, %d)\n", r1[0], r1[1], u1[0], u1[1]); bad++; }
+      int r2[2] = {0, 1}, u2[2] = {-1, 0}; s2a_phone_panel_fix(1512, 2316, 0, r2, u2);
+      if (r2[0] != 0 || r2[1] != 1 || u2[0] != -1 || u2[1] != 0) { printf("✗ ⑫ iPad mini 另一侧不该动：得 右 (%d, %d) 上 (%d, %d)\n", r2[0], r2[1], u2[0], u2[1]); bad++; }
+      int r3[2] = {0, 1}, u3[2] = {-1, 0}; s2a_phone_panel_fix(2007, 2853, 0, r3, u3);
+      if (r3[0] != 0 || r3[1] != 1) { printf("✗ ⑫ 界面类型不是 iPhone 时 Duo 尺寸也不补\n"); bad++; } }
     if (bad) { printf("✗ t_phone_axes：%d 处不符\n", bad); return 1; }
-    printf("✓ t_phone_axes：8 项手算姿态全符（横屏左右、平放对齐 NS2 真报文、方向盘、俯仰、手柄 GCMotion）\n");
+    printf("✓ t_phone_axes：12 项手算姿态全符（iPad 不补转、横屏左右、平放对齐 NS2 真报文、方向盘、俯仰、手柄 GCMotion、Duo 内屏、通用形式、折叠屏内屏补转）\n");
     return 0;
 }

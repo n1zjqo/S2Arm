@@ -20,6 +20,12 @@ public struct GameDetailView: View {
         VStack(alignment: .leading, spacing: 30) {
             if showsHeader || showsPrimaryAction { header }
             ForEach(detail.sections) { section in
+              // 社区补丁与金手指合成一块 S 级优化专区（SGradeGroup.swift），出现在两组里第一组的位置
+              if SGradeGroup.ids.contains(section.id) {
+                if section.id == detail.sections.first(where: { SGradeGroup.ids.contains($0.id) })?.id {
+                    SGradeGroup(gameID: detail.id, sections: detail.sections.filter { SGradeGroup.ids.contains($0.id) }) { actions.onChange(detail.id, $0, $1) }
+                }
+              } else {
                 group(section.title) {
                     // The button mapping is one row here and opens a card of its own, as a long choice list does.
                     if section.id == PadMappingRows.sectionID {
@@ -32,22 +38,29 @@ public struct GameDetailView: View {
                         }
                     }
                 }
+              }
             }
             group(ShellStrings.text("Game data")) {
                 SourceRow(symbol: "folder",
                           title: detail.dataSource.isEmpty ? ShellStrings.text("No data selected") : detail.dataSource,
                           note: detail.dataNote) {
-                    Button(ShellStrings.text("Choose…")) { actions.onPickGameData(detail.id) }
-                        .buttonStyle(ShellButtonStyle(fills: true)).accessibilityLabel(ShellStrings.text("Choose game data…"))
-                        .shellTarget("set.data") { actions.onPickGameData(detail.id) }
+                    // Only while the game has no data: the button then leads to how to bring it in. Once the host reports the
+                    // data as ready (the iOS host fills dataSource with its state and size), the row only reads.
+                    if detail.dataSource.isEmpty {
+                        Button(ShellStrings.text("Choose…")) { actions.onPickGameData(detail.id) }
+                            .buttonStyle(ShellButtonStyle(fills: true)).accessibilityLabel(ShellStrings.text("Choose game data…"))
+                            .shellTarget("set.data") { actions.onPickGameData(detail.id) }
+                    }
                     if let useAppData = actions.onUseAppData, !detail.dataSource.isEmpty && !detail.dataFromShell {
                         Button(ShellStrings.text("Use app data")) { useAppData(detail.id) }
                             .buttonStyle(ShellButtonStyle(fills: true)).shellTarget("set.appdata") { useAppData(detail.id) }
                     }
                 }
-                divider
-                Label(detail.dlc.isEmpty ? ShellStrings.text("No additional content") : detail.dlc, systemImage: "square.stack.3d.up")
-                    .shellText(14).foregroundStyle(.white.opacity(0.72)).frame(minHeight: 32)
+                if !detail.dlc.isEmpty {   // nothing to say when the host reports no additional content
+                    divider
+                    Label(detail.dlc, systemImage: "square.stack.3d.up")
+                        .shellText(14).foregroundStyle(.white.opacity(0.72)).frame(minHeight: 32)
+                }
             }
             if let pickCloud = actions.onPickCloudSaves {
                 group(ShellStrings.text("Cloud saves")) {
@@ -222,10 +235,14 @@ struct SettingControl: View, Equatable {
                 }
                 HStack(spacing: 10) {
                     rangeButton("minus", min: min, max: max, delta: -step)
+                    #if os(tvOS)
+                    Spacer(minLength: 0)   // tvOS 没有 Slider：遥控器 / 手柄只用两侧的减、加一档
+                    #else
                     if min < max && step > 0 {
                         Slider(value: Binding(get: { Double(row.value) ?? min }, set: { change(String($0)) }), in: min...max, step: step)
                             .frame(minHeight: 44).tint(ShellPalette.cream).accessibilityLabel(row.label)
                     }
+                    #endif
                     rangeButton("plus", min: min, max: max, delta: step)
                 }
             }

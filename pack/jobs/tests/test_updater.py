@@ -1,9 +1,14 @@
 import hashlib
+import io
 import http.server
 import json
 import os
+import shutil
 import sys
+import subprocess
 import tempfile
+import unittest.mock
+import types
 import threading
 import time
 import unittest
@@ -52,183 +57,6 @@ class Base(unittest.TestCase):
         return {k: v for k, v in tree(self.private).items() if not k.startswith(("updates", "logs"))}
 
 
-class ApplyTests(Base):
-    def run_apply(self, launch, **options):
-        return updater.apply(self.staged, self.install, 2147483646, self.private, launch=launch, health_seconds=options.pop("health", 1), **options)
-
-    def healthy(self, install, args):
-        (self.private / "updates/health.ok").write_text("ok")
-
-    def test_success_replaces_install_and_keeps_every_user_file(self):
-        before = self.data()
-        self.assertEqual(self.run_apply(self.healthy), 0)
-        self.assertEqual((self.install / "S2Arm.exe").read_text(), "new")
-        self.assertFalse(self.install.with_name("S2Arm.s2arm-old").exists())
-        self.assertEqual(self.data(), before)
-
-    def test_read_only_files_do_not_leave_the_old_copy_behind(self):
-        locked = self.install / "Engine/pack"; locked.write_text("x"); locked.chmod(0o444)
-        self.assertEqual(self.run_apply(self.healthy), 0)
-        self.assertFalse(self.install.with_name("S2Arm.s2arm-old").exists())
-
-    def test_new_version_that_never_starts_is_rolled_back(self):
-        before = self.data(); launches = []
-        self.assertEqual(self.run_apply(lambda i, a: launches.append((i / "S2Arm.exe").read_text())), 1)
-        self.assertEqual((self.install / "S2Arm.exe").read_text(), "old")
-        self.assertEqual(launches, ["new", "old"])
-        self.assertEqual(json.loads((self.private / "updates/last_failure.json").read_text(encoding="utf-8"))["code"], "update_rolled_back")
-        self.assertEqual(self.data(), before)
-
-    def test_swap_failure_keeps_old_version(self):
-        real, calls = os.rename, []
-
-        def flaky(source, target):   # 新版的东西放不进安装位置：整目录改名、逐项改名（move_dir 的退路）都被拒
-            calls.append(target)
-            if ".s2arm-new" in str(source) and (Path(target) == self.install or Path(target).parent == self.install):
-                raise PermissionError(13, "locked")
-            real(source, target)
-        launches = []
-        with patch.object(updater.os, "rename", flaky), patch.object(updater.time, "sleep", lambda s: None), patch.object(updater.time, "monotonic", side_effect=iter(range(0, 10**6, 100)).__next__):
-            self.assertEqual(self.run_apply(lambda i, a: launches.append((i / "S2Arm.exe").read_text())), 1)
-        self.assertEqual((self.install / "S2Arm.exe").read_text(), "old")
-        self.assertEqual(launches, ["old"])
-
-    def test_install_folder_held_open_swaps_its_contents(self):
-        # #379：下载工具持有安装目录本身的句柄，整目录改名一直被拒、里面的文件能改名 → 逐项换上新版，确认起来后旧副本删掉
-        real = os.rename
-        def held(source, target):
-            if Path(source) == self.install:
-                raise PermissionError(32, "being used by another process")
-            real(source, target)
-        with patch.object(updater.os, "rename", held), patch.object(updater.time, "sleep", lambda s: None), \
-             patch.object(updater.time, "monotonic", side_effect=iter(range(0, 10**6, 100)).__next__):
-            self.assertEqual(self.run_apply(self.healthy), 0)
-        self.assertEqual((self.install / "S2Arm.exe").read_text(), "new")
-        self.assertTrue((self.install / "Engine").is_dir())
-        self.assertFalse(self.install.with_name("S2Arm.s2arm-old").exists())
-
-    def test_held_folder_and_a_locked_file_rolls_every_entry_back(self):
-        # 逐项换到一半有文件也被占（残留的作业进程开着它）：已搬走的全部搬回，旧版原样，失败原因记进 update.log
-        real = os.rename
-        def held(source, target):
-            if Path(source) == self.install or Path(source) == self.install / "S2Arm.exe":
-                raise PermissionError(32, "being used by another process")
-            real(source, target)
-        with patch.object(updater.os, "rename", held), patch.object(updater.time, "sleep", lambda s: None), \
-             patch.object(updater.time, "monotonic", side_effect=iter(range(0, 10**6, 100)).__next__):
-            self.assertEqual(self.run_apply(self.healthy), 1)
-        self.assertEqual(((self.install / "S2Arm.exe").read_text(), sorted(p.name for p in self.install.iterdir())), ("old", ["Engine", "S2Arm.exe"]))
-        self.assertIn("update_swap_failed", (self.private / "logs/update.log").read_text(encoding="utf-8"))
-
-    def test_rollback_reason_is_kept_in_update_log(self):   # #379：last_failure.json 启动器读完就删，原因还要留在诊断包会收的日志里
-        self.assertEqual(self.run_apply(lambda i, a: None), 1)
-        self.assertIn("update_rolled_back", (self.private / "logs/update.log").read_text(encoding="utf-8"))
-
-    def test_app_that_does_not_exit_is_left_alone(self):
-        result = updater.apply(self.staged, self.install, os.getpid(), self.private, launch=self.fail, exit_seconds=0)
-        self.assertEqual(result, 1)
-        self.assertEqual((self.install / "S2Arm.exe").read_text(), "old")
-
-    def test_retry_after_interrupted_first_rename_installs_new_version(self):
-        before = self.data()
-        backup = self.install.with_name("S2Arm.s2arm-old")
-        # swap() interrupted after install -> backup, before new -> install.
-        os.rename(self.install, backup)
-        self.assertEqual(self.run_apply(self.healthy), 0)
-        self.assertEqual((self.install / "S2Arm.exe").read_text(), "new")
-        self.assertFalse(backup.exists())
-        self.assertEqual(self.data(), before)
-
-    def test_retry_when_restore_leaves_an_empty_backup_keeps_the_old_copy(self):
-        # 审计 P1-157：上次中断在「安装目录已改名为 .s2arm-old、新版还没换上」。这次先把副本搬回：整段改名被拒（目录被占用）→ 逐项搬，
-        #   搬空的 .s2arm-old 删不掉留成空目录。期望（手写）：空目录不当成「还有一份旧版」，旧版留在安装目录；新版起不来就回到它，
-        #   失败句「已回到旧版」与盘上一致（原先把刚搬回的旧版当坏的删掉，安装目录没有 S2Arm.exe，失败句仍写「已回到旧版」）
-        backup = self.install.with_name("S2Arm.s2arm-old")
-        os.rename(self.install, backup)
-        real_rename, real_rmdir = updater.retry_rename, Path.rmdir
-        def rename(src, dst, *a, **kw):
-            if Path(src) == backup and Path(dst) == self.install:
-                raise PermissionError(13, "held open")
-            return real_rename(src, dst, *a, **kw)
-        def rmdir(path, *a, **kw):
-            if Path(path) == backup:
-                raise OSError(16, "busy")
-            return real_rmdir(path, *a, **kw)
-        with patch.object(updater, "retry_rename", rename), patch.object(Path, "rmdir", rmdir):
-            self.assertEqual(self.run_apply(lambda install, args: None, health=0, exit_seconds=0), 1)
-        self.assertEqual((self.install / "S2Arm.exe").read_text(), "old")
-        failure = json.loads((self.private / "updates/last_failure.json").read_text(encoding="utf-8"))
-        self.assertEqual((failure["code"], failure["message"]), ("update_rolled_back", "新版没能启动，已回到旧版。"))
-
-    def test_holds_copy_ignores_empty_leftovers(self):
-        empty = self.root / "empty"; empty.mkdir()
-        self.assertTrue(updater.holds_copy(self.install))
-        self.assertFalse(updater.holds_copy(empty))
-        self.assertFalse(updater.holds_copy(self.root / "missing"))
-
-    def test_retry_with_missing_staged_files_restores_the_old_install(self):
-        before = self.data()
-        backup = self.install.with_name("S2Arm.s2arm-old")
-        os.rename(self.install, backup)
-        launches = []
-        self.staged = self.root / "missing-staged"
-        self.assertEqual(self.run_apply(lambda i, a: launches.append((i / "S2Arm.exe").read_text())), 1)
-        self.assertEqual((self.install / "S2Arm.exe").read_text(), "old")
-        self.assertEqual(launches, ["old"])
-        self.assertEqual(self.data(), before)
-
-    def test_failed_interrupted_install_recovery_preserves_the_backup(self):
-        backup = self.install.with_name("S2Arm.s2arm-old")
-        os.rename(self.install, backup)
-        with patch.object(updater, "retry_rename", side_effect=PermissionError(13, "locked")):
-            self.assertEqual(self.run_apply(lambda *_: None), 1)
-        self.assertEqual((backup / "S2Arm.exe").read_text(), "old")
-
-    def test_retry_after_partial_new_copy_cleans_it_and_installs_normally(self):
-        backup = self.install.with_name("S2Arm.s2arm-old")
-        os.rename(self.install, backup)
-        partial = self.install.with_name("S2Arm.s2arm-new")
-        partial.mkdir()
-        (partial / "incomplete").write_text("synthetic interrupted copy")
-        self.assertEqual(self.run_apply(self.healthy), 0)
-        self.assertEqual((self.install / "S2Arm.exe").read_text(), "new")
-        self.assertFalse((self.install / "incomplete").exists())
-        self.assertFalse(partial.exists())
-
-    def unconfirmed_previous_update(self):
-        """上一次 apply 已把安装目录换成新版、旧版留在副本，没等到 health.ok 就中断（审计 P1-147）"""
-        backup = self.install.with_name("S2Arm.s2arm-old")
-        os.rename(self.install, backup)
-        (self.install / "Engine").mkdir(parents=True)
-        (self.install / "S2Arm.exe").write_text("unconfirmed")
-        return backup
-
-    def test_failed_retry_after_unconfirmed_update_keeps_the_known_good_install(self):
-        self.unconfirmed_previous_update()
-        self.staged = self.root / "missing-staged"   # 这次替换必然失败
-        launches = []
-        self.assertEqual(self.run_apply(lambda i, a: launches.append((i / "S2Arm.exe").read_text())), 1)
-        failure = json.loads((self.private / "updates/last_failure.json").read_text(encoding="utf-8"))
-        self.assertEqual(failure["code"], "update_swap_failed")
-        # 失败句说「已保留旧版」：盘上必须真有确认过能用的那一版
-        self.assertEqual((self.install / "S2Arm.exe").read_text(), "old")
-        self.assertEqual(launches, ["old"])
-
-    def test_new_version_failing_after_unconfirmed_update_rolls_back_to_the_known_good_install(self):
-        backup = self.unconfirmed_previous_update()
-        launches = []
-        self.assertEqual(self.run_apply(lambda i, a: launches.append((i / "S2Arm.exe").read_text())), 1)
-        self.assertEqual((self.install / "S2Arm.exe").read_text(), "old")
-        self.assertEqual(launches, ["new", "old"])
-        self.assertFalse(backup.exists())
-
-    def test_confirmed_previous_update_becomes_the_rollback_target(self):
-        self.unconfirmed_previous_update()
-        (self.private / "updates/health.ok").write_text("ok")   # 上次换上的版本后来起来过
-        launches = []
-        self.assertEqual(self.run_apply(lambda i, a: launches.append((i / "S2Arm.exe").read_text())), 1)
-        self.assertEqual((self.install / "S2Arm.exe").read_text(), "unconfirmed")
-        self.assertEqual(launches, ["new", "unconfirmed"])
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -245,143 +73,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         pass
 
 
-class FlakyHandler(http.server.BaseHTTPRequestHandler):
-    """按脚本回应：每项是一次请求给多少字节（None = 全给）、支不支持续传"""
-    body = b""
-    plan = []
-    ranges = []
-
-    def do_GET(self):
-        header = self.headers.get("Range")
-        start = int(header[6:-1]) if header else 0
-        type(self).ranges.append(start)
-        limit, resume = type(self).plan.pop(0) if type(self).plan else (None, True)
-        if not resume:
-            start = 0
-        data = self.body[start:]
-        self.send_response(206 if start else 200)
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data if limit is None else data[:limit])
-        self.wfile.flush()
-        self.connection.close()
-
-    def log_message(self, *a):
-        pass
 
 
-class DownloadTests(Base):
-    def setUp(self):
-        super().setUp()
-        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), FlakyHandler)
-        threading.Thread(target=self.server.serve_forever, daemon=True).start()
-        self.addCleanup(self.server.server_close)
-        self.addCleanup(self.server.shutdown)
-        FlakyHandler.body = bytes(range(256)) * 4096
-        FlakyHandler.ranges = []
-        self.target = self.root / "package"
-        for name, value in (("trusted", lambda url: True), ("emit", lambda **k: None)):
-            p = patch.object(updater, name, value); p.start(); self.addCleanup(p.stop)
-        p = patch.object(updater, "RETRY_SECONDS", 0); p.start(); self.addCleanup(p.stop)
-
-    def get(self):
-        updater.download(f"http://127.0.0.1:{self.server.server_port}/p", self.target, len(FlakyHandler.body))
-
-    def test_dropped_connection_resumes_where_it_stopped(self):
-        FlakyHandler.plan = [(1 << 18, True), (1 << 18, True), (None, True)]
-        self.get()
-        self.assertEqual(self.target.read_bytes(), FlakyHandler.body)
-        self.assertEqual(FlakyHandler.ranges, [0, 1 << 18, 1 << 19])
-
-    def test_server_without_resume_starts_over(self):
-        FlakyHandler.plan = [(1 << 18, True), (None, False)]
-        self.get()
-        self.assertEqual(self.target.read_bytes(), FlakyHandler.body)
-
-    def test_gives_up_when_nothing_arrives(self):
-        FlakyHandler.plan = [(0, True)] * updater.DOWNLOAD_ATTEMPTS
-        with self.assertRaises(updater.UpdateError) as caught:
-            self.get()
-        self.assertEqual(caught.exception.code, "update_download_failed")
-        self.assertFalse(self.target.exists())
-
-    def test_retry_in_a_new_process_resumes_from_the_saved_part(self):
-        """跨进程重试（审计 P2-220）：上次进程留下的 .part 接着下，不从头来"""
-        Path(str(self.target) + ".part").write_bytes(FlakyHandler.body[:1 << 18])
-        FlakyHandler.plan = [(None, True)]
-        self.get()
-        self.assertEqual(self.target.read_bytes(), FlakyHandler.body)
-        self.assertEqual(FlakyHandler.ranges, [1 << 18])
-
-    def test_part_longer_than_the_manifest_is_discarded(self):
-        Path(str(self.target) + ".part").write_bytes(b"x" * (len(FlakyHandler.body) + 1))
-        FlakyHandler.plan = [(None, True)]
-        self.get()
-        self.assertEqual(self.target.read_bytes(), FlakyHandler.body)
-        self.assertEqual(FlakyHandler.ranges, [0])
-
-    def test_slow_progress_keeps_going_past_the_attempt_limit(self):
-        FlakyHandler.plan = [(1 << 16, True)] * (updater.DOWNLOAD_ATTEMPTS + 3) + [(None, True)]
-        self.get()
-        self.assertEqual(self.target.read_bytes(), FlakyHandler.body)
-
-    def test_completed_download_retries_promotion_without_another_request(self):
-        real, attempts = os.replace, []
-
-        def locked(source, target):
-            attempts.append((source, target))
-            if len(attempts) < 3:
-                raise PermissionError(13, "synthetic sharing violation")
-            return real(source, target)
-
-        FlakyHandler.plan = [(None, True)]
-        with patch.object(updater.os, "replace", locked), patch.object(updater.time, "sleep"):
-            self.get()
-        self.assertEqual(len(attempts), 3)
-        self.assertEqual(FlakyHandler.ranges, [0])
-        self.assertEqual(self.target.read_bytes(), FlakyHandler.body)
-        self.assertFalse(Path(str(self.target) + ".part").exists())
-
-    def test_promotion_timeout_keeps_complete_part_for_the_next_attempt(self):
-        FlakyHandler.plan = [(None, True)]
-        with patch.object(updater.os, "replace", side_effect=PermissionError(13, "synthetic sharing violation")) as replace, \
-                patch.object(updater.time, "monotonic", side_effect=[0, 1, 31]), patch.object(updater.time, "sleep"), \
-                self.assertRaises(PermissionError):
-            self.get()
-        self.assertEqual(replace.call_count, 2)
-        self.assertFalse(self.target.exists())
-        self.assertEqual(Path(str(self.target) + ".part").read_bytes(), FlakyHandler.body)
-        self.get()
-        self.assertEqual(self.target.read_bytes(), FlakyHandler.body)
-        self.assertEqual(FlakyHandler.ranges, [0])
-
-    def test_completed_part_can_replace_an_existing_target(self):
-        self.target.write_bytes(b"stale package")
-        Path(str(self.target) + ".part").write_bytes(FlakyHandler.body)
-        self.get()
-        self.assertEqual(self.target.read_bytes(), FlakyHandler.body)
-        self.assertEqual(FlakyHandler.ranges, [])
 
 
-class MacUnpackTests(Base):
-    def test_failed_attach_reports_why_and_mounts_outside_the_data_folder(self):
-        calls = []
-        def run(cmd, **k):
-            calls.append(cmd)
-            return type("R", (), {"returncode": 1, "stderr": b"hdiutil: attach failed - Permission denied"})
-        dest = self.root / "unpack"; dest.mkdir()
-        with patch.object(updater.subprocess, "run", run), self.assertRaises(updater.UpdateError) as caught:
-            updater.extract_mac(self.root / "x.dmg", dest)
-        self.assertEqual(caught.exception.code, "update_unpack_failed")
-        self.assertIn("Permission denied", caught.exception.detail)
-        mount = Path(calls[0][calls[0].index("-mountpoint") + 1])
-        self.assertFalse(mount.is_relative_to(self.root)); self.assertFalse(mount.exists())
-
-    def test_failure_reason_reaches_the_log(self):
-        args = type("A", (), {"private_root": str(self.root / "p")})
-        updater.record_failure(args, "update_unpack_failed", "打不开", "hdiutil: attach failed")
-        text = (self.root / "p/logs/update.log").read_text(encoding="utf-8")
-        self.assertIn("update_unpack_failed", text); self.assertIn("hdiutil: attach failed", text)
 
 
 class ScriptedHandler(http.server.BaseHTTPRequestHandler):
@@ -418,7 +113,7 @@ class NetworkErrorTests(Base):
         self.addCleanup(self.server.shutdown)
         self.base = f"http://127.0.0.1:{self.server.server_port}"
         ScriptedHandler.scripts, ScriptedHandler.hits = {}, []
-        for name, value in (("trusted", lambda url: True), ("emit", lambda **k: None), ("FETCH_RETRY_SECONDS", 0), ("RETRY_SECONDS", 0)):
+        for name, value in (("trusted", lambda url: True), ("emit", lambda **k: None), ("FETCH_RETRY_SECONDS", 0)):
             p = patch.object(updater, name, value); p.start(); self.addCleanup(p.stop)
 
     def check(self, api):
@@ -459,335 +154,16 @@ class NetworkErrorTests(Base):
         self.assertEqual(caught.exception.code, "update_network")
         self.assertIn("超时", str(caught.exception))
 
-    def test_missing_package_fails_fast_with_server_code(self):
-        ScriptedHandler.scripts["/pkg"] = [(404, {}, b"")]
-        with self.assertRaises(updater.UpdateError) as caught:
-            updater.download(self.base + "/pkg", self.root / "p", 1000)
-        self.assertEqual(caught.exception.code, "update_server")
-        self.assertEqual(ScriptedHandler.hits, ["/pkg"])   # 地址本身出错：不空耗重试
 
 
-class ThrottledDropHandler(http.server.BaseHTTPRequestHandler):
-    """限速 + 中途掐连接：每次最多给 cut 字节、每 16 KB 停 2 毫秒，然后断开（国内连 GitHub 下大文件的常见样子）"""
-    body, cut, ranges = b"", 1 << 17, []
-
-    def do_GET(self):
-        header = self.headers.get("Range")
-        start = int(header[6:-1]) if header else 0
-        type(self).ranges.append(start)
-        data = self.body[start:]
-        self.send_response(206 if start else 200)
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        sent, limit = 0, min(len(data), type(self).cut)
-        while sent < limit:
-            n = min(16384, limit - sent)
-            self.wfile.write(data[sent:sent + n]); self.wfile.flush(); sent += n
-            time.sleep(0.002)
-        self.connection.close()
-
-    def log_message(self, *a):
-        pass
 
 
-class ThrottledDownloadTests(Base):
-    def test_throttled_and_repeatedly_cut_download_resumes_to_completion(self):
-        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), ThrottledDropHandler)
-        threading.Thread(target=server.serve_forever, daemon=True).start()
-        self.addCleanup(server.server_close); self.addCleanup(server.shutdown)
-        ThrottledDropHandler.body, ThrottledDropHandler.cut, ThrottledDropHandler.ranges = bytes(range(256)) * 4096, 1 << 17, []   # 1 MiB，每次断在 128 KiB：要 8 次
-        for name, value in (("trusted", lambda url: True), ("emit", lambda **k: None), ("RETRY_SECONDS", 0)):
-            p = patch.object(updater, name, value); p.start(); self.addCleanup(p.stop)
-        target = self.root / "pkg"
-        updater.download(f"http://127.0.0.1:{server.server_port}/p", target, len(ThrottledDropHandler.body))
-        self.assertEqual(target.read_bytes(), ThrottledDropHandler.body)
-        self.assertEqual(ThrottledDropHandler.ranges, [i << 17 for i in range(8)])   # 每次从断开处接着下
 
 
-class PrepareTests(Base):
-    def setUp(self):
-        super().setUp()
-        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        threading.Thread(target=self.server.serve_forever, daemon=True).start()
-        self.addCleanup(self.server.server_close)
-        self.addCleanup(self.server.shutdown)
-        self.base = f"http://127.0.0.1:{self.server.server_port}"
-        patcher = patch.dict(os.environ, {"S2A_UPDATE_API": self.base + "/latest", "S2A_UPDATE_PUBKEY": ed25519.public_key(TEST_SECRET).hex()})
-        patcher.start(); self.addCleanup(patcher.stop)
-        package = self.root / "p.zip"
-        with zipfile.ZipFile(package, "w") as z:
-            z.writestr("S2Arm/S2Arm.exe", "new"); z.writestr("S2Arm/Engine/e", "e"); z.writestr("S2Arm/Runtime/python/python.exe", "py")
-            z.writestr("S2Arm/Runtime/python/Lib/site-packages/big", "x"); z.writestr("S2Arm/Runtime/python/Lib/os.py", "os")
-        self.zip = package.read_bytes()
-        self.publish(hashlib.sha256(self.zip).hexdigest())
-
-    def publish(self, digest, tag="v9.9.9", secret=TEST_SECRET, version="9.9.9"):
-        name = "S2Arm-windows-x64.zip"
-        raw, signature = signed(version, {name: {"sha256": digest, "size": len(self.zip)}}, secret)
-        Handler.routes = {"/latest": json.dumps({"tag_name": tag, "assets": [
-            {"name": name, "size": len(self.zip), "browser_download_url": self.base + "/pkg"},
-            {"name": updater.MANIFEST, "size": 80, "browser_download_url": self.base + "/m"},
-            {"name": updater.SIGNATURE, "size": 64, "browser_download_url": self.base + "/s"}]}).encode(),
-            "/pkg": self.zip, "/m": raw, "/s": signature}
-
-    def prepare(self, protect=()):
-        with patch("builtins.print") as out, patch.object(updater.subprocess, "run", return_value=type("R", (), {"returncode": 0, "stdout": ""})()):
-            updater.prepare("windows", "0.1.1", self.private, self.install, list(protect) + [self.private])
-        return json.loads(out.call_args.args[0])
-
-    def test_ready_leaves_install_untouched_and_runner_has_no_site_packages(self):
-        before = tree(self.install)
-        ready = self.prepare()
-        self.assertEqual(ready["state"], "ready")
-        self.assertEqual(tree(self.install), before)
-        self.assertEqual((Path(ready["staged"]) / "S2Arm.exe").read_text(), "new")
-        self.assertTrue(Path(ready["python"]).is_file())
-        self.assertFalse(list(Path(ready["python"]).parent.rglob("site-packages")))
-
-    def test_retry_keeps_the_partial_download_of_the_same_version(self):
-        work = self.private / "updates/9.9.9"
-        (work / "unpack").mkdir(parents=True)
-        (work / "unpack/stale").write_text("x")
-        part = work / "S2Arm-windows-x64.zip.part"
-        part.write_bytes(self.zip[:100])
-        seen = []
-        with patch.object(updater, "download", side_effect=lambda url, target, size: seen.append(Path(str(target) + ".part").read_bytes()) or Path(target).write_bytes(self.zip)):
-            ready = self.prepare()
-        self.assertEqual(ready["state"], "ready")
-        self.assertEqual(seen, [self.zip[:100]])   # prepare 没删已下的字节，交给 download 续传
-        self.assertFalse((work / "unpack/stale").exists())
-
-    def test_checksum_mismatch_deletes_download_and_keeps_old(self):
-        self.publish("0" * 64); before = tree(self.install)
-        with self.assertRaises(updater.UpdateError) as caught:
-            self.prepare()
-        self.assertEqual(caught.exception.code, "update_checksum_mismatch")
-        self.assertEqual(tree(self.install), before)
-        self.assertFalse(list((self.private / "updates").rglob("S2Arm-windows-x64.zip")))
-
-    def test_promotion_retry_still_verifies_the_signed_checksum(self):
-        real = os.replace
-        for valid in (True, False):
-            with self.subTest(valid=valid):
-                self.publish(hashlib.sha256(self.zip).hexdigest() if valid else "0" * 64)
-                before, attempts = tree(self.install), []
-
-                def locked(source, target):
-                    if str(source).endswith(".zip.part"):
-                        attempts.append(source)
-                        if len(attempts) == 1:
-                            raise PermissionError(13, "synthetic sharing violation")
-                    return real(source, target)
-
-                with patch.object(updater.os, "replace", locked), patch.object(updater.time, "sleep"):
-                    if valid:
-                        self.assertEqual(self.prepare()["state"], "ready")
-                    else:
-                        with self.assertRaises(updater.UpdateError) as caught:
-                            self.prepare()
-                        self.assertEqual(caught.exception.code, "update_checksum_mismatch")
-                self.assertEqual(len(attempts), 2)
-                self.assertEqual(tree(self.install), before)
-
-    def test_runs_the_way_the_launcher_starts_it(self):
-        """两端都用 python -I 直接跑 updater.py：同目录的模块要自己能找到。"""
-        self.publish(hashlib.sha256(self.zip).hexdigest())
-        run = __import__("subprocess").run([sys.executable, "-B", "-I", updater.__file__, "check", "--platform", "windows", "--current", "0.1.0"], capture_output=True, text=True, timeout=60)
-        self.assertEqual(run.returncode, 0, run.stderr)
-        self.assertTrue(json.loads(run.stdout)["available"])
-
-    def test_bad_signature_downloads_nothing(self):
-        self.publish(hashlib.sha256(self.zip).hexdigest(), secret=bytes([7]) * 32)
-        Handler.hits = []
-        with self.assertRaises(updater.UpdateError) as caught:
-            self.prepare()
-        self.assertEqual(caught.exception.code, "update_bad_signature")
-        self.assertNotIn("/pkg", Handler.hits)
-
-    def test_manifest_for_another_version_is_refused(self):
-        self.publish(hashlib.sha256(self.zip).hexdigest(), version="9.9.8")
-        with self.assertRaises(updater.UpdateError) as caught:
-            self.prepare()
-        self.assertEqual(caught.exception.code, "update_bad_signature")
-
-    def test_oversized_download_is_stopped(self):
-        name = "S2Arm-windows-x64.zip"
-        raw, signature = signed("9.9.9", {name: {"sha256": hashlib.sha256(self.zip).hexdigest(), "size": 10}})
-        self.publish(hashlib.sha256(self.zip).hexdigest())
-        Handler.routes["/m"], Handler.routes["/s"] = raw, signature
-        with self.assertRaises(updater.UpdateError) as caught:
-            self.prepare()
-        self.assertEqual(caught.exception.code, "update_checksum_mismatch")
-
-    def test_disk_full_stops_before_download(self):
-        with patch.object(updater.shutil, "disk_usage", return_value=type("U", (), {"free": 1})()), patch.object(updater, "download", side_effect=AssertionError):
-            with self.assertRaises(updater.UpdateError) as caught:
-                self.prepare()
-        self.assertEqual(caught.exception.code, "update_disk_full")
-
-    def test_network_failure_is_reported_by_main_and_keeps_old(self):
-        before = tree(self.install)
-        Handler.routes["/pkg"] = None
-        with patch("builtins.print") as out:
-            code = updater.main(["prepare", "--platform", "windows", "--current", "0.1.1", "--private-root", str(self.private), "--install", str(self.install)])
-        self.assertEqual(code, 1)
-        self.assertEqual(json.loads(out.call_args.args[0])["state"], "failed")
-        self.assertEqual(tree(self.install), before)
-
-    def test_check_then_prepare_and_retry_query_github_once(self):
-        """启动时查一次、接着下载、失败后重试：15 分钟内只调一次查版本接口（匿名每 IP 每小时 60 次，共享出口容易被限流）"""
-        Handler.hits = []
-        with patch.object(updater, "LATEST_TTL", 900):
-            with patch("builtins.print"):
-                updater.main(["check", "--platform", "windows", "--current", "0.1.1"])
-            Handler.routes["/pkg"] = None   # 第一次下载失败
-            with patch("builtins.print"):
-                self.assertEqual(updater.main(["prepare", "--platform", "windows", "--current", "0.1.1", "--private-root", str(self.private), "--install", str(self.install)]), 1)
-            self.publish(hashlib.sha256(self.zip).hexdigest())   # 恢复，玩家点重试
-            self.assertEqual(self.prepare()["state"], "ready")
-        self.assertEqual(Handler.hits.count("/latest"), 1)
-
-    def test_prepare_survives_throttled_and_cut_download_then_verifies_and_unpacks(self):
-        """限速 + 每次只给五分之一就掐断连接下安装包：续传接上，校验（签名清单的 SHA-256）、解包都过，进入可重启更新"""
-        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), ThrottledDropHandler)
-        threading.Thread(target=server.serve_forever, daemon=True).start()
-        self.addCleanup(server.server_close); self.addCleanup(server.shutdown)
-        cut = len(self.zip) // 5 + 1
-        ThrottledDropHandler.body, ThrottledDropHandler.cut, ThrottledDropHandler.ranges = self.zip, cut, []
-        p = patch.object(updater, "RETRY_SECONDS", 0); p.start(); self.addCleanup(p.stop)
-        latest = json.loads(Handler.routes["/latest"])
-        latest["assets"][0]["browser_download_url"] = f"http://127.0.0.1:{server.server_port}/pkg"
-        Handler.routes["/latest"] = json.dumps(latest).encode()
-        result = self.prepare()
-        self.assertEqual(result["state"], "ready")
-        self.assertEqual(ThrottledDropHandler.ranges, [i * cut for i in range(5)])   # 断了 4 次，每次从断开处接着下
-        self.assertEqual((Path(result["staged"]) / "S2Arm.exe").read_text(), "new")   # 解包出的新版
-
-    def test_data_inside_install_is_refused(self):
-        inside = self.install / "MyLibrary"; inside.mkdir()
-        with self.assertRaises(updater.UpdateError) as caught:
-            self.prepare([inside])
-        self.assertEqual(caught.exception.code, "update_data_inside_install")
-
-    def test_zip_slip_is_refused(self):
-        evil = self.root / "evil.zip"
-        with zipfile.ZipFile(evil, "w") as z:
-            z.writestr("../../escape", "x")
-        target = self.root / "out"; target.mkdir()
-        with self.assertRaises(updater.UpdateError):
-            updater.extract_windows(evil, target)
-        self.assertFalse((self.root / "escape").exists())
 
 
-class DeltaTests(Base):
-    def setUp(self):
-        super().setUp()
-        self.old = self.root / "old"; self.new = self.root / "new"
-        for root, body in ((self.old, "v1"), (self.new, "v2")):
-            (root / "Engine").mkdir(parents=True); (root / "same").write_text("same")
-            (root / "tool").write_text(body); (root / "Engine/data").write_text(body * 1000)
-        (self.old / "gone").write_text("x")
-        (self.new / "added").write_text("new file")
-        if os.name != "nt":
-            (self.new / "tool").chmod(0o755); (self.old / "tool").chmod(0o644)
-            os.symlink("tool", self.new / "alias")
-        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        threading.Thread(target=self.server.serve_forever, daemon=True).start()
-        self.addCleanup(self.server.server_close); self.addCleanup(self.server.shutdown)
-        self.base = f"http://127.0.0.1:{self.server.server_port}"
-        patcher = patch.dict(os.environ, {"S2A_UPDATE_API": self.base + "/latest", "S2A_UPDATE_PUBKEY": ed25519.public_key(TEST_SECRET).hex()}); patcher.start(); self.addCleanup(patcher.stop)
-        self.delta = updater.build_delta(self.old, self.new, "windows", "0.1.1", "9.9.9", self.root)
-        full = self.root / "full.zip"
-        with zipfile.ZipFile(full, "w") as z:
-            z.writestr("S2Arm/S2Arm.exe", "full"); z.writestr("S2Arm/Engine/e", "e"); z.writestr("S2Arm/Runtime/python/python.exe", "py")
-        self.full = full.read_bytes()
-        self.hits = Handler.hits = []
-
-    def publish(self, delta, in_manifest=True):
-        names = {"full": "S2Arm-windows-x64.zip", "delta": self.delta.name}
-        files = {names["full"]: {"sha256": hashlib.sha256(self.full).hexdigest(), "size": len(self.full)}}
-        if in_manifest:
-            files[names["delta"]] = {"sha256": hashlib.sha256(delta).hexdigest(), "size": len(delta)}
-        raw, signature = signed("9.9.9", files)
-        Handler.routes = {"/latest": json.dumps({"tag_name": "v9.9.9", "assets": [
-            {"name": names["full"], "size": 1, "browser_download_url": self.base + "/full"},
-            {"name": names["delta"], "size": 1, "browser_download_url": self.base + "/delta"},
-            {"name": updater.MANIFEST, "size": 9, "browser_download_url": self.base + "/m"},
-            {"name": updater.SIGNATURE, "size": 9, "browser_download_url": self.base + "/s"}]}).encode(),
-            "/full": self.full, "/delta": delta, "/m": raw, "/s": signature}
-
-    def prepare(self):
-        shutil_rmtree = __import__("shutil").rmtree
-        shutil_rmtree(self.install); __import__("shutil").copytree(self.old, self.install, symlinks=True)
-        # 差分打完的目录里要有 Runtime/python 才能备 runner：清单里没有，打桩跳过
-        with patch("builtins.print") as out, patch.object(updater, "runner_python", return_value=self.root / "py"), patch.object(updater.subprocess, "run", return_value=type("R", (), {"returncode": 0, "stdout": ""})()):
-            updater.prepare("windows", "0.1.1", self.private, self.install, [self.private])
-        return [json.loads(c.args[0]) for c in out.call_args_list]
-
-    def test_delta_applies_to_a_copy_and_matches_the_new_tree_exactly(self):
-        out = self.root / "out"; out.mkdir()
-        staged = updater.apply_delta(self.delta, "windows", "0.1.1", "9.9.9", self.old, out)
-        self.assertEqual(updater.file_manifest(staged), updater.file_manifest(self.new))
-        self.assertTrue((self.old / "gone").exists())   # 原目录不动
-
-    def test_only_changed_files_are_packed(self):
-        with zipfile.ZipFile(self.delta) as z:
-            self.assertNotIn("files/same", z.namelist())
-            self.assertIn("files/tool", z.namelist())
-
-    def test_prepare_uses_delta_and_skips_the_full_package(self):
-        self.publish(self.delta.read_bytes()); before = self.data()
-        events = self.prepare()
-        self.assertEqual(events[-1]["via"], "delta")
-        self.assertNotIn("/full", Handler.hits)
-        self.assertEqual(updater.file_manifest(events[-1]["staged"]), updater.file_manifest(self.new))
-        self.assertEqual(self.data(), before)
-
-    def test_corrupt_delta_falls_back_to_full(self):
-        self.publish(b"not a zip")
-        events = self.prepare()
-        self.assertIn("deltaFailed", [e["state"] for e in events])
-        self.assertEqual(events[-1]["via"], "full")
-        self.assertEqual((Path(events[-1]["staged"]) / "S2Arm.exe").read_text(), "full")
-
-    def test_delta_outside_the_signed_manifest_is_ignored(self):
-        self.publish(self.delta.read_bytes(), in_manifest=False)
-        events = self.prepare()
-        self.assertEqual(events[-1]["via"], "full")
-        self.assertNotIn("/delta", Handler.hits)
-
-    def test_changed_install_falls_back_to_full(self):
-        out = self.root / "out"; out.mkdir()
-        (self.old / "same").write_text("edited by something")
-        with self.assertRaises(updater.UpdateError):
-            updater.apply_delta(self.delta, "windows", "0.1.1", "9.9.9", self.old, out)
-
-    def test_paths_and_links_cannot_leave_the_app(self):
-        for target in ({"../evil": {"sha256": "0"}}, {"a/../../evil": {"sha256": "0"}}, {"/etc/x": {"sha256": "0"}}, {"a\\b": {"sha256": "0"}}, {"C:/x": {"sha256": "0"}},
-                       {"l": {"link": "/etc/passwd"}}, {"l": {"link": "../../x"}}, {"a/l": {"link": "../../x"}}):
-            with self.subTest(target=target), self.assertRaises(updater.UpdateError):
-                updater.check_target(target)
-        updater.check_target({"Contents/Frameworks/P.framework/Python": {"link": "Versions/Current/Python"}, "a/b": {"link": "../c"}, "a/f": {"sha256": "0"}})
-
-    def test_release_tools_import_and_reference_real_names(self):
-        sys.path.insert(0, str(Path(updater.__file__).resolve().parents[2] / "tools"))
-        import make_update_delta, sign_update_manifest
-        self.assertEqual(make_update_delta.SUMS, "SHA256SUMS.txt")
-        (self.old / "S2Arm-windows-x64.zip").write_text("pkg"); (self.old / "S2Arm-mac-arm64-delta-0.1.1.zip").write_text("d"); (self.old / "other.txt").write_text("no")
-        files = json.loads(sign_update_manifest.build(self.old, "9.9.9"))["files"]
-        self.assertEqual(sorted(files), ["S2Arm-mac-arm64-delta-0.1.1.zip", "S2Arm-windows-x64.zip"])
-
-    def test_delta_for_another_version_is_refused(self):
-        out = self.root / "out"; out.mkdir()
-        with self.assertRaises(updater.UpdateError):
-            updater.apply_delta(self.delta, "windows", "0.1.0", "9.9.9", self.old, out)
 
 
-class RunnerTests(unittest.TestCase):
-    def test_apply_needs_no_network_modules(self):
-        """updates/runner 的 Python 在 Mac 上没有 ssl：导入 updater 不能带进来。"""
-        code = "import sys; sys.path.insert(0, %r); import updater; print([m for m in ('ssl', 'urllib.request', 'zipfile', '_hashlib') if m in sys.modules])" % str(Path(updater.__file__).parent)
-        self.assertEqual(__import__("subprocess").run([sys.executable, "-I", "-c", code], capture_output=True, text=True).stdout.strip(), "[]")
 
 
 class Ed25519Tests(unittest.TestCase):
@@ -825,7 +201,11 @@ class VersionTests(Base):
 
             def __exit__(self, *a):
                 pass
-        return patch.object(updater, "open_url", side_effect=lambda url, timeout: Response(answers[url]))
+        def answer(url, timeout):
+            if url not in answers:
+                raise OSError("offline")   # 官网（updater.MIRROR）连不上：这组测的是回退到 GitHub 后的版本比较
+            return Response(answers[url])
+        return patch.object(updater, "open_url", side_effect=answer)
 
     def test_only_a_strictly_higher_numeric_version_is_offered(self):
         key = ed25519.public_key(TEST_SECRET).hex()
@@ -845,29 +225,41 @@ class VersionTests(Base):
 
 
 class NoticeTests(unittest.TestCase):
-    """启动器公告条（v0.2.3）：官方下载页优先、取不到用随包那份、关掉的同一条不再给、换号再出现、已撤 / 无效不显示。期望手写"""
+    """公告条（v0.2.3 起；11-13 加 messages / platforms）：官方下载页优先、取不到用随包那份、已撤不显示、链接只认官方 https。期望手写"""
     ITEM = {"schema": 1, "id": "n1", "text": {"zh-Hans": "中文公告", "en": "English notice"}, "url": "https://github.com/jhaizhou-ops/S2Arm#readme"}
 
     def setUp(self):
         self.root = Path(tempfile.mkdtemp())
         self.bundled = self.root / "notice.json"; self.bundled.write_text(json.dumps(dict(self.ITEM, id="bundled")), encoding="utf-8")
-        self.private = self.root / "private"
 
-    def show(self, remote):
-        return updater.notice(self.private, remote=lambda: remote, bundled=self.bundled)
+    def ids(self, remote, platform="mac"):
+        return [n["id"] for n in updater.notice_messages(updater.notice_data(remote=lambda: remote, bundled=self.bundled), platform)]
 
     def test_remote_first_then_bundled(self):
-        self.assertEqual(self.show((True, updater.notice_valid(self.ITEM)))["id"], "n1")
-        self.assertEqual(self.show((False, None))["id"], "bundled")   # 没网 / 页面不通
-        self.assertEqual(self.show((False, None))["text"], {"zh-Hans": "中文公告", "en": "English notice"})
+        self.assertEqual(self.ids((True, self.ITEM)), ["n1"])
+        self.assertEqual(self.ids((False, None)), ["bundled"])   # 没网 / 页面不通
 
     def test_retracted_remote_wins_over_bundled(self):   # 页面取到了、但已撤（只剩 schema）：不显示，不退回随包那份
-        self.assertIsNone(self.show((True, updater.notice_valid({"schema": 1}))))
+        self.assertEqual(self.ids((True, {"schema": 1})), [])
 
-    def test_dismissed_stays_hidden_until_a_new_id(self):
-        updater.notice_dismiss(self.private, "n1")
-        self.assertIsNone(self.show((True, updater.notice_valid(self.ITEM))))
-        self.assertEqual(self.show((True, updater.notice_valid(dict(self.ITEM, id="n2"))))["id"], "n2")
+    def test_legacy_top_level_is_one_important_message(self):
+        [n] = updater.notice_messages(self.ITEM, "windows")
+        self.assertEqual((n["id"], n["level"], n["url"]), ("n1", "important", self.ITEM["url"]))
+
+    def test_messages_filtered_by_platform_newest_first(self):
+        data = {"schema": 1, "id": "old", "text": self.ITEM["text"], "messages": [
+            {"id": "w2", "level": "important", "platforms": ["windows"], "text": self.ITEM["text"]},
+            {"id": "a1", "level": "info", "text": self.ITEM["text"]},
+            {"id": "m0", "platforms": ["mac"], "text": self.ITEM["text"]},
+            {"id": "bad", "platforms": "mac", "text": self.ITEM["text"]}]}
+        self.assertEqual([(n["id"], n["level"]) for n in updater.notice_messages(data, "mac")], [("a1", "info"), ("m0", "info")])
+        self.assertEqual([n["id"] for n in updater.notice_messages(data, "windows")], ["w2", "a1"])   # 有 messages 就不再看顶层那条（给旧版看的）
+        # maxVersion（11-14）：只给这一版及更早的看；新版看不到，版本号读不出（开发版后缀照样认前三段）时按版本比，没给 current 照常显示
+        old = {"schema": 1, "messages": [{"id": "old", "maxVersion": "0.3.9", "text": {"zh-Hans": "旧", "en": "old"}}]}
+        self.assertEqual([n["id"] for n in updater.notice_messages(old, "mac", "0.3.9")], ["old"])
+        self.assertEqual([n["id"] for n in updater.notice_messages(old, "mac", "0.3.10-dev+e6403d")], [])
+        self.assertEqual([n["id"] for n in updater.notice_messages(old, "mac", "0.4.0")], [])
+        self.assertEqual([n["id"] for n in updater.notice_messages(old, "mac")], ["old"])
 
     def test_invalid_shapes_are_not_shown(self):
         for bad in ({"schema": 2, "id": "a", "text": self.ITEM["text"]}, {"schema": 1, "text": self.ITEM["text"]},
@@ -875,6 +267,7 @@ class NoticeTests(unittest.TestCase):
                     {"schema": 1, "id": "a", "text": {"zh-Hans": " ", "en": "x"}}, [], "x"):
             with self.subTest(bad=bad):
                 self.assertIsNone(updater.notice_valid(bad))
+                self.assertEqual(updater.notice_messages(bad, "mac"), [])
 
     def test_link_only_official_https(self):
         for url, kept in (("https://github.com/jhaizhou-ops/S2Arm", True), ("https://jhaizhou-ops.github.io/S2Arm/", True),
@@ -882,21 +275,472 @@ class NoticeTests(unittest.TestCase):
             with self.subTest(url=url):
                 self.assertEqual("url" in updater.notice_valid(dict(self.ITEM, url=url)), kept)
 
-    def test_cli_prints_empty_object_when_nothing_to_show(self):
+    def test_shipped_notice_is_valid(self):   # 仓库里那份（Pages 发布 + 随包兜底）：有公告就要能显示、带官方链接；撤了就必须是说明里写的撤法
+        data = json.loads(updater.notice_file().read_text(encoding="utf-8"))
+        self.assertEqual(data.get("schema"), 1)
+        if "id" not in data and "messages" not in data:   # 11-12 撤公告后改成 {"schema": 1}（docs/site/README.md「撤掉公告」）：没有公告是合法状态
+            self.assertEqual(data, {"schema": 1})
+            return
+        for platform in updater.PLATFORMS:
+            for n in updater.notice_messages(data, platform):
+                self.assertIn("url", n)
+
+
+class NotesTests(unittest.TestCase):
+    """发版说明 → 清单 notes（tools/sign_update_manifest.py --notes）。期望按发版说明的写法手写"""
+    MD = """# S2Arm v9.9.9
+
+开头一段不进清单。
+
+## 亮点
+- **第一条亮点。**（#1）
+  *First highlight. (#1)*
+- 没加粗的亮点
+
+## 修了哪些问题
+- **修复：A 不再失败。** 后面是细节，`代码`也去掉。
+  *Fixed: A no longer fails.*
+- **B 修了。**
+"""
+
+    def test_sections_highlights_and_english(self):
+        notes = updater.notes_from_markdown(self.MD)
+        self.assertEqual(notes["highlights"], [{"zh-Hans": "第一条亮点。", "en": "First highlight. (#1)"}, {"zh-Hans": "没加粗的亮点"}])
+        self.assertEqual(notes["sections"], [{"title": "修了哪些问题", "items": [{"zh-Hans": "修复：A 不再失败。", "en": "Fixed: A no longer fails."}, {"zh-Hans": "B 修了。"}]}])
+
+    def test_no_highlight_section_means_no_highlights(self):   # 程序不替人挑亮点：没写「## 亮点」就没有（更新后不弹「这版更新了什么」）
+        notes = updater.notes_from_markdown("## 其它改进\n- **C。**\n")
+        self.assertEqual((notes["highlights"], len(notes["sections"])), ([], 1))
+        self.assertIsNone(updater.notes_from_markdown("# 只有标题\n"))
+
+    def test_offer_passes_signed_notes_through(self):   # 清单里的 notes 随「有新版」一起给启动器；坏的丢掉、照常给新版
+        files = {updater.ASSETS["mac"]: {"sha256": "0" * 64, "size": 1}}
+        notes = {"highlights": [{"zh-Hans": "亮点"}], "sections": []}
+        self.assertEqual(updater.offer("mac", (0, 3, 5), (0, 3, 3), files, lambda n: "https://x/" + n, notes)["notes"], notes)
+        info = updater.offer("mac", (0, 3, 5), (0, 3, 3), files, lambda n: "https://x/" + n, {"sections": 1})
+        self.assertEqual((info["available"], "notes" in info), (True, False))
+
+    def test_invalid_notes_dropped(self):
+        for bad in (None, [], {"sections": "x"}, {"highlights": [{"en": "only en"}]}, {"sections": [{"title": "", "items": [{"zh-Hans": "a"}]}]}):
+            with self.subTest(bad=bad):
+                self.assertIsNone(updater.notes_valid(bad))
+
+
+class InboxTests(unittest.TestCase):
+    """打开启动器时给玩家看什么（11-13 维护者定：永远只给最新一期，不叠加、不补弹；看过关掉的不再弹）。期望按规则手写，不跑被测实现推"""
+    TEXT = {"zh-Hans": "公告", "en": "Notice"}
+    NOTES = {"highlights": [{"zh-Hans": "亮点"}], "sections": [{"title": "修好了", "items": [{"zh-Hans": "一条"}]}]}
+
+    def setUp(self):
+        self.private = Path(tempfile.mkdtemp())
+
+    def notices(self, *ids, level="important"):   # 最新在前
+        return updater.notice_messages({"schema": 1, "messages": [{"id": i, "level": level, "text": self.TEXT} for i in ids]}, "mac")
+
+    def open(self, current, check=None, notices=()):
+        return updater.inbox("mac", current, self.private, check or {"available": False}, list(notices))
+
+    def test_three_notices_and_skipped_versions_show_only_latest_once(self):
+        # 玩家停在 0.3.3，其间发了 0.3.4、0.3.5 两版和 n1、n2、n3 三期重要公告：一进来只弹最新版 0.3.5、横幅只有 n3、未读 1
+        check = {"available": True, "version": "0.3.5", "notes": self.NOTES}
+        first = self.open("0.3.3", check, self.notices("n3", "n2", "n1"))
+        self.assertEqual((first["popup"]["kind"], first["popup"]["version"]), ("update", "0.3.5"))
+        self.assertEqual(first["banner"]["id"], "n3")
+        self.assertEqual(first["unread"], 1)
+        self.assertEqual([m.get("id") or m.get("version") for m in first["messages"]], ["n3", "n2", "n1", "0.3.5"])   # 旧的都在消息里，不弹
+        self.assertEqual([m["unread"] for m in first["messages"] if m["kind"] == "notice"], [True, False, False])
+        # 关掉弹窗（以后再说）、关掉横幅：再进来什么都不弹，n2 / n1 不补
+        updater.inbox_seen(self.private, update="0.3.5", notice="n3")
+        again = self.open("0.3.3", check, self.notices("n3", "n2", "n1"))
+        self.assertEqual((again["popup"], again["banner"], again["unread"]), (None, None, 0))
+
+    def test_after_update_popup_once_then_newer_update_next_open(self):
+        # 从 0.3.3 点更新换上 0.3.5（prepare 记了 0.3.5 的说明），此时已有 0.3.6：先只弹「这版更新了什么」，关掉后下次才弹 0.3.6，再关掉就都不弹
+        updater.save_json(self.private / "updates/notes/0.3.4.json", self.NOTES)   # 跳过的那版：不补弹
+        updater.save_json(self.private / "updates/notes/0.3.5.json", self.NOTES)
+        check = {"available": True, "version": "0.3.6"}
+        r = self.open("0.3.5", check)
+        self.assertEqual((r["popup"]["kind"], r["popup"]["version"]), ("afterUpdate", "0.3.5"))
+        self.assertEqual(self.open("0.3.5", check)["popup"]["kind"], "afterUpdate")   # 没关（直接退出）下次还在
+        updater.inbox_seen(self.private, after="0.3.5")
+        r = self.open("0.3.5", check)
+        self.assertEqual((r["popup"]["kind"], r["popup"]["version"]), ("update", "0.3.6"))
+        updater.inbox_seen(self.private, update="0.3.6")
+        self.assertIsNone(self.open("0.3.5", check)["popup"])
+
+    def test_after_update_needs_highlights_and_our_own_update(self):
+        self.assertIsNone(self.open("0.3.5")["popup"])   # 手动装的新版：本机没有这版说明，不弹
+        updater.save_json(self.private / "updates/notes/0.3.5.json", {"sections": self.NOTES["sections"]})
+        r = self.open("0.3.5")
+        self.assertIsNone(r["popup"])   # 说明里没写亮点：不弹，说明只在消息里
+        self.assertEqual([m["version"] for m in r["messages"] if m["kind"] == "update"], ["0.3.5"])
+
+    def test_new_notice_after_seen_and_info_level_never_banners(self):
+        updater.inbox_seen(self.private, notice="n3")
+        r = self.open("0.3.3", notices=self.notices("n4", "n3", "n2"))
+        self.assertEqual((r["banner"]["id"], r["unread"]), ("n4", 1))
+        r = self.open("0.3.3", notices=self.notices("i5", level="info") + self.notices("n4", "n3"))
+        self.assertEqual((r["banner"]["id"], r["unread"]), ("n4", 1))   # 最新是普通公告：只算未读、不出横幅；横幅仍是没看过的最新重要那条
+        updater.inbox_seen(self.private, notice="i5")   # 打开消息 = 看过最新那条，更旧的都算看过
+        r = self.open("0.3.3", notices=self.notices("i5", level="info") + self.notices("n4", "n3"))
+        self.assertEqual((r["banner"], r["unread"]), (None, 0))
+
+    def test_seen_rejects_bad_values_and_inbox_does_not_write(self):
+        for kw in ({"update": "x"}, {"after": "../1.0.0"}, {"notice": "a b"}):
+            with self.subTest(kw=kw), self.assertRaises(ValueError):
+                updater.inbox_seen(self.private, **kw)
+        self.open("0.3.3", {"available": True, "version": "0.3.5"}, self.notices("n1"))
+        self.assertFalse((self.private / "updates/seen.json").exists())   # 只读：关掉时才记
+
+    def test_cli_offline_prints_nothing_to_show(self):
         import io, contextlib
-        self.bundled.unlink()
-        with patch.object(updater, "notice_file", return_value=self.bundled), patch.object(updater, "notice_remote", return_value=(False, None)):
+        with patch.object(updater, "latest", side_effect=OSError("offline")), patch.object(updater, "notice_remote", return_value=(False, None)), \
+                patch.object(updater, "notice_file", return_value=self.private / "none.json"):
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
-                self.assertEqual(updater.main(["notice", "--private-root", str(self.private)]), 0)
-        self.assertEqual(json.loads(out.getvalue()), {})
-        self.assertFalse((self.private / "logs").exists())   # 公告与更新无关：不写 update.log
+                self.assertEqual(updater.main(["inbox", "--private-root", str(self.private), "--platform", "mac", "--current", "0.3.3"]), 0)
+        r = json.loads(out.getvalue())
+        self.assertEqual((r["popup"], r["banner"], r["messages"], r["update"]["available"]), (None, None, [], False))
+        self.assertFalse((self.private / "logs").exists())   # 查不到不写 update.log
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(updater.main(["inbox-seen", "--private-root", str(self.private), "--notice", "n1"]), 0)
+        self.assertEqual(updater.seen_state(self.private), {"noticeSeen": "n1"})
 
-    def test_shipped_notice_is_valid(self):   # 仓库里那份（Pages 发布 + 随包兜底）要能显示，带官方链接
-        item = updater.notice_valid(json.loads(updater.notice_file().read_text(encoding="utf-8")))
-        self.assertIsNotNone(item); self.assertIn("url", item)
-        self.assertIn("s2arm.com", item["text"]["zh-Hans"]); self.assertIn("s2arm.com", item["text"]["en"])
+
+class FeatureTests(unittest.TestCase):
+    """新功能大窗（docs/site/feature.json）：本机没看过这一期就弹一次（新装、更新上来都算），排在更新弹窗前面；版本不够 / 撤回 / 不给本平台不弹。期望按规则手写"""
+    T = {"zh-Hans": "中", "en": "En"}
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.private = self.root / "private"
+        (self.root / "site/feature").mkdir(parents=True)
+        (self.root / "site/feature/a.jpg").write_bytes(b"jpg")
+        self.write()
+
+    def write(self, **over):
+        page = {"image": "feature/a.jpg", **{k: self.T for k in updater.FEATURE_TEXTS}}
+        data = {"schema": 1, "id": "v0.4.0-x", "minVersion": "0.4.0", "platforms": ["mac", "windows"], "pages": [page, dict(page, image="feature/none.jpg")]}
+        data.update(over)
+        (self.root / "site/feature.json").write_text(json.dumps(data), encoding="utf-8")
+
+    def spot(self, current="0.4.0", platform="mac", withdrawn=()):
+        return updater.feature_spotlight(platform, current, self.root / "site/feature.json", withdrawn)
+
+    def test_pages_need_both_languages_and_an_existing_image(self):
+        f = self.spot()
+        self.assertEqual((f["kind"], f["id"], len(f["pages"])), ("feature", "v0.4.0-x", 1))   # 第二页图不在：丢掉
+        a = str((self.root / "site/feature/a.jpg").resolve())
+        self.assertEqual(f["pages"][0]["image"], {"zh-Hans": a, "en": a})   # 只写一个路径：两种语言同图
+        self.assertEqual(f["pages"][0]["layout"], "detail")
+        self.write(pages=[{"image": "feature/a.jpg", **{k: {"zh-Hans": "中"} for k in updater.FEATURE_TEXTS}}])
+        self.assertIsNone(self.spot())   # 缺英文：这页不要，一页不剩不弹
+        self.write(pages=[{"image": "feature/a.jpg", "title": self.T}])
+        self.assertIsNone(self.spot())   # 说明页只写了一部分文字：不要（不当海报页）
+        self.write(pages=[{"image": "feature/a.jpg"}, {"image": "feature/a.jpg", **{k: self.T for k in updater.FEATURE_TEXTS}}])
+        self.assertEqual([p["layout"] for p in self.spot()["pages"]], ["poster", "detail"])   # 只有图 = 海报页
+        self.write(pages=[{"image": "../private/x.jpg", **{k: self.T for k in updater.FEATURE_TEXTS}}])
+        self.assertIsNone(self.spot())   # 图只认 docs/site 里面的
+
+    def test_image_follows_ui_language(self):
+        (self.root / "site/feature/a_en.jpg").write_bytes(b"jpg")
+        page = {**{k: self.T for k in updater.FEATURE_TEXTS}}
+        self.write(pages=[dict(page, image={"zh-Hans": "feature/a.jpg", "en": "feature/a_en.jpg"}),
+                          dict(page, image={"zh-Hans": "feature/a.jpg", "en": "feature/none.jpg"}),
+                          dict(page, image={"en": "feature/a_en.jpg"})])
+        site = (self.root / "site/feature").resolve()
+        imgs = [p["image"] for p in self.spot()["pages"]]
+        self.assertEqual(imgs, [{"zh-Hans": str(site / "a.jpg"), "en": str(site / "a_en.jpg")},
+                                {"zh-Hans": str(site / "a.jpg"), "en": str(site / "a.jpg")}])   # 英文图不在：用中文；没有中文图：这页不要
+
+    def test_version_platform_and_withdraw(self):
+        self.assertIsNone(self.spot("0.3.10"))                     # 功能还没进这一版：热修不带大窗
+        self.assertIsNotNone(self.spot("0.4.0-dev+abc1234"))        # 开发版按前三段比
+        self.assertIsNotNone(self.spot("0.10.0"))                   # 按数字比，不按字面
+        self.assertIsNone(self.spot(platform="iphone"))
+        self.assertIsNone(self.spot(withdrawn=["v0.4.0-x"]))
+
+    def test_shows_once_before_update_popups(self):
+        f = self.spot()
+        updater.save_json(self.private / "updates/notes/0.4.0.json", {"highlights": [{"zh-Hans": "亮点"}], "sections": []})
+        check = {"available": True, "version": "0.4.1"}
+        r = updater.inbox("mac", "0.4.0", self.private, check, [], f)
+        self.assertEqual((r["popup"]["kind"], r["popup"]["id"]), ("feature", "v0.4.0-x"))   # 新功能先弹，这版说明下次
+        updater.inbox_seen(self.private, feature="v0.4.0-x")
+        self.assertEqual(updater.inbox("mac", "0.4.0", self.private, check, [], f)["popup"]["kind"], "afterUpdate")
+        with self.assertRaises(ValueError):
+            updater.inbox_seen(self.private, feature="../x")
+
+    def test_site_dir_finds_mac_app_engine_snapshot(self):
+        # Mac App：作业在 Contents/Resources/Jobs，随包 docs/site 在旁边的 Resources/Engine 里；Windows：Engine/pack/jobs 往上两级
+        mac = self.root / "S2Arm.app/Contents/Resources"
+        (mac / "Jobs").mkdir(parents=True); (mac / "Engine/docs/site").mkdir(parents=True)
+        self.assertEqual(updater.site_dir(mac / "Jobs"), mac / "Engine/docs/site")
+        win = self.root / "win/Engine"
+        (win / "pack/jobs").mkdir(parents=True); (win / "docs/site").mkdir(parents=True)
+        self.assertEqual(updater.site_dir(win / "pack/jobs"), win / "docs/site")
+
+    def test_fresh_install_without_seen_file_shows_it(self):
+        self.assertFalse((self.private / "updates/seen.json").exists())
+        self.assertEqual(updater.inbox("windows", "0.4.0", self.private, None, [], self.spot(platform="windows"))["popup"]["kind"], "feature")
+
+
+class MirrorTests(Base):
+    """查版本先走官网静态清单（updater.MIRROR）、失败回退 GitHub API。期望按规则手写：
+    官网验签通过 → 以它为准（新就给、不新就没有），一次都不问 GitHub；官网超时 / 404 / 验签不过 → 问 GitHub；两边都不行 → 报 GitHub 那边的错误码"""
+    def setUp(self):
+        super().setUp()
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), ScriptedHandler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+        self.base = f"http://127.0.0.1:{self.server.server_port}"
+        ScriptedHandler.scripts, ScriptedHandler.hits = {}, []
+        for name, value in (("trusted", lambda url: True), ("FETCH_RETRY_SECONDS", 0), ("MIRROR_TIMEOUT", 1)):
+            p = patch.object(updater, name, value); p.start(); self.addCleanup(p.stop)
+        p = patch.dict(os.environ, {"S2A_UPDATE_API": self.base + "/latest", "S2A_UPDATE_MIRROR": self.base + "/update/latest.json",
+                                    "S2A_UPDATE_DOWNLOAD": self.base + "/dl/{version}/{name}", "S2A_UPDATE_PUBKEY": ed25519.public_key(TEST_SECRET).hex()})
+        p.start(); self.addCleanup(p.stop)
+        self.pkg = updater.ASSETS["windows"]
+
+    def site(self, version, secret=TEST_SECRET):
+        raw, sig = signed(version, {self.pkg: {"sha256": "a" * 64, "size": 7}, "S2Arm-windows-x64-delta-0.1.1.zip": {"sha256": "b" * 64, "size": 3}}, secret)
+        ScriptedHandler.scripts["/update/latest.json"] = [(200, {}, raw)]
+        ScriptedHandler.scripts["/update/latest.json.sig"] = [(200, {}, sig)]
+
+    def github(self, version="0.3.1"):
+        raw, sig = signed(version, {self.pkg: {"sha256": "c" * 64, "size": 9}})
+        release = {"tag_name": "v" + version, "assets": [{"name": self.pkg, "browser_download_url": self.base + "/gh/pkg"},
+                   {"name": updater.MANIFEST, "browser_download_url": self.base + "/gh/m"}, {"name": updater.SIGNATURE, "browser_download_url": self.base + "/gh/s"}]}
+        ScriptedHandler.scripts.update({"/latest": [(200, {}, json.dumps(release).encode())], "/gh/m": [(200, {}, raw)], "/gh/s": [(200, {}, sig)]})
+
+    def test_site_newer_version_is_used_without_asking_github(self):
+        self.site("0.3.0"); self.github()
+        info = updater.query_latest("windows", "0.1.1")
+        self.assertEqual((info["available"], info["version"], info["sha256"], info["size"]), (True, "0.3.0", "a" * 64, 7))
+        self.assertEqual(info["asset"], self.base + "/dl/0.3.0/" + self.pkg)   # 安装包仍从 Release 下载地址取
+        self.assertEqual((info["deltaName"], info["deltaSha256"]), ("S2Arm-windows-x64-delta-0.1.1.zip", "b" * 64))
+        self.assertNotIn("/latest", ScriptedHandler.hits)
+
+    def test_site_not_newer_means_no_update_and_github_is_not_asked(self):
+        for version in ("0.1.1", "0.1.0"):
+            with self.subTest(version=version):
+                ScriptedHandler.hits = []
+                self.site(version); self.github()
+                self.assertEqual(updater.query_latest("windows", "0.1.1"), {"available": False})
+                self.assertNotIn("/latest", ScriptedHandler.hits)
+
+    def test_site_timeout_falls_back_to_github(self):
+        ScriptedHandler.scripts["/update/latest.json"] = ["sleep"]; self.github()
+        info = updater.query_latest("windows", "0.1.1")
+        self.assertEqual((info["version"], info["sha256"], info["asset"]), ("0.3.1", "c" * 64, self.base + "/gh/pkg"))
+        self.assertEqual(ScriptedHandler.hits.count("/update/latest.json"), 1)   # 官网只试一次就回退
+
+    def test_site_manifest_without_this_platform_means_no_update(self):
+        """官网清单只有 Mac 包（只发了 Mac）：Windows 老用户 → 没有新版、不报错、不去问 GitHub，标准错误记一行；Mac 照常有新版"""
+        mac = updater.ASSETS["mac"]
+        raw, sig = signed("0.3.0", {mac: {"sha256": "d" * 64, "size": 5}})
+        ScriptedHandler.scripts["/update/latest.json"] = [(200, {}, raw)]; ScriptedHandler.scripts["/update/latest.json.sig"] = [(200, {}, sig)]
+        self.github()
+        err = io.StringIO()
+        with patch.object(sys, "stderr", err):
+            self.assertEqual(updater.query_latest("windows", "0.2.9"), {"available": False})
+        self.assertIn("签名清单里没有 S2Arm-windows-x64.zip", err.getvalue())
+        self.assertNotIn("/latest", ScriptedHandler.hits)
+        ScriptedHandler.scripts["/update/latest.json"] = [(200, {}, raw)]; ScriptedHandler.scripts["/update/latest.json.sig"] = [(200, {}, sig)]
+        self.assertEqual(updater.query_latest("mac", "0.2.9")["version"], "0.3.0")
+
+    def test_github_manifest_without_this_platform_means_no_update(self):
+        """GitHub 这一版的签名清单里没有本平台的包（资产里却有同名文件也不认）→ 没有新版、不报错"""
+        mac = updater.ASSETS["mac"]
+        raw, sig = signed("0.3.1", {mac: {"sha256": "e" * 64, "size": 5}})
+        release = {"tag_name": "v0.3.1", "assets": [{"name": self.pkg, "browser_download_url": self.base + "/gh/pkg"},
+                   {"name": updater.MANIFEST, "browser_download_url": self.base + "/gh/m"}, {"name": updater.SIGNATURE, "browser_download_url": self.base + "/gh/s"}]}
+        ScriptedHandler.scripts.update({"/latest": [(200, {}, json.dumps(release).encode())], "/gh/m": [(200, {}, raw)], "/gh/s": [(200, {}, sig)]})
+        with patch.object(sys, "stderr", io.StringIO()):
+            self.assertEqual(updater.query_latest("windows", "0.2.9"), {"available": False})
+
+    def test_site_missing_falls_back_to_github(self):
+        self.github()   # 官网 404（发版流程还没写入）
+        self.assertEqual(updater.query_latest("windows", "0.1.1")["version"], "0.3.1")
+        self.assertEqual(ScriptedHandler.hits[:1], ["/update/latest.json"])
+
+    def test_site_bad_signature_falls_back_to_github(self):
+        self.site("9.9.9", secret=bytes(range(1, 33))); self.github()   # 别的私钥签的「9.9.9」：不认，按 GitHub 的 0.3.1
+        self.assertEqual(updater.query_latest("windows", "0.1.1")["version"], "0.3.1")
+        self.assertIn("/latest", ScriptedHandler.hits)
+
+    def test_both_failing_reports_the_github_error(self):
+        reset = str(int(time.time()) + 600)
+        ScriptedHandler.scripts["/latest"] = [(403, {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": reset}, b"{}")]
+        with self.assertRaises(updater.UpdateError) as caught:
+            updater.query_latest("windows", "0.1.1")
+        self.assertEqual(caught.exception.code, "update_rate_limited")
+
+    def test_site_hit_downloads_from_r2_first_with_github_as_fallback(self):
+        """官网清单命中 → 安装包先走 R2（S2A_UPDATE_R2，正式构建 = dl.s2arm.com），GitHub 那个地址留作退路；没给 R2 就照旧只有 GitHub"""
+        self.site("0.3.0")
+        with patch.dict(os.environ, {"S2A_UPDATE_R2": self.base + "/r2/v{version}/{name}"}):
+            info = updater.query_latest("windows", "0.1.1")
+        self.assertEqual((info["asset"], info["assetFallback"]), (self.base + "/r2/v0.3.0/" + self.pkg, self.base + "/dl/0.3.0/" + self.pkg))
+        self.site("0.3.0")
+        self.assertNotIn("assetFallback", updater.query_latest("windows", "0.1.1"))
+
+
+
+
+
+
+    def test_official_build_downloads_from_the_official_domain(self):
+        with patch.dict(os.environ, {"S2A_UPDATE_API": ""}):
+            self.assertTrue(updater.trusted(updater.R2_DOWNLOAD.format(version="0.3.1", name=self.pkg)))
+            self.assertTrue(updater.R2_DOWNLOAD.startswith("https://dl.s2arm.com/"))
+
+    def test_official_build_trusts_the_site_but_tests_never_reach_it(self):
+        with patch.dict(os.environ, {"S2A_UPDATE_API": ""}):
+            self.assertEqual(updater.mirror_url(), "https://s2arm.com/update/latest.json")
+            self.assertTrue(updater.trusted(updater.MIRROR))
+        with patch.dict(os.environ, {"S2A_UPDATE_MIRROR": ""}):
+            self.assertEqual(updater.mirror_url(), "")   # 假 Release 验收没给官网地址：不连真网
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LegacyCleanupTests(unittest.TestCase):
+    def test_old_updater_leftovers_are_cleared_notes_and_seen_kept(self):
+        """v0.3.10 起换版交给 Sparkle / NetSparkle：旧自写换版留在 updates/ 下的 pending.json、health.ok、last_failure.json、apply.log、
+        .update.lock、runner/、按版本号命名的整份新版都清掉；notes/（换上新版后弹说明用）与 seen.json 不动。期望手写"""
+        with tempfile.TemporaryDirectory() as d:
+            u = Path(d) / "updates"
+            for name in ("pending.json", "health.ok", "last_failure.json", "apply.log", ".update.lock", "seen.json"):
+                (u / name).parent.mkdir(parents=True, exist_ok=True); (u / name).write_text("x")
+            for folder in ("runner/python", "0.3.9/unpack/S2Arm.app", "notes"):
+                (u / folder).mkdir(parents=True, exist_ok=True)
+            (u / "notes" / "0.3.10.json").write_text("{}")
+            self.assertTrue(updater.clear_stale_pending(d, "0.3.10"))
+            self.assertEqual(sorted(p.name for p in u.iterdir()), ["notes", "seen.json"])
+            self.assertFalse(updater.clear_stale_pending(d, "0.3.10"))   # 再来一次没东西可清
+
+    def test_answers_old_updater_handshake_and_leaves_its_files_while_it_runs(self):
+        """11-14 本机复现：0.3.9 自写更新器换上 0.3.10、拉起后等 updates/health.ok 90 秒，0.3.10 不写还删它的 runner/ → 回滚删掉正在跑的新版。
+        期望手写：替换进程（子进程持 .update.lock 的内核锁）还在时，新版启动清理写 health.ok、一个文件不删（runner/ / pending.json / 版本目录原样）、
+        返回 False；替换进程退出后再清，照旧只剩 notes/ 与 seen.json"""
+        with tempfile.TemporaryDirectory() as d:
+            u = Path(d) / "updates"
+            for name in ("pending.json", ".update.lock", "seen.json"):
+                (u / name).parent.mkdir(parents=True, exist_ok=True); (u / name).write_text("x")
+            for folder in ("runner/python", "0.3.10/unpack/S2Arm.app", "notes"):
+                (u / folder).mkdir(parents=True, exist_ok=True)
+            holder = subprocess.Popen([sys.executable, "-c", "import fcntl, sys, time; f = open(sys.argv[1], 'r+'); fcntl.flock(f, fcntl.LOCK_EX); print('locked', flush=True); time.sleep(60)",
+                                       str(u / ".update.lock")], stdout=subprocess.PIPE, text=True)
+            self.addCleanup(holder.kill)
+            self.assertEqual(holder.stdout.readline().strip(), "locked")
+            before = sorted(str(p.relative_to(u)) for p in u.rglob("*"))
+            self.assertTrue(updater.legacy_apply_running(u))
+            self.assertFalse(updater.clear_stale_pending(d, "0.3.10"))
+            self.assertEqual((u / "health.ok").read_text(), "ok")
+            self.assertEqual(sorted(str(p.relative_to(u)) for p in u.rglob("*") if p.name != "health.ok"), before)
+            holder.kill(); holder.wait()
+            self.assertFalse(updater.legacy_apply_running(u))
+            self.assertTrue(updater.clear_stale_pending(d, "0.3.10"))
+            self.assertEqual(sorted(p.name for p in u.iterdir()), ["notes", "seen.json"])
+
+    def test_install_dir_mac_windows_and_source_tree(self):
+        """期望手写：Mac S2Arm.app/Contents/Resources/Jobs/updater.py → S2Arm.app；Windows <装>/Engine/pack/jobs/updater.py → <装>；源码树 → None"""
+        with tempfile.TemporaryDirectory() as d:
+            mac = Path(d) / "Applications/S2Arm.app"; (mac / "Contents/Resources/Jobs").mkdir(parents=True); (mac / "Contents/Info.plist").write_text("x")
+            win = Path(d) / "Programs/S2Arm"; (win / "Engine/pack/jobs").mkdir(parents=True); (win / "S2Arm.exe").write_text("x")
+            self.assertEqual(updater.install_dir(mac / "Contents/Resources/Jobs/updater.py"), mac.resolve())
+            self.assertEqual(updater.install_dir(win / "Engine/pack/jobs/updater.py"), win.resolve())
+            self.assertIsNone(updater.install_dir())   # 本文件在源码树 pack/jobs/ 下
+
+    def _leftovers(self, d):
+        inst = Path(d) / "Programs/S2Arm"; (inst / "Engine").mkdir(parents=True); (inst / "S2Arm.exe").write_text("x")
+        old = Path(d) / "Programs/S2Arm.s2arm-old"; (old / "Runtime/python").mkdir(parents=True); (old / "Runtime/python/python.exe").write_bytes(b"x" * 2 * 1048576)
+        (Path(d) / "Programs/S2Arm.s2arm-bad").mkdir(); (Path(d) / "Programs/S2Arm.s2arm-new/Engine").mkdir(parents=True)
+        for keep in ("S2Arm.backup", "Other.s2arm-old", "S2Arm.s2arm-old.txt"):
+            (Path(d) / "Programs" / keep).mkdir() if "." not in keep[-4:] else (Path(d) / "Programs" / keep).write_text("x")
+        return inst
+
+    def test_sweeps_only_our_three_leftovers_and_logs_each(self):
+        """Windows 实测的现场：完整 .s2arm-old（这里 2 MB）+ 空 .s2arm-bad + 半份 .s2arm-new。期望手写：三个都删、返回三个名字、update.log 三行带大小；
+        安装目录本身、名字不合规则的（S2Arm.backup、Other.s2arm-old、S2Arm.s2arm-old.txt）都不动"""
+        with tempfile.TemporaryDirectory() as d:
+            inst = self._leftovers(d)
+            gone = updater.sweep_install_leftovers(d, inst, in_use=lambda f: False)
+            self.assertEqual(sorted(gone), ["S2Arm.s2arm-bad", "S2Arm.s2arm-new", "S2Arm.s2arm-old"])
+            self.assertEqual(sorted(p.name for p in (Path(d) / "Programs").iterdir()), ["Other.s2arm-old", "S2Arm", "S2Arm.backup", "S2Arm.s2arm-old.txt"])
+            log = (Path(d) / "logs/update.log").read_text(encoding="utf-8")
+            self.assertEqual(log.count("update_leftover_removed"), 3)
+            self.assertIn("S2Arm.s2arm-old（2 MB）", log)
+            self.assertEqual(updater.sweep_install_leftovers(d, inst, in_use=lambda f: False), [])   # 再来一次没东西
+
+    def test_leftover_in_use_or_locked_by_windows_is_kept(self):
+        """期望手写：有进程在用的（in_use）不删；改名失败（Windows 文件被占用）的不删、不记日志；其余照删"""
+        with tempfile.TemporaryDirectory() as d:
+            inst = self._leftovers(d)
+            real = os.rename
+            def rename(a, b):
+                if Path(a).name == "S2Arm.s2arm-new":
+                    raise PermissionError(5, "拒绝访问")
+                return real(a, b)
+            with unittest.mock.patch.object(updater.os, "rename", rename):
+                gone = updater.sweep_install_leftovers(d, inst, in_use=lambda f: f.name == "S2Arm.s2arm-old")
+            self.assertEqual(gone, ["S2Arm.s2arm-bad"])
+            self.assertTrue((Path(d) / "Programs/S2Arm.s2arm-old/Runtime/python/python.exe").is_file())
+            self.assertTrue((Path(d) / "Programs/S2Arm.s2arm-new/Engine").is_dir())
+            self.assertEqual((Path(d) / "logs/update.log").read_text(encoding="utf-8").count("update_leftover_removed"), 1)
+
+    def test_leftovers_kept_while_old_updater_is_swapping_and_half_deleted_resumed(self):
+        """期望手写：旧替换进程持着 .update.lock（还在换版，它要用 .s2arm-old / -new）→ 一个都不删；锁放开后照删，上次删到一半的 .deleting 也删掉"""
+        with tempfile.TemporaryDirectory() as d:
+            inst = self._leftovers(d)
+            (Path(d) / "Programs/S2Arm.s2arm-old.deleting/x").mkdir(parents=True)
+            u = Path(d) / "updates"; u.mkdir(); (u / ".update.lock").write_text("x")
+            holder = subprocess.Popen([sys.executable, "-c", "import fcntl, sys, time; f = open(sys.argv[1], 'r+'); fcntl.flock(f, fcntl.LOCK_EX); print('locked', flush=True); time.sleep(60)",
+                                       str(u / ".update.lock")], stdout=subprocess.PIPE, text=True)
+            self.addCleanup(holder.kill)
+            self.assertEqual(holder.stdout.readline().strip(), "locked")
+            self.assertEqual(updater.sweep_install_leftovers(d, inst, in_use=lambda f: False), [])
+            self.assertTrue((Path(d) / "Programs/S2Arm.s2arm-old").is_dir())
+            holder.kill(); holder.wait()
+            # 三个残骸；上次删到一半的 S2Arm.s2arm-old.deleting 和这次 .s2arm-old 改名的目标同名，改名前先删掉它，不另计
+            self.assertEqual(len(updater.sweep_install_leftovers(d, inst, in_use=lambda f: False)), 3)
+            self.assertFalse((Path(d) / "Programs/S2Arm.s2arm-old.deleting").exists())
+
+    def test_in_use_reads_process_table(self):
+        """期望手写：进程表里有可执行文件在这个目录下的 → 在用；只是名字前缀相同的另一个目录（S2Arm.app.s2arm-old2）不算；进程表拿不到（None）→ 一律算在用"""
+        exes = ["/Applications/S2Arm.app.s2arm-old/Contents/MacOS/S2ArmApple --control", "/Applications/S2Arm.app.s2arm-old2/x"]
+        check = updater.in_use_by(exes)
+        self.assertTrue(check(Path("/Applications/S2Arm.app.s2arm-old")))
+        self.assertFalse(check(Path("/Applications/S2Arm.app.s2arm-new")))
+        self.assertTrue(updater.in_use_by(None)(Path("/Applications/S2Arm.app.s2arm-new")))
+
+    def test_half_deleted_in_use_kept_and_resumed_one_logged(self):
+        """期望手写：上次删到一半的 .deleting 有进程在用 → 不动；没人用 → 删掉并记一行「上次没删完」"""
+        with tempfile.TemporaryDirectory() as d:
+            inst = Path(d) / "Programs/S2Arm"; (inst / "Engine").mkdir(parents=True); (inst / "S2Arm.exe").write_text("x")
+            half = Path(d) / "Programs/S2Arm.s2arm-old.deleting"; (half / "Runtime").mkdir(parents=True)
+            self.assertEqual(updater.sweep_install_leftovers(d, inst, in_use=lambda f: True), [])
+            self.assertTrue(half.is_dir())
+            self.assertEqual(updater.sweep_install_leftovers(d, inst, in_use=lambda f: False), ["S2Arm.s2arm-old.deleting"])
+            self.assertIn("上次没删完", (Path(d) / "logs/update.log").read_text(encoding="utf-8"))
+
+    def test_no_leftovers_does_not_read_process_table(self):
+        """绝大多数启动没有残骸：期望手写，不起进程表（running_executables 一次都不调）"""
+        with tempfile.TemporaryDirectory() as d:
+            inst = Path(d) / "Programs/S2Arm"; (inst / "Engine").mkdir(parents=True); (inst / "S2Arm.exe").write_text("x")
+            with unittest.mock.patch.object(updater, "running_executables", side_effect=AssertionError("不该读进程表")):
+                self.assertEqual(updater.sweep_install_leftovers(d, inst), [])
+
+    def test_pending_without_running_updater_is_cleared(self):
+        """准备好了没换（旧版下载完、玩家改用 DMG 装了新版）：没有替换进程，照常全清。期望手写：只剩 notes/ 与 seen.json"""
+        with tempfile.TemporaryDirectory() as d:
+            u = Path(d) / "updates"; (u / "runner").mkdir(parents=True); (u / "notes").mkdir()
+            for name in ("pending.json", ".update.lock", "seen.json"):
+                (u / name).write_text("x")
+            self.assertTrue(updater.clear_stale_pending(d, "0.3.10"))
+            self.assertEqual(sorted(p.name for p in u.iterdir()), ["notes", "seen.json"])

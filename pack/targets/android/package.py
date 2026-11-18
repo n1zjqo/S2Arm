@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import hashlib
+import importlib.util
 import json
 import os
 import platform
@@ -264,6 +265,22 @@ def android_sdk_home(env):
     return str(home / ('Library/Android/sdk' if platform.system() == 'Darwin' else 'Android/Sdk'))
 
 
+def host_signer_env(build_source, env):
+    """host 后端验签用的环境：构建由 host/hostenv.sh 经 tools/jdk17.sh 找 JDK 17（Homebrew 装的不进 PATH、
+    也不登记 java_home），apksigner 是 Java 程序，要用同一个 JDK，否则落到 Mac 的 /usr/bin/java 空壳。"""
+    if java_runtime_ok(env):
+        return env
+    try:
+        found = subprocess.run(['bash', str(Path(build_source) / 'android/tools/jdk17.sh')], env=env, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return env
+    javac = found.stdout.strip() if found.returncode == 0 else ''
+    if not javac:
+        return env
+    home = str(Path(javac).parent.parent)
+    return {**env, 'JAVA_HOME': home, 'PATH': str(Path(home) / 'bin') + os.pathsep + env.get('PATH', os.defpath)}
+
+
 def verify_signature(build_source, apk, env, backend, variant='release'):
     sdk = android_sdk_home(env)
     pinned = Path(sdk) / 'build-tools' / sdk_pins()['build-tools'] / 'apksigner'
@@ -273,7 +290,7 @@ def verify_signature(build_source, apk, env, backend, variant='release'):
     if local and backend == 'docker' and not java_runtime_ok(env):
         local = None
     if local:
-        subprocess.run([local, 'verify', str(apk)], env=env, check=True)
+        subprocess.run([local, 'verify', str(apk)], env=host_signer_env(build_source, env) if backend == 'host' else env, check=True)
     elif backend == 'docker':
         image = env.get('S2ARM_ANDROID_IMAGE', 's2arm-android-build:1')
         subprocess.run(['docker', 'run', '--rm', '--network', 'none',
@@ -294,7 +311,6 @@ BUILD_ENV_ALLOWED = frozenset({
     'ANDROID_USER_HOME', 'GRADLE_USER_HOME', 'NUGET_PACKAGES',
     'S2A_ANDROID_DOTNET', 'S2A_JAVAC', 'S2A_REWRITER_DEPS', 'S2A_RUN_ROOT',
     'S2A_BUILD_CACHE', 'S2ARM_ANDROID_IMAGE', 'S2ARM_ANDROID_CACHE',
-    'S2A_MAX_INDEX_BYTES',   # 只抬高 direct_library 的 index.tsv 读取上限（超大型 RomFS 显式放开，见 direct_library.py）
     'S2A_VULKAN_PROFILE', 'S2A_VULKAN_REFS',
 })
 
@@ -302,9 +318,13 @@ BUILD_ENV_ALLOWED = frozenset({
 def build_environment(environ):
     env = {key: environ[key] for key in BUILD_ENV_ALLOWED if key in environ}
     env.setdefault('PATH', os.defpath)
+    # 图形后端缺省是新回放层（nvk）；旧层（nvn_vk）只留作对照诊断，要显式设环境变量才出
+    backend = environ.get('S2ARM_ANDROID_VK_BACKEND') or 'nvk'
+    if backend not in ('nvk', 'nvn_vk'):
+        raise ValueError('S2ARM_ANDROID_VK_BACKEND 只认 nvk / nvn_vk：' + backend)
     env.update(S2A_REWRITE_SPIN='0', S2ARM_ANDROID_CS_SERVICES='static',
                S2A_ANDROID_SKIP_APPLE_ARTIFACTS='1', S2A_TARGET='android',
-               S2ARM_ANDROID_VK_ENGINE='1', S2ARM_ANDROID_VK_BACKEND='nvn_vk',
+               S2ARM_ANDROID_VK_ENGINE='1', S2ARM_ANDROID_VK_BACKEND=backend,
                S2ARM_ANDROID_GAME_DIR='build/android-game/input',
                GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM='1')
     # #1207 复审二轮：local.properties 被 gitignore、不进导出树——把解析出的
@@ -336,7 +356,9 @@ def verify_manifest(root, apk, resources, ledger):
 
 def export_sources(destination, env):
     """Build from a committed source export outside the repository checkout."""
-    if subprocess.run(['git', '-C', str(ROOT), 'diff', '--quiet', 'HEAD', '--'], env=env).returncode:
+    # 发版快照（根有 engine.json）：工作区和 HEAD 的差异只来自打包时重签名的 Mac 二进制，不是安卓构建输入；
+    # archive HEAD 本来就只导出已提交内容。只在开发树上拦「改了没提交」（与 ipa.sh src_dirty 同一判据）
+    if not (ROOT / 'engine.json').is_file() and subprocess.run(['git', '-C', str(ROOT), 'diff', '--quiet', 'HEAD', '--'], env=env).returncode:
         raise ValueError('引擎源码有未提交的修改，无法固定安卓构建输入。')
     destination.mkdir(mode=0o700)
     archive = destination.parent / 'source.tar'
@@ -347,6 +369,50 @@ def export_sources(destination, env):
         subprocess.run(['tar', '-xf', str(archive), '-C', str(destination)], env=env, check=True)
     finally:
         archive.unlink(missing_ok=True)
+
+
+def direct_vulkan_candidate(root, tools):
+    """#48 P5：Vulkan 类游戏（main 导入 vk*、不导入 NVN / EGL，加载器 / 驱动模块能干净替换）出包要带 direct-vulkan.txt，
+    安卓侧 s2a_vk_lib_ready / AUTO 才有判定依据；别的游戏照旧不带。判定用导出源码树里同一份 vulkan_modules.replaced_modules
+    （make_pack --direct-vulkan 写描述符时也是它），返回 (是否带, 不带的原因)。读不了模块表这类意外也按「不带」处理并给出原因：
+    这一步只决定加不加一个可选描述符，不能让本来出得了的包因此失败。"""
+    exefs = Path(root) / 'exefs'
+    if not exefs.is_dir():
+        return False, ''
+    spec = importlib.util.spec_from_file_location('s2a_vulkan_modules', Path(tools) / 'vulkan_modules.py')
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+        module.replaced_modules(exefs)
+    except Exception as error:   # noqa: BLE001 — 原因原样交给调用方打印
+        return False, f'{type(error).__name__}: {error}'
+    return True, ''
+
+
+def latest_release(releases):
+    """The newest published release whose resource package is complete, or None.
+
+    The next release's read-only files are hard-linked to it (game_apk.py --resources --reuse-from) instead of
+    being written again: ext4 has no reflink, so every release used to keep a full copy of the RomFS.
+    A release is published only by the final rename (ledger written first), so '.'-named staging directories,
+    symlinks and directories missing the ledger or the package manifest are not candidates. What game_apk.py
+    actually links is decided by hash against the new package's own index, so a stale or foreign candidate
+    only costs the links, never correctness."""
+    newest = None
+    try:
+        candidates = list(releases.iterdir())
+    except OSError:
+        return None
+    for path in candidates:
+        if path.name.startswith('.') or path.is_symlink() or not path.is_dir():
+            continue
+        ledger = path / 'artifact.json'
+        if not ledger.is_file() or not (path / 'resources' / 'manifest.json').is_file():
+            continue
+        stamp = ledger.stat().st_mtime_ns
+        if newest is None or stamp > newest[0]:
+            newest = (stamp, path)
+    return newest[1] if newest else None
 
 
 def package(root, out):
@@ -377,7 +443,15 @@ def package(root, out):
             original_pack = stage / 'source-pack'
             resources = stage / 'resources'
             apk = stage / 'game.apk'
-            subprocess.run([py, str(tool / 'make_pack.py'), str(original_pack), '--root', str(root)], env=env, check=True)
+            # 两次 make_pack 必须一致：describe 记下的 gameContentRoot 覆盖 direct-vulkan.txt 这一行，只在第二次带会对不上
+            vulkan, why_not = direct_vulkan_candidate(root, tool)
+            vulkan_flag = ['--direct-vulkan'] if vulkan else []
+            if vulkan:
+                print('Vulkan 类游戏：包里带 direct-vulkan.txt（AUTO 据此判直连）。')
+            elif why_not and not why_not.startswith('ValueError: direct Vulkan requires Vulkan main imports'):
+                print('🟡 不带 direct-vulkan.txt（' + why_not + '）：本包照旧走通用路径。')
+            subprocess.run([py, str(tool / 'make_pack.py'), str(original_pack), '--root', str(root), *vulkan_flag],
+                           env=env, check=True)
             backend = build_backend(env)
             builder = build_source / ('android/docker/build.sh' if backend == 'docker' else 'android/host/build.sh')
             # 描述符的翻译闭包取本源码树编译器的构建身份（与 APK 里的编译器同源同配置）。
@@ -388,7 +462,7 @@ def package(root, out):
                             '--identity', str(identity), '--descriptor', str(descriptor)], env=env, check=True)
             direct_pack = stage / 'direct-pack'
             subprocess.run([py, str(tool / 'make_pack.py'), str(direct_pack), '--root', str(root),
-                            '--direct-graphics', str(descriptor)], env=env, check=True)
+                            '--direct-graphics', str(descriptor), *vulkan_flag], env=env, check=True)
             shutil.rmtree(original_pack)
             original_pack = direct_pack
             # 离线 Vulkan 着色器包（target.json「shaders」，#1574）：包 manifest 绑定安装 revision 的
@@ -447,8 +521,10 @@ def package(root, out):
             verify_signature(build_source, apk, env, backend, variant)
             if sha256(apk) != sha256(built):
                 raise ValueError('构建输出在签名验证期间变化。')
-            subprocess.run([py, str(tool / 'game_apk.py'), '--resources', str(original_pack),
-                            str(apk), str(resources)], env=env, check=True)
+            previous = latest_release(releases)   # 持着出包锁：不会有别的出包在这时发布新的
+            subprocess.run([py, str(tool / 'game_apk.py'), '--resources',
+                            *(('--reuse-from', str(previous / 'resources')) if previous else ()),
+                            str(original_pack), str(apk), str(resources)], env=env, check=True)
             if shader_pack:
                 # 把离线包挂进安装资源包：行追加进 index、manifest 绑定的是挂前的内容根
                 #   （attach_shaders.py 自己核 contentRoot，与烘焙时 --content-root 一致）。

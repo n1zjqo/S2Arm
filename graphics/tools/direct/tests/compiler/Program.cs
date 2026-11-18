@@ -28,11 +28,12 @@ internal static unsafe class Program
         catch (DirectCompileException error)
         {
             if (code != null && error.Code != code)
-                Console.Error.WriteLine($"FAIL {what}: code={error.Code} want={code} ({error.Message})");
+            { Console.Error.WriteLine($"FAIL {what}: code={error.Code} want={code} ({error.Message})"); _failures++; }
             return;
         }
-        catch (Exception error) { Console.Error.WriteLine($"FAIL {what}: {error.GetType().Name} {error.Message}"); return; }
-        Console.Error.WriteLine("FAIL " + what + ": no exception");
+        catch (Exception error) { Console.Error.WriteLine($"FAIL {what}: {error.GetType().Name} {error.Message}"); _failures++; return; }
+        // 该抛没抛也算失败（原先这三条路只打印 FAIL、不计数，整份照样报 ok）
+        Console.Error.WriteLine("FAIL " + what + ": no exception"); _failures++;
     }
 
     private const ulong Sched = 0x001F8000FC0007E0UL, Exit = 0xE30000000007000FUL;
@@ -52,12 +53,19 @@ internal static unsafe class Program
     private static ulong Ldc(int dest, int offset, int slot = 0, int srcA = 0xFF) =>
         0xEF90000000000000UL | (4UL << 48) | ((ulong)slot << 36) | ((ulong)(offset & 0xFFFF) << 20) |
         (7UL << 16) | ((ulong)srcA << 8) | (uint)dest;
+    // LOP.OR Rd, Ra, Rb: exact Maxwell opcode and fields from InstTable / InstLopR.
+    private static ulong LopOr(int dest, int a, int b) =>
+        0x5C40000000000000UL | (7UL << 48) | (1UL << 41) | ((ulong)b << 20) | (7UL << 16) | ((ulong)a << 8) | (uint)dest;
     private static ulong Ald4(int location) =>
         0xEFD8000000000000UL | (0xFFUL << 39) | (3UL << 47) | ((ulong)(0x80 + location * 16) << 20) | (7UL << 16) | (0xFFUL << 8);
     // TEX R0, R2, texture0：2D、坐标 R2/R3、写 RGBA。
     private static ulong Tex2D(int dest, int coord, int tid = 0) =>
         0xC000000000000000UL | (7UL << 16) | (2UL << 28) | (0xFUL << 31) |
         ((ulong)tid << 36) | ((ulong)coord << 8) | (uint)dest;
+    // TEX.B: SrcB supplies a runtime texture/sampler handle (InstTexB decoder).
+    private static ulong TexBindless2D(int dest, int coord, int handle) =>
+        0xDE80000000000000UL | (7UL << 16) | (2UL << 28) | (0xFUL << 31) |
+        ((ulong)handle << 20) | ((ulong)coord << 8) | (uint)dest;
     private static ulong Ast4Pos(int reg) =>
         0xEFF0000000000000UL | (0xFFUL << 39) | (3UL << 47) | (0x70UL << 20) | (7UL << 16) | (0xFFUL << 8) | (uint)reg;
     private static byte[] Guest(bool fragment, ulong[] ops, int[] reads = null)
@@ -79,6 +87,109 @@ internal static unsafe class Program
         return b;
     }
     private static byte[] ComputeGuest() => MemoryMarshal.AsBytes(new ulong[] { Sched, Exit, 0x50B0000000070F00UL, 0xE2400FFFFF07000FUL }.AsSpan()).ToArray();
+
+    // 原创合成 Maxwell GS：普通（非 passthrough）几何阶段，读写 loc0，发出顶点并结束图元。
+    // OUT 的 opcode / 类型域分别来自 InstTable 和 InstOutR，不依赖游戏输入。
+    private static byte[] GeometryGuest(bool viewportIndex = false, bool omitVaryingOutput = false, bool uniform = false)
+    {
+        ulong emit = 0xFBE0000000000000UL | (1UL << 39) | (0xFFUL << 20) | (7UL << 16) | (0xFFUL << 8) | 0xFFUL;
+        ulong emitAndCut = 0xFBE0000000000000UL | (3UL << 39) | (0xFFUL << 20) | (7UL << 16) | (0xFFUL << 8) | 0xFFUL;
+        var ops = new List<ulong> {
+            Ald(0), Ast(0), Fadd32i(4, -1), Fadd32i(5, -1), Fadd32i(6, 0), Fadd32i(7, 1), Ast4Pos(4), emit,
+            Fadd32i(4, 3), Ast4Pos(4), emit, Fadd32i(4, -1), Fadd32i(5, 3), Ast4Pos(4), emitAndCut,
+        };
+        // 仍把读到的 loc0 写到 loc1，防止编译器因读值未使用而合法消掉 GS 输入。
+        if (omitVaryingOutput) ops[1] = Ast(1);
+        if (uniform) ops.Insert(1, Ldc(0, 0));
+        // Maxwell AttributeConsts.ViewportIndex = 0x068；写到 GS 输出，不能以默认为 viewport 0 冒充。
+        if (viewportIndex) ops.Insert(2, (Ast(0) & ~(0x7ffUL << 20)) | (0x68UL << 20));
+        byte[] code = Guest(false, ops.ToArray());
+        BinaryPrimitives.WriteUInt32LittleEndian(code, 1u | (3u << 5) | (4u << 10));
+        BinaryPrimitives.WriteUInt32LittleEndian(code.AsSpan(8), 1u << 24);
+        BinaryPrimitives.WriteUInt32LittleEndian(code.AsSpan(12), 7u << 24);
+        BinaryPrimitives.WriteUInt32LittleEndian(code.AsSpan(16), 3);
+        return code;
+    }
+
+    // 从实际模块的 Location/OpVariable/类型声明读跨阶段接口；GS 输入按 SPIR-V 规则多一层顶点数组。
+    private static Dictionary<uint, string> ShaderInterface(JsonElement stage, uint storage, bool stripVertexArray = false)
+    {
+        uint[] words = MemoryMarshal.Cast<byte, uint>(stage.GetProperty("spirv").GetBytesFromBase64()).ToArray();
+        var instructions = new List<uint[]>();
+        for (int i = 5; i < words.Length;)
+        {
+            int count = (int)(words[i] >> 16);
+            if (count == 0 || i + count > words.Length) throw new InvalidDataException("invalid SPIR-V instruction");
+            instructions.Add(words[i..(i + count)]); i += count;
+        }
+        var types = instructions.Where(x => (x[0] & 0xffff) is 21 or 22 or 23 or 28 or 32).ToDictionary(x => x[1]);
+        var locations = instructions.Where(x => (x[0] & 0xffff) == 71 && x.Length >= 4 && x[2] == 30)
+            .ToDictionary(x => x[1], x => x[3]);
+        string Signature(uint id)
+        {
+            uint[] t = types[id];
+            return (t[0] & 0xffff) switch
+            {
+                21 => $"int{t[2]}:{t[3]}", 22 => $"float{t[2]}",
+                23 => $"vec{t[3]}<{Signature(t[2])}>",
+                _ => throw new InvalidDataException("unexpected SPIR-V interface type " + (t[0] & 0xffff)),
+            };
+        }
+        var result = new Dictionary<uint, string>();
+        foreach (uint[] v in instructions.Where(x => (x[0] & 0xffff) == 59 && x.Length >= 4 && x[3] == storage))
+        {
+            if (!locations.TryGetValue(v[2], out uint loc)) continue;
+            uint[] pointer = types[v[1]];
+            if ((pointer[0] & 0xffff) != 32 || pointer[2] != storage) throw new InvalidDataException("invalid interface pointer");
+            uint typeId = pointer[3];
+            if (stripVertexArray)
+            {
+                uint[] array = types[typeId];
+                if ((array[0] & 0xffff) != 28) throw new InvalidDataException("GS input is not a vertex array");
+                typeId = array[2];
+            }
+            result.Add(loc, Signature(typeId));
+        }
+        return result;
+    }
+
+    private static HashSet<(uint set, uint binding)> ShaderBindings(JsonElement stage)
+    {
+        uint[] words = MemoryMarshal.Cast<byte, uint>(stage.GetProperty("spirv").GetBytesFromBase64()).ToArray();
+        var sets = new Dictionary<uint, uint>();
+        var bindings = new Dictionary<uint, uint>();
+        for (int i = 5; i < words.Length;)
+        {
+            int count = (int)(words[i] >> 16);
+            if (count == 0 || i + count > words.Length) throw new InvalidDataException("invalid SPIR-V instruction");
+            if ((words[i] & 0xffff) == 71 && count >= 4)
+            {
+                if (words[i + 2] == 34) sets[words[i + 1]] = words[i + 3];
+                if (words[i + 2] == 33) bindings[words[i + 1]] = words[i + 3];
+            }
+            i += count;
+        }
+        return sets.Where(p => bindings.ContainsKey(p.Key)).Select(p => (p.Value, bindings[p.Key])).ToHashSet();
+    }
+
+    private static uint GeometryInputArrayLength(JsonElement stage, uint location)
+    {
+        uint[] words = MemoryMarshal.Cast<byte, uint>(stage.GetProperty("spirv").GetBytesFromBase64()).ToArray();
+        var instructions = new List<uint[]>();
+        for (int i = 5; i < words.Length;)
+        {
+            int count = (int)(words[i] >> 16);
+            if (count == 0 || i + count > words.Length) throw new InvalidDataException("invalid SPIR-V instruction");
+            instructions.Add(words[i..(i + count)]); i += count;
+        }
+        var locations = instructions.Where(x => (x[0] & 0xffff) == 71 && x.Length >= 4 && x[2] == 30 && x[3] == location)
+            .Select(x => x[1]).ToHashSet();
+        uint[] variable = instructions.Single(x => (x[0] & 0xffff) == 59 && x.Length >= 4 && x[3] == 1 && locations.Contains(x[2]));
+        uint[] pointer = instructions.Single(x => (x[0] & 0xffff) == 32 && x[1] == variable[1]);
+        uint[] array = instructions.Single(x => (x[0] & 0xffff) == 28 && x[1] == pointer[3]);
+        uint[] constant = instructions.Single(x => (x[0] & 0xffff) == 43 && x[2] == array[3]);
+        return constant[3];
+    }
 
     // 原创合成 CS，不来自游戏：编码依据本仓 Ryujinx.Graphics.Shader 的
     // Decoders/InstTable.cs、InstDecoders.cs 及 Instructions/InstEmitMemory.cs。
@@ -190,6 +301,33 @@ internal static unsafe class Program
         if (load) Emit(61, leaf, 121, 120);
         if (escape) Emit(83, 109, 123, 120);
         return MemoryMarshal.AsBytes(w.ToArray().AsSpan()).ToArray();
+    }
+
+    // 计算模块里唯一一个存储图像（OpTypeImage Sampled = 2）的声明：(Image Format 操作数, Sampled Type 是否 uint)
+    private static (uint format, bool uintSampled, int images) StorageImageDecl(JsonElement stage)
+    {
+        uint[] words = MemoryMarshal.Cast<byte, uint>(stage.GetProperty("spirv").GetBytesFromBase64()).ToArray();
+        var ints = new Dictionary<uint, uint>(); uint format = 99, sampledType = 0; int images = 0;
+        for (int i = 5; i < words.Length;)
+        {
+            int count = (int)(words[i] >> 16); uint op = words[i] & 0xffff;
+            if (count == 0 || i + count > words.Length) throw new InvalidDataException("invalid SPIR-V instruction");
+            if (op == 21 && count >= 4) ints[words[i + 1]] = words[i + 3];
+            if (op == 25 && count >= 9 && words[i + 7] == 2) { images++; format = words[i + 8]; sampledType = words[i + 2]; }
+            i += count;
+        }
+        return (format, ints.TryGetValue(sampledType, out uint signed) && signed == 0, images);
+    }
+
+    // 原创合成 Maxwell CS：R0 = c0[0x310]（存储缓冲地址），R4 = R5 = 0，SULD.D.B32 R2, [R4]（二维、图像句柄 c2 字 74，按位读），STG [R0], R2。
+    //   SULD.D 的字段来自 InstSuldD（目的 0..7、坐标 8..15、谓词 16..18、大小 20..22 = B32、目的谓词 30..32、维度 33..35 = 2D、句柄 36..48）。
+    private static byte[] ComputeRawImageLoadGuest()
+    {
+        ulong[] ops = { 0xEF9500310007FF00UL, 0x1C0000000007FF04UL, 0x1C0000000007FF05UL, 0xEB1804A7C0470402UL, 0xEEDC200000070002UL, Exit };
+        byte[] code = new byte[((ops.Length + 2) / 3) * 32];
+        for (int i = 0; i < ops.Length; i++)
+            BinaryPrimitives.WriteUInt64LittleEndian(code.AsSpan((i / 3 * 4 + i % 3 + 1) * 8), ops[i]);
+        return code;
     }
 
     private static byte[] ComputeTextureGuest()
@@ -405,7 +543,7 @@ internal static unsafe class Program
             if (kind == "graphics")
             {
                 WriteStage(w, "vs", overrideCode ?? vs, 0);
-                WriteStage(w, "fs", overrideCode ?? fs, fsCbUse);
+                if (fs != null || overrideCode != null) WriteStage(w, "fs", overrideCode ?? fs, fsCbUse);   // fs 不给 = 只有顶点阶段的程序
             }
             else
             {
@@ -513,6 +651,13 @@ internal static unsafe class Program
         byte[] fs = Guest(true, new[] { Ald(0) }, new[] { 0 });
         byte[] cs = ComputeGuest();
 
+        if (args.Length == 1 && args[0] == "--legacy-artifact")
+        {
+            byte[] request = RequestJson(profile, "graphics", 1, 1, "legacy-artifact", vs, FsTwoTextures(), textureFacts: TwoTextureFacts);
+            Console.WriteLine(Encoding.UTF8.GetString(DirectShaderCompiler.Compile(request)));
+            return;
+        }
+
         if (args.Length == 2 && args[0] == "--emit-requests")
         {
             string directory = Path.GetFullPath(args[1]);
@@ -574,6 +719,110 @@ internal static unsafe class Program
             return;
         }
 
+        // A large pool must not prevent a program with constant texture handles from compiling.
+        {
+            byte[] fsConstant = Guest(true, new[] { Fadd32i(2, 0.5f), Fadd32i(3, 0.5f), Tex2D(0, 2) });
+            const string texFact = "[{\"stage\":\"fs\",\"handle\":0,\"cbufSlot\":-1,\"samplerType\":\"2d\",\"format\":\"R8G8B8A8Unorm\",\"isBuffer\":false,\"normalized\":true,\"separate\":false,\"arrayLength\":1}]";
+            string raw = Encoding.UTF8.GetString(RequestJson(profile, "graphics", 1, 1, "large-pool", vs, fsConstant, textureFacts: texFact));
+            foreach (int length in new[] { 524288, 1048576 })
+            {
+                string request = raw.Replace("\"textureArrayLength\":64", "\"textureArrayLength\":" + length)
+                                    .Replace("\"samplerArrayLength\":8", "\"samplerArrayLength\":" + length);
+                try
+                {
+                    using JsonDocument largeResult = ParseResult(DirectShaderCompiler.Compile(Encoding.UTF8.GetBytes(request)));
+                    var textures = largeResult.RootElement.GetProperty("content").GetProperty("bindings").EnumerateArray()
+                        .Where(b => b.GetProperty("kind").GetString() == "texture").ToArray();
+                    Check(textures.Length == 1 && textures[0].GetProperty("count").GetInt32() == 1,
+                        "large pool " + length + " compiles constant handle as one descriptor");
+                }
+                catch (Exception error) { Check(false, "large pool " + length + " constant handle: " + error.Message); }
+            }
+            string tooLarge = raw.Replace("\"textureArrayLength\":64", "\"textureArrayLength\":1048577");
+            Throws("MISSING_FIELD", () => DirectShaderCompiler.Compile(Encoding.UTF8.GetBytes(tooLarge)), "texture pool above cap rejected");
+            tooLarge = raw.Replace("\"samplerArrayLength\":8", "\"samplerArrayLength\":1048577");
+            Throws("MISSING_FIELD", () => DirectShaderCompiler.Compile(Encoding.UTF8.GetBytes(tooLarge)), "sampler pool above cap rejected");
+
+            // The real translator produces a runtime pool array, but this input currently hits
+            // the independent cbuf-slot limitation before a program result is emitted.
+            byte[] fsDynamic = Guest(true, new[] { Ald(1, 0, 4), Fadd32i(2, 0.5f), Fadd32i(3, 0.5f), TexBindless2D(0, 2, 4) }, new[] { 1 });
+            string dynamicRequest = Encoding.UTF8.GetString(RequestJson(profile, "graphics", 1, 1, "runtime-pool", vs, fsDynamic, textureFacts: texFact))
+                .Replace("\"textureArrayLength\":64", "\"textureArrayLength\":524288");
+            try
+            {
+                DirectShaderCompiler.Compile(Encoding.UTF8.GetBytes(dynamicRequest));
+                Check(false, "runtime handle must not claim an unsupported cbuf layout is usable");
+            }
+            catch (DirectCompileException error) {
+                Check(error.Code == "UNSUPPORTED_PROGRAM" && error.Message.Contains("texture handle from cbuf slot 0"),
+                    "runtime handle reports its actual upstream cbuf limitation: " + error.Message);
+            }
+        }
+
+        // 句柄在游戏自己的 UBO 里（认领 #999）：LDC Rh, c[4][off]; TEX.B Rd, Rcoord, Rh。真实编译器、真实 BindlessElimination。
+        //   A：字偏移 8（字节 0x20）正好等于组合槽 0 的句柄位置（8 + 2 × 槽）。请求只带运行时照常给的组合槽事实（handle 8 / cbufSlot −1）。
+        //      这个句柄来自 c4、不是 c2 句柄表，不许当成组合槽 0 绑——修前「同 handle 事实回退」放行，绑到组合槽 0，读错图还不报。
+        //   B：字节 0x400（字偏移 256，和组合区不重叠），请求带精确事实（handle 256 / cbufSlot 4）。第 2 片起编出贴图绑定，来源是
+        //      uboSlot 1（NVN UBO 号 = cbuf − 3）/ uboOffset 1024（句柄字的字节偏移），不带 slot（slot 只指 c2 组合槽）。
+        {
+            byte[] fsUboA = Guest(true, new[] { Ldc(4, 0x20, 4), Fadd32i(2, 0.5f), Fadd32i(3, 0.5f), TexBindless2D(0, 2, 4) });
+            const string comboFact = "[{\"stage\":\"fs\",\"handle\":8,\"cbufSlot\":-1,\"samplerType\":\"2d\",\"format\":\"R8G8B8A8Unorm\",\"isBuffer\":false,\"normalized\":true,\"separate\":false,\"arrayLength\":1}]";
+            string misbind = "";
+            try
+            {
+                using JsonDocument r = ParseResult(DirectShaderCompiler.Compile(RequestJson(profile, "graphics", 1, 1, "ubo-handle-a", vs, fsUboA, textureFacts: comboFact, fsCbUse: 1u << 4)));
+                foreach (var b in r.RootElement.GetProperty("content").GetProperty("bindings").EnumerateArray())
+                    if (b.GetProperty("kind").GetString() == "texture" && !b.TryGetProperty("uboSlot", out _)) misbind += b.GetRawText();
+            }
+            catch (DirectCompileException) { }
+            Check(misbind.Length == 0, "c4 handle at word 8 is not bound as combined texture slot 0: " + misbind);
+
+            static string UboFact(int handle, int cbufSlot) =>
+                "{\"stage\":\"fs\",\"handle\":" + handle + ",\"cbufSlot\":" + cbufSlot +
+                ",\"samplerType\":\"2d\",\"format\":\"R8G8B8A8Unorm\",\"isBuffer\":false,\"normalized\":true,\"separate\":false,\"arrayLength\":1}";
+            // 编出的贴图绑定逐个列成「uboSlot/uboOffset/slot」，不带的字段写 -
+            string UboTextures(string id, byte[] fs, string facts, uint cbUse)
+            {
+                try
+                {
+                    using JsonDocument r = ParseResult(DirectShaderCompiler.Compile(RequestJson(profile, "graphics", 1, 1, id, vs, fs, textureFacts: facts, fsCbUse: cbUse)));
+                    string Field(JsonElement b, string name) => b.TryGetProperty(name, out JsonElement f) ? f.GetInt32().ToString() : "-";
+                    return string.Join(";", r.RootElement.GetProperty("content").GetProperty("bindings").EnumerateArray()
+                        .Where(b => b.GetProperty("kind").GetString() == "texture")
+                        .Select(b => Field(b, "uboSlot") + "/" + Field(b, "uboOffset") + "/" + Field(b, "slot")).OrderBy(x => x, StringComparer.Ordinal));
+                }
+                catch (DirectCompileException error) { return error.Code + " " + error.Message; }
+            }
+
+            byte[] fsUboB = Guest(true, new[] { Ldc(4, 0x400, 4), Fadd32i(2, 0.5f), Fadd32i(3, 0.5f), TexBindless2D(0, 2, 4) });
+            string got = UboTextures("ubo-handle-b", fsUboB, "[" + UboFact(256, 4) + "]", 1u << 4);
+            Check(got == "1/1024/-", "c4 handle at byte 0x400 compiles to uboSlot 1 / uboOffset 1024 without a combined slot: " + got);
+
+            // UBO 号的两端：c3 = NVN UBO 0、c18 = NVN UBO 15
+            byte[] fsUboC3 = Guest(true, new[] { Ldc(4, 0, 3), Fadd32i(2, 0.5f), Fadd32i(3, 0.5f), TexBindless2D(0, 2, 4) });
+            got = UboTextures("ubo-handle-c3", fsUboC3, "[" + UboFact(0, 3) + "]", 1u << 3);
+            Check(got == "0/0/-", "c3 handle at byte 0 compiles to uboSlot 0 / uboOffset 0: " + got);
+            byte[] fsUboC18 = Guest(true, new[] { Ldc(4, 0x7FFC, 18), Fadd32i(2, 0.5f), Fadd32i(3, 0.5f), TexBindless2D(0, 2, 4) });
+            got = UboTextures("ubo-handle-c18", fsUboC18, "[" + UboFact(0x7FFC / 4, 18) + "]", 1u << 18);
+            Check(got == "15/32764/-", "c18 handle at byte 0x7FFC compiles to uboSlot 15 / uboOffset 32764: " + got);
+
+            // 同一个片元着色器两张 UBO 句柄贴图（c4 0x400、c6 0x10）：各自的来源，不串
+            byte[] fsUboTwo = Guest(true, new[] {
+                Ldc(4, 0x400, 4), Fadd32i(2, 0.5f), Fadd32i(3, 0.5f), TexBindless2D(8, 2, 4),
+                Ldc(5, 0x10, 6), TexBindless2D(12, 2, 5),
+                FaddR(0, 8, 12), FaddR(1, 9, 13), FaddR(2, 10, 14), FaddR(3, 11, 15) });
+            got = UboTextures("ubo-handle-two", fsUboTwo, "[" + UboFact(256, 4) + "," + UboFact(4, 6) + "]", (1u << 4) | (1u << 6));
+            Check(got == "1/1024/-;3/16/-", "two user-UBO handles keep their own uboSlot / uboOffset: " + got);
+
+            // 缺精确事实：如实报 MISSING_FACT，坐标是「这个 UBO 句柄」（宿主按它读 UBO 补事实）；
+            //   同 handle 的组合槽事实、别的 UBO 里同偏移的事实都不借
+            got = UboTextures("ubo-handle-missing", fsUboB,
+                "[{\"stage\":\"fs\",\"handle\":256,\"cbufSlot\":-1,\"samplerType\":\"2d\",\"format\":\"R8G8B8A8Unorm\",\"isBuffer\":false,\"normalized\":true,\"separate\":false,\"arrayLength\":1}," +
+                UboFact(256, 5) + "]", 1u << 4);
+            Check(got.StartsWith("MISSING_FACT ", StringComparison.Ordinal) && got.EndsWith("has no source (stage=fs,handle=256,cbufSlot=4)", StringComparison.Ordinal),
+                "a c4 handle without its exact fact is MISSING_FACT at (fs, 256, 4): " + got);
+        }
+
         // 1) 接口全覆盖（接口新增方法时这里先红）。
         var interfaceMethods = typeof(IGpuAccessor).GetMethods().Where(m => m.DeclaringType == typeof(IGpuAccessor)).ToList();
         var classMethods = typeof(DirectGpuAccessor).GetMethods().Where(m => m.DeclaringType == typeof(DirectGpuAccessor))
@@ -616,8 +865,11 @@ internal static unsafe class Program
             }
             Check(composed.SequenceEqual(DirectProfileComposer.Compose(CapsJson(), closure)),
                 "same caps compose the same profile bytes");
-            Check(composed.SequenceEqual(DirectProfileComposer.Compose(CapsJson(geometry: true), closure)),
-                "hardware-only geometry support does not change the enabled profile");
+            byte[] gsEnabled = DirectProfileComposer.Compose(CapsJson(geometry: true), closure);
+            Check(!composed.SequenceEqual(gsEnabled), "enabled geometry changes the profile");
+            using (JsonDocument enabled = JsonDocument.Parse(gsEnabled))
+                Check(DirectProfile.Parse(enabled.RootElement, "gs profile").Caps.SupportsGeometryShader,
+                    "enabled geometry reaches compiler profile");
             // #1456：capprobe 位是写进 profile 的设备事实——同 caps 不同判定必须产出不同 profileHash。
             byte[] gsOcc = DirectProfileComposer.Compose(CapsJson(geometry: true, gsOccQuery: true), closure);
             Check(!composed.SequenceEqual(gsOcc), "gs occlusion-query bit must change the profile");
@@ -688,6 +940,210 @@ internal static unsafe class Program
 
         // 2) 合成 VS/FS 编译；SPIR-V/反射/依赖/支持缓冲。
         byte[] graphicsRequest = RequestJson(profile, "graphics", 1, 1, "req-graphics-1", vs, fs);
+        // 先在真实请求解析器证明第三阶段不是被静默丢弃：没有替身解析器、没有游戏数据。
+        // 红线在 program.stages 的 GS 拒绝；后续还须经真实翻译检验接口与拓扑。
+        {
+            byte[] gs = GeometryGuest();
+            using var stageStream = new MemoryStream();
+            using (var w = new Utf8JsonWriter(stageStream)) WriteStage(w, "gs", gs, 0);
+            var requestNode = System.Text.Json.Nodes.JsonNode.Parse(graphicsRequest);
+            var oldStages = requestNode["program"]["stages"].AsArray();
+            requestNode["program"]["stages"] = new System.Text.Json.Nodes.JsonArray(
+                oldStages[0].DeepClone(), oldStages[1].DeepClone(),
+                System.Text.Json.Nodes.JsonNode.Parse(stageStream.ToArray()), null, null);
+            requestNode["schema"] = DirectShaderCompiler.GraphicsRequestSchemaV2;
+            string request = requestNode.ToJsonString();
+            using JsonDocument requestDoc = JsonDocument.Parse(request);
+            using JsonDocument profileDoc = JsonDocument.Parse(profile);
+            try
+            {
+                DirectProfile parsedProfile = DirectProfile.Parse(profileDoc.RootElement, "profile");
+                DirectProgram parsed = DirectProgram.Parse(requestDoc.RootElement.GetProperty("program"), "program", parsedProfile, 2);
+                Check(parsed.Stages.Length == 3 && parsed.StageOf("gs") != null &&
+                    parsed.StageOf("gs").Code.SequenceEqual(gs), "GS request preserves all three stages and exact GS code");
+            }
+            catch (DirectCompileException ex)
+            {
+                Console.Error.WriteLine("GS request rejected: " + ex.Code + " " + ex.Message);
+                Check(false, "GS request preserves all three stages and exact GS code");
+            }
+
+            Throws("UNSUPPORTED_PROGRAM", () => DirectShaderCompiler.Compile(Encoding.UTF8.GetBytes(request)),
+                "GS request rejected when geometry is not enabled");
+            byte[] enabledProfile = DirectProfileComposer.Compose(CapsJson(geometry: true), DirectBuildIdentity.TranslatorClosure);
+            requestNode["profile"] = System.Text.Json.Nodes.JsonNode.Parse(enabledProfile);
+            byte[] enabledRequest = Encoding.UTF8.GetBytes(requestNode.ToJsonString());
+            {
+                var badSlot = requestNode.DeepClone();
+                var badStages = badSlot["program"]["stages"].AsArray();
+                (badStages[1], badStages[2]) = (badStages[2].DeepClone(), badStages[1].DeepClone());
+                Throws("INVALID_JSON", () => DirectShaderCompiler.Compile(Encoding.UTF8.GetBytes(badSlot.ToJsonString())),
+                    "v2 rejects a stage in the wrong NVN slot");
+                var shortSlots = requestNode.DeepClone();
+                shortSlots["program"]["stages"].AsArray().RemoveAt(4);
+                Throws("INVALID_JSON", () => DirectShaderCompiler.Compile(Encoding.UTF8.GetBytes(shortSlots.ToJsonString())),
+                    "v2 requires all five slots including null slots");
+                var wrongHeader = requestNode.DeepClone();
+                wrongHeader["program"]["stages"][2]["code"] = Convert.ToBase64String(vs);
+                Throws("INVALID_JSON", () => DirectShaderCompiler.Compile(Encoding.UTF8.GetBytes(wrongHeader.ToJsonString())),
+                    "v2 rejects a GS slot containing a VS header");
+                var missingFs = requestNode.DeepClone();
+                missingFs["program"]["stages"][1] = null;
+                Throws("UNSUPPORTED_PROGRAM", () => DirectShaderCompiler.Compile(Encoding.UTF8.GetBytes(missingFs.ToJsonString())),
+                    "v2 rejects VS+GS without FS");
+                var adjacent = requestNode.DeepClone();
+                adjacent["program"]["graphicsState"]["topology"] = "TrianglesAdjacency";
+                Throws("UNSUPPORTED_PROGRAM", () => DirectShaderCompiler.Compile(Encoding.UTF8.GetBytes(adjacent.ToJsonString())),
+                    "GS adjacency remains unsupported");
+                var oldVersion = requestNode.DeepClone();
+                oldVersion["schema"] = DirectShaderCompiler.RequestSchema;
+                Throws("UNSUPPORTED_PROGRAM", () => DirectShaderCompiler.Compile(Encoding.UTF8.GetBytes(oldVersion.ToJsonString())),
+                    "v1 does not silently accept geometry");
+                var passthrough = requestNode.DeepClone();
+                byte[] pt = GeometryGuest(); pt[3] |= 1;
+                passthrough["program"]["stages"][2]["code"] = Convert.ToBase64String(pt);
+                Throws("UNSUPPORTED_PROGRAM", () => DirectShaderCompiler.Compile(Encoding.UTF8.GetBytes(passthrough.ToJsonString())),
+                    "GS passthrough remains unsupported");
+                var viewport = requestNode.DeepClone();
+                viewport["program"]["stages"][2]["code"] = Convert.ToBase64String(GeometryGuest(viewportIndex: true));
+                Throws("UNSUPPORTED_PROGRAM", () => DirectShaderCompiler.Compile(Encoding.UTF8.GetBytes(viewport.ToJsonString())),
+                    "GS viewport index remains unsupported");
+            }
+            try
+            {
+                using JsonDocument translated = ParseResult(DirectShaderCompiler.Compile(enabledRequest));
+                JsonElement stages = translated.RootElement.GetProperty("content").GetProperty("stages");
+                Check(stages.GetArrayLength() == 3 && stages[0].GetProperty("stage").GetString() == "vs" &&
+                    stages[1].GetProperty("stage").GetString() == "gs" && stages[2].GetProperty("stage").GetString() == "fs",
+                    "GS compilation uses VS->GS->FS execution order");
+                if (stages.GetArrayLength() == 3)
+                {
+                    uint[] words = MemoryMarshal.Cast<byte, uint>(stages[1].GetProperty("spirv").GetBytesFromBase64()).ToArray();
+                    var instructions = new List<uint[]>();
+                    for (int i = 5; i < words.Length;)
+                    {
+                        int count = (int)(words[i] >> 16);
+                        if (count == 0 || i + count > words.Length) throw new InvalidDataException("invalid SPIR-V instruction");
+                        instructions.Add(words[i..(i + count)]); i += count;
+                    }
+                    Check(instructions.Any(x => (x[0] & 0xffff) == 15 && x[1] == 3), "GS SPIR-V entry execution model Geometry");
+                    bool Mode(uint mode, uint? value = null) => instructions.Any(x => (x[0] & 0xffff) == 16 && x.Length >= 3 &&
+                        x[2] == mode && (!value.HasValue || x.Length >= 4 && x[3] == value.Value));
+                    Check(Mode(22) && Mode(29) && Mode(26, 3) && Mode(0, 1),
+                        "GS topology is triangles -> triangle strip, max 3 vertices, one invocation");
+                    Check(instructions.Count(x => (x[0] & 0xffff) == 218) == 3 && instructions.Count(x => (x[0] & 0xffff) == 219) == 1,
+                        "GS emits three vertices and ends one primitive");
+                    var locations = instructions.Where(x => (x[0] & 0xffff) == 71 && x.Length >= 4 && x[2] == 30)
+                        .ToDictionary(x => x[1], x => x[3]);
+                    var variables = instructions.Where(x => (x[0] & 0xffff) == 59 && x.Length >= 4).ToArray();
+                    Check(variables.Any(x => x[3] == 1 && locations.TryGetValue(x[2], out uint loc) && loc == 0) &&
+                        variables.Any(x => x[3] == 3 && locations.TryGetValue(x[2], out uint loc) && loc == 0),
+                        "GS consumes and produces location 0");
+                    var vsOut = ShaderInterface(stages[0], 3);
+                    var gsIn = ShaderInterface(stages[1], 1, stripVertexArray: true);
+                    var gsOut = ShaderInterface(stages[1], 3);
+                    var fsIn = ShaderInterface(stages[2], 1);
+                    Check(gsOut.Count == 1 && gsOut.ContainsKey(0),
+                        "native GS output follows actual FS inputs instead of all 32 independent-stage varyings");
+                    Check(vsOut.TryGetValue(0, out string vsType) && gsIn.TryGetValue(0, out string gsInType) && vsType == gsInType,
+                        "VS output matches GS input location 0 and type");
+                    Check(gsOut.TryGetValue(0, out string gsOutType) && fsIn.TryGetValue(0, out string fsType) && gsOutType == fsType,
+                        "GS output matches FS input location 0 and type");
+                    if (args.Length == 2 && args[0] == "--emit-gs")
+                    {
+                        Directory.CreateDirectory(args[1]);
+                        foreach (JsonElement s in stages.EnumerateArray())
+                            File.WriteAllBytes(Path.Combine(args[1], s.GetProperty("stage").GetString() + ".spv"),
+                                s.GetProperty("spirv").GetBytesFromBase64());
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine("GS compile failed: " + ex);
+                Check(false, "GS real compiler translation succeeds");
+            }
+            // VS 与 GS 都没有显式写 location 0，而各自的下游阶段要读它。
+            // 只有正确 SetNextStage，翻译器才会在两个生产者补出接口与缺省输出。
+            try
+            {
+                var missingOutputs = requestNode.DeepClone();
+                missingOutputs["program"]["stages"][0]["code"] = Convert.ToBase64String(Guest(false, Array.Empty<ulong>()));
+                missingOutputs["program"]["stages"][2]["code"] = Convert.ToBase64String(GeometryGuest(omitVaryingOutput: true));
+                using JsonDocument linked = ParseResult(DirectShaderCompiler.Compile(Encoding.UTF8.GetBytes(missingOutputs.ToJsonString())));
+                JsonElement linkedStages = linked.RootElement.GetProperty("content").GetProperty("stages");
+                var vsDefaults = ShaderInterface(linkedStages[0], 3);
+                var gsNeeds = ShaderInterface(linkedStages[1], 1, stripVertexArray: true);
+                var gsDefaults = ShaderInterface(linkedStages[1], 3);
+                var fsNeeds = ShaderInterface(linkedStages[2], 1);
+                Check(vsDefaults.TryGetValue(0, out string v) && gsNeeds.TryGetValue(0, out string gi) && v == gi,
+                    "GS input causes unwritten VS location 0 interface to be synthesized");
+                Check(gsDefaults.TryGetValue(0, out string g) && fsNeeds.TryGetValue(0, out string f) && g == f,
+                    "FS input causes unwritten GS location 0 interface to be synthesized");
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine("GS linked defaults failed: " + ex);
+                Check(false, "GS linked default interface synthesis succeeds");
+            }
+            // 每个阶段都独立读取客体 c[0]。共享分配器必须在同一个 set 内分配不同 binding，
+            // 反射记录与各自实际模块的 DescriptorSet/Binding 必须一致。
+            try
+            {
+                var resources = requestNode.DeepClone();
+                var slots = resources["program"]["stages"];
+                slots[0]["code"] = Convert.ToBase64String(Guest(false, new[] { Ldc(0, 0), Ast(0) }));
+                slots[1]["code"] = Convert.ToBase64String(FsUniform());
+                slots[2]["code"] = Convert.ToBase64String(GeometryGuest(uniform: true));
+                for (int i = 0; i < 3; i++) slots[i]["constantBufferUse"] = 1;
+                using JsonDocument compiled = ParseResult(DirectShaderCompiler.Compile(Encoding.UTF8.GetBytes(resources.ToJsonString())));
+                JsonElement content = compiled.RootElement.GetProperty("content");
+                JsonElement[] stageResults = content.GetProperty("stages").EnumerateArray().ToArray();
+                JsonElement[] uniformBindings = content.GetProperty("bindings").EnumerateArray()
+                    .Where(b => b.GetProperty("kind").GetString() == "uniform").ToArray();
+                Check(uniformBindings.Length == 3 && uniformBindings.Select(b => b.GetProperty("binding").GetUInt32()).Distinct().Count() == 3,
+                    "VS, GS and FS uniforms have distinct bindings");
+                foreach (string name in new[] { "vs", "gs", "fs" })
+                {
+                    JsonElement binding = uniformBindings.Single(b => b.GetProperty("stage").GetString() == name);
+                    JsonElement stage = stageResults.Single(s => s.GetProperty("stage").GetString() == name);
+                    uint set = binding.GetProperty("set").GetUInt32(), index = binding.GetProperty("binding").GetUInt32();
+                    Check(set == 0 && binding.GetProperty("slot").GetInt32() == 0 && ShaderBindings(stage).Contains((set, index)),
+                        name + " uniform reflection matches its actual SPIR-V set/binding and guest slot");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine("GS resource fixture failed: " + ex);
+                Check(false, "GS per-stage uniform compilation succeeds");
+            }
+
+            // 输入图元由请求事实决定；几何头仍固定输出三角带。
+            foreach (var (topology, mode, vertices) in new[] { ("Points", 19u, 1), ("Lines", 20u, 2), ("Triangles", 22u, 3) })
+            {
+                try
+                {
+                    var variant = requestNode.DeepClone();
+                    variant["program"]["graphicsState"]["topology"] = topology;
+                    using JsonDocument compiled = ParseResult(DirectShaderCompiler.Compile(Encoding.UTF8.GetBytes(variant.ToJsonString())));
+                    JsonElement stage = compiled.RootElement.GetProperty("content").GetProperty("stages")[1];
+                    uint[] spv = MemoryMarshal.Cast<byte, uint>(stage.GetProperty("spirv").GetBytesFromBase64()).ToArray();
+                    bool found = false;
+                    for (int i = 5; i < spv.Length; i += (int)(spv[i] >> 16))
+                        if ((spv[i] & 0xffff) == 16 && (spv[i] >> 16) >= 3 && spv[i + 2] == mode) found = true;
+                    Check(found && GeometryInputArrayLength(stage, 0) == vertices &&
+                        stage.GetProperty("info").GetProperty("geometryVerticesPerPrimitive").GetInt32() == 3,
+                        "GS " + topology + " input matches SPIR-V mode and input array size; output primitive size is 3");
+                    if (args.Length == 2 && args[0] == "--emit-gs")
+                        File.WriteAllBytes(Path.Combine(args[1], "gs-" + topology + ".spv"), stage.GetProperty("spirv").GetBytesFromBase64());
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine("GS " + topology + " fixture failed: " + ex);
+                    Check(false, "GS " + topology + " topology compilation succeeds");
+                }
+            }
+        }
         byte[] result = DirectShaderCompiler.Compile(graphicsRequest);
         using (JsonDocument doc = ParseResult(result))
         {
@@ -718,6 +1174,41 @@ internal static unsafe class Program
             Check(root.GetProperty("contentHash").GetString().StartsWith("sha256-"), "content hash");
         }
 
+        // 2b) 图形阶段的 c0Reads：回放按它决定间接绘制要不要把 GPU 侧的 base instance 拷进 c0 + 0x644。
+        //     真实翻译器（DrawParametersReplace）：cbdp 真时 VS 对 c0 + 0x644 / 0x640 的立即读换成内建，读集里不再有；
+        //     cbdp 假时照实列出；寄存器下标读 c0 分析不出 → null（未知，回放照旧拷）。
+        {
+            JsonElement[] C0Stages(ulong[] vsOps, bool cbdp, out string error)
+            {
+                error = null;
+                var node = System.Text.Json.Nodes.JsonNode.Parse(graphicsRequest);
+                node["program"]["stages"][0]["code"] = Convert.ToBase64String(Guest(false, vsOps));
+                node["program"]["stages"][0]["constantBufferUse"] = 1;
+                node["program"]["graphicsState"]["hasConstantBufferDrawParameters"] = cbdp;
+                try
+                {
+                    using JsonDocument d = ParseResult(DirectShaderCompiler.Compile(Encoding.UTF8.GetBytes(node.ToJsonString())));
+                    return d.RootElement.GetProperty("content").GetProperty("stages").EnumerateArray().Select(x => x.Clone()).ToArray();
+                }
+                catch (Exception ex) { error = ex.Message; return null; }
+            }
+            JsonValueKind Kind(JsonElement stage) => stage.TryGetProperty("c0Reads", out var r) ? r.ValueKind : JsonValueKind.Undefined;
+            bool Covers(JsonElement stage, int offset) => stage.TryGetProperty("c0Reads", out var reads) && reads.ValueKind == JsonValueKind.Array &&
+                reads.EnumerateArray().Any(r => r[0].GetInt32() < offset + 4 && r[0].GetInt32() + r[1].GetInt32() > offset);
+            string Show(JsonElement[] st, string err) => err ?? string.Join(" / ", st.Select(x => x.GetProperty("stage").GetString() + "=" +
+                (x.TryGetProperty("c0Reads", out var r) ? r.GetRawText() : "(missing)")));
+            JsonElement[] binstOff = C0Stages(new[] { Ldc(0, 0x644), Ldc(1, 0x610), FaddR(0, 0, 1), Ast(0) }, false, out string e1);
+            Check(binstOff != null && Covers(binstOff[0], 0x644) && Covers(binstOff[0], 0x610),
+                "cbdp false: VS c0Reads lists the base-instance word 0x644 and 0x610: " + Show(binstOff, e1));
+            JsonElement[] binstOn = C0Stages(new[] { Ldc(0, 0x644), Ldc(1, 0x610), FaddR(0, 0, 1), Ast(0) }, true, out string e2);
+            Check(binstOn != null && Kind(binstOn[0]) == JsonValueKind.Array && !Covers(binstOn[0], 0x644) && Covers(binstOn[0], 0x610),
+                "cbdp true: VS base-instance read becomes the builtin, c0Reads keeps 0x610 and drops 0x644: " + Show(binstOn, e2));
+            JsonElement[] dynamic = C0Stages(new[] { Ald(0, 0, 1), Ldc(0, 0x644, 0, 1), Ast(0) }, true, out string e3);   // 下标来自顶点属性：翻译器折不成常量
+            Check(dynamic != null && Kind(dynamic[0]) == JsonValueKind.Null,
+                "register-indexed c0 read is unknown (null), never an empty read set: " + Show(dynamic, e3));
+            Check(binstOn != null && binstOn.All(x => x.TryGetProperty("c0Reads", out _)), "every graphics stage carries c0Reads");
+        }
+
         // 3) 同快照逐字节一致；transport 不进入内容键。
         byte[] again = DirectShaderCompiler.Compile(graphicsRequest);
         using (JsonDocument a = ParseResult(result)) using (JsonDocument b = ParseResult(again))
@@ -737,6 +1228,30 @@ internal static unsafe class Program
                 "attachment variant changes content hash");
 
         // 5) 合成 CS。
+        // 只有顶点阶段的图形程序（只写深度的绘制）：结果里一个阶段，就是 vs，带 SPIR-V
+        using (JsonDocument doc = ParseResult(DirectShaderCompiler.Compile(
+                   RequestJson(profile, "graphics", 1, 1, "req-vs-only", Guest(false, new[] { Ald4(0), Ast4Pos(0) })))))
+        {
+            JsonElement content = doc.RootElement.GetProperty("content");
+            Check(content.GetProperty("kind").GetString() == "graphics", "vs-only kind is graphics");
+            JsonElement stages = content.GetProperty("stages");
+            Check(stages.GetArrayLength() == 1 && stages[0].GetProperty("stage").GetString() == "vs", "vs-only: exactly one stage, vs");
+        }
+        // 按位读（SULD.D）浮点贴图的存储图像：设备支持无格式读时声明 Unknown + uint（回放按贴图字节数绑 uint 视图），
+        //   不支持时保留按读大小的 R32ui（回放按声明格式能建就建、建不了报名跳过）。读的是 1x1 RG32F 曝光那一类（空轨 2nd update 核同形）。
+        {
+            const string rawFact = "[{\"stage\":\"cs\",\"handle\":74,\"cbufSlot\":-1,\"samplerType\":\"2d\",\"format\":\"R32G32Float\",\"isBuffer\":false,\"normalized\":false,\"separate\":false,\"arrayLength\":1}]";
+            string on = Encoding.UTF8.GetString(profile), off = on.Replace("\"supportsImageLoadFormatted\":true", "\"supportsImageLoadFormatted\":false");
+            Check(on != off, "profile carries supportsImageLoadFormatted");
+            foreach (bool formatless in new[] { true, false })
+            {
+                byte[] req = RequestJson(Encoding.UTF8.GetBytes(formatless ? on : off), "compute", 2, 1, "suld-raw", cs: ComputeRawImageLoadGuest(), csCbUse: 1, textureFacts: rawFact);
+                using JsonDocument doc = ParseResult(DirectShaderCompiler.Compile(req));
+                (uint format, bool uintSampled, int images) = StorageImageDecl(doc.RootElement.GetProperty("content").GetProperty("stages")[0]);
+                Check(images == 1 && uintSampled && format == (formatless ? 0u : 33u),
+                    $"raw SULD.D of an RG32F image: {(formatless ? "Unknown" : "R32ui")} with uint sampled type (got format {format}, uint {uintSampled}, images {images})");
+            }
+        }
         byte[] computeRequest = RequestJson(profile, "compute", 2, 1, "req-compute", cs: cs);
         using (JsonDocument doc = ParseResult(DirectShaderCompiler.Compile(computeRequest)))
         {
@@ -1122,7 +1637,8 @@ internal static unsafe class Program
                 + "{\"stage\":\"fs\",\"handle\":1,\"cbufSlot\":0,\"samplerType\":\"2d-array\",\"format\":\"R16G16B16A16Float\",\"isBuffer\":false,\"normalized\":false,\"separate\":false,\"arrayLength\":8},"
                 + "{\"stage\":\"fs\",\"handle\":1,\"cbufSlot\":4,\"samplerType\":\"cube-shadow\",\"format\":\"R32Float\",\"isBuffer\":false,\"normalized\":false,\"separate\":false,\"arrayLength\":6},"
                 + "{\"stage\":\"fs\",\"handle\":2,\"cbufSlot\":-1,\"samplerType\":\"buffer\",\"format\":\"R32Uint\",\"isBuffer\":true,\"normalized\":false,\"separate\":false,\"arrayLength\":1},"
-                + "{\"stage\":\"fs\",\"handle\":3,\"cbufSlot\":-1,\"samplerType\":\"3d\",\"format\":\"R11G11B10Float\",\"isBuffer\":false,\"normalized\":false,\"separate\":true,\"arrayLength\":1}"
+                + "{\"stage\":\"fs\",\"handle\":3,\"cbufSlot\":-1,\"samplerType\":\"3d\",\"format\":\"R11G11B10Float\",\"isBuffer\":false,\"normalized\":false,\"separate\":true,\"arrayLength\":1},"
+                + "{\"stage\":\"fs\",\"handle\":72,\"cbufSlot\":-1,\"samplerType\":\"2d\",\"format\":\"R8G8B8A8Unorm\",\"isBuffer\":false,\"normalized\":false,\"separate\":false,\"arrayLength\":1}"
                 + "]";
             byte[] matrixRequest = RequestJson(profile, "graphics", 1, 1, "tex-matrix", vs, fs, textureFacts: facts,
                 textureBufferLengths: "{\"0\":8}");
@@ -1149,13 +1665,17 @@ internal static unsafe class Program
             Check(matrixAccessor.QueryTextureFormat(2, -1) == TextureFormat.R32Uint, "integer buffer format");
             Check(matrixAccessor.QuerySamplerType(3, -1) == SamplerType.Texture3D, "3d sampler type");
 
-            // cbuf 查询没有精确事实时，只能回落到同句柄的直接事实（NVN c2 句柄→组合槽）；
-            // 没有同句柄直接事实、或未列出的 handle 仍是缺事实；事实不跨阶段。
-            Check(matrixAccessor.QuerySamplerType(0, 0) == SamplerType.Texture2D &&
-                  matrixAccessor.QueryTextureCoordNormalized(0, 0),
-                "cbuf query falls back to the same handle's direct fact");
-            Check(matrixAccessor.HasDirectTextureFact(0) && !matrixAccessor.HasDirectTextureFact(1),
+            // 经 c2 句柄表的查询没有精确事实时，只能回落到同句柄的直接事实（NVN c2 句柄→组合槽）；
+            // 别的常量缓冲（游戏 UBO、c0）同一字偏移不借（#999）；没有同句柄直接事实、或未列出的 handle 仍是缺事实；事实不跨阶段。
+            Check(matrixAccessor.QuerySamplerType(0, 2) == SamplerType.Texture2D &&
+                  matrixAccessor.QueryTextureCoordNormalized(0, 2),
+                "c2 query falls back to the same handle's direct fact");
+            Throws("MISSING_FACT", () => matrixAccessor.QuerySamplerType(0, 4), "a user-UBO handle does not borrow the combined slot's fact");
+            Throws("MISSING_FACT", () => matrixAccessor.QuerySamplerType(0, 3), "c3 (NVN UBO 0) does not borrow either");
+            Check(matrixAccessor.HasDirectTextureFact(0, 2) && !matrixAccessor.HasDirectTextureFact(1, 2),
                 "only directly bound handles have a fallback");
+            Check(!matrixAccessor.HasDirectTextureFact(0, 4) && !matrixAccessor.HasDirectTextureFact(0, 0),
+                "the fallback is only for the c2 handle table");
             Throws("MISSING_FACT", () => matrixAccessor.QuerySamplerType(9, 0), "cbuf handle without a direct fact is a missing fact");
             Throws("MISSING_FACT", () => matrixAccessor.QueryTextureFormat(9, -1), "unlisted handle is a missing fact");
             var vsMatrix = new DirectGpuAccessor(matrixProfile, program, program.StageOf("vs"), 1,
@@ -1174,10 +1694,10 @@ internal static unsafe class Program
             Check(resolvePoolSlots != null, "production pool-slot resolver exists");
             var cbufAllocator = new DirectAllocator(matrixProfile);
             cbufAllocator.Bindings.Add(new DirectBinding("fs", "texture", "test", 2, 0, 1));
-            ShaderProgram CbufProgram(int handleIndex) => new(
+            ShaderProgram CbufProgram(int handleIndex, int cbufSlot = 2) => new(
                 new ShaderProgramInfo(Array.Empty<BufferDescriptor>(), Array.Empty<BufferDescriptor>(),
                     new[] { new TextureDescriptor(2, 0, SamplerType.Texture2D, TextureFormat.R8G8B8A8Unorm,
-                        cbufSlot: 4, handleIndex: handleIndex, arrayLength: 1, separate: false, TextureUsageFlags.None) },
+                        cbufSlot: cbufSlot, handleIndex: handleIndex, arrayLength: 1, separate: false, TextureUsageFlags.None) },
                     Array.Empty<TextureDescriptor>(), ShaderStage.Fragment, 0, 0, 0,
                     usesFragCoord: false, usesInstanceId: false, usesDrawParameters: false, usesRtLayer: false,
                     clipDistancesWritten: 0, fragmentOutputMap: 0),
@@ -1197,6 +1717,85 @@ internal static unsafe class Program
                 cbufRejected = error.InnerException is DirectCompileException compile && compile.Code == "UNSUPPORTED_PROGRAM";
             }
             Check(cbufRejected, "cbuf handle without a direct fact is rejected");
+            // 游戏 UBO（c4）里的同一字偏移：不是组合槽，有同句柄直接事实也拒（#999 错绑）
+            var uboAllocator = new DirectAllocator(matrixProfile);
+            uboAllocator.Bindings.Add(new DirectBinding("fs", "texture", "test", 2, 0, 1));
+            bool uboRejected = false;
+            try { resolvePoolSlots.Invoke(null, new object[] { new List<(DirectStage stage, ShaderProgram shader, DirectGpuAccessor accessor)>
+                { (program.StageOf("fs"), CbufProgram(0, 4), matrixAccessor) }, uboAllocator }); }
+            catch (System.Reflection.TargetInvocationException error)
+            {
+                uboRejected = error.InnerException is DirectCompileException compile && compile.Code == "UNSUPPORTED_PROGRAM" && compile.Message.Contains("cbuf slot 4");
+            }
+            Check(!uboRejected && uboAllocator.Bindings.Last().Slot == -1 && uboAllocator.Bindings.Last().UboSlot == 1 &&
+                  uboAllocator.Bindings.Last().UboOffset == 0,
+                "a c4 handle is not bound as the combined slot with the same handle index (it is uboSlot 1 / uboOffset 0)");
+            // 游戏 UBO 句柄只接单个、非分离的采样贴图；其余形态如实报未接，不给 uboSlot
+            string UboShape(string kind, string source, int count, int cbufSlot, int handleIndex, int arrayLength, bool separate)
+            {
+                var allocator = new DirectAllocator(matrixProfile);
+                var b = new DirectBinding("fs", kind, source, kind == "image" ? 3 : 2, 0, count);
+                allocator.Bindings.Add(b);
+                var descriptor = new TextureDescriptor(kind == "image" ? 3 : 2, 0, source == "buffer-texture" ? SamplerType.TextureBuffer : SamplerType.Texture2D,
+                    TextureFormat.R8G8B8A8Unorm, cbufSlot: cbufSlot, handleIndex: handleIndex, arrayLength: arrayLength, separate: separate, TextureUsageFlags.None);
+                ShaderProgram shaderProgram = new(
+                    new ShaderProgramInfo(Array.Empty<BufferDescriptor>(), Array.Empty<BufferDescriptor>(),
+                        kind == "image" ? Array.Empty<TextureDescriptor>() : new[] { descriptor },
+                        kind == "image" ? new[] { descriptor } : Array.Empty<TextureDescriptor>(), ShaderStage.Fragment, 0, 0, 0,
+                        usesFragCoord: false, usesInstanceId: false, usesDrawParameters: false, usesRtLayer: false,
+                        clipDistancesWritten: 0, fragmentOutputMap: 0),
+                    Ryujinx.Graphics.Shader.Translation.TargetLanguage.Spirv, Array.Empty<byte>());
+                try
+                {
+                    resolvePoolSlots.Invoke(null, new object[] { new List<(DirectStage stage, ShaderProgram shader, DirectGpuAccessor accessor)>
+                        { (program.StageOf("fs"), shaderProgram, matrixAccessor) }, allocator });
+                    return "bound " + b.UboSlot + "/" + b.UboOffset + "/" + b.Slot;
+                }
+                catch (System.Reflection.TargetInvocationException error) when (error.InnerException is DirectCompileException compile)
+                {
+                    return compile.Code + " " + compile.Message;
+                }
+            }
+            Check(UboShape("texture", "texture", 1, 18, 0x3FFF, 1, false) == "bound 15/65532/-1", "c18 last word of a 64 KiB UBO is bound");
+            foreach (var (what, shape, outcome) in new[] {
+                ("image", "image", UboShape("image", "image", 1, 4, 256, 1, false)),
+                ("buffer texture", "buffer texture", UboShape("texture", "buffer-texture", 1, 4, 256, 1, false)),
+                ("separate", "separate", UboShape("texture", "texture", 1, 4, 256, 1, true)),
+                ("array", "array", UboShape("texture", "texture", 4, 4, 0, 4, false)),
+                ("offset past 64 KiB", "offset outside 64 KiB", UboShape("texture", "texture", 1, 4, 0x4000, 1, false)) })
+                Check(outcome == "UNSUPPORTED_PROGRAM fs: texture handle from cbuf slot 4 is not implemented (" + shape + ")",
+                    "user-UBO " + what + " handle stays unsupported: " + outcome);
+            // 图像句柄从 c2 图像句柄表读（字 72 + 2k，空轨 2nd 9000 计算「cbuf slot 2」）：有同字直接事实（宿主按图像槽出）→ 绑同号图像槽；
+            //   没有事实的槽、表外的字、数组照旧报未接
+            string c2Img = UboShape("image", "image", 1, 2, 72, 1, false);
+            Check(c2Img == "bound -1/-1/72", "c2 image-table word 72 with its direct fact binds image handle 72: " + c2Img);
+            foreach (var (what, handle, count, len) in new[] { ("without a fact", 74, 1, 1), ("outside the image table", 88, 1, 1), ("as an array", 72, 4, 4) })
+            {
+                string r = UboShape("image", "image", count, 2, handle, len, false);
+                Check(r == "UNSUPPORTED_PROGRAM fs: texture handle from cbuf slot 2 is not implemented", "c2 image word " + what + " stays unsupported: " + r);
+            }
+            string c19 = UboShape("texture", "texture", 1, 19, 256, 1, false);
+            Check(c19 == "UNSUPPORTED_PROGRAM fs: texture handle from cbuf slot 19 is not implemented", "cbuf 19 is outside the user UBO range: " + c19);
+            // Facts alone do not implement separate binding; the production resolver must still refuse it.
+            var separateAllocator = new DirectAllocator(matrixProfile);
+            separateAllocator.Bindings.Add(new DirectBinding("fs", "texture", "test", 2, 0, 1));
+            ShaderProgram separateProgram = new(
+                new ShaderProgramInfo(Array.Empty<BufferDescriptor>(), Array.Empty<BufferDescriptor>(),
+                    new[] { new TextureDescriptor(2, 0, SamplerType.Texture2D, TextureFormat.R8G8B8A8Unorm,
+                        cbufSlot: 2, handleIndex: 0, arrayLength: 1, separate: true, TextureUsageFlags.None) },
+                    Array.Empty<TextureDescriptor>(), ShaderStage.Fragment, 0, 0, 0,
+                    usesFragCoord: false, usesInstanceId: false, usesDrawParameters: false, usesRtLayer: false,
+                    clipDistancesWritten: 0, fragmentOutputMap: 0),
+                Ryujinx.Graphics.Shader.Translation.TargetLanguage.Spirv, Array.Empty<byte>());
+            var separateTranslated = new List<(DirectStage stage, ShaderProgram shader, DirectGpuAccessor accessor)>
+                { (program.StageOf("fs"), separateProgram, matrixAccessor) };
+            bool separateRejected = false;
+            try { resolvePoolSlots.Invoke(null, new object[] { separateTranslated, separateAllocator }); }
+            catch (System.Reflection.TargetInvocationException error)
+            {
+                separateRejected = error.InnerException is DirectCompileException compile && compile.Code == "UNSUPPORTED_PROGRAM" && compile.Message.Contains("separate sampler");
+            }
+            Check(separateRejected, "separate binding stays unsupported when its texture fact exists");
 
             // 解析期拒绝：未知格式、未知 sampler 分量、越界 arrayLength。
             Throws("MISSING_FACT", () => DirectShaderCompiler.Compile(RequestJson(profile, "graphics", 1, 1, "x", vs, fs,
@@ -1208,6 +1807,114 @@ internal static unsafe class Program
             Throws(null, () => DirectShaderCompiler.Compile(RequestJson(profile, "graphics", 1, 1, "x", vs, fs,
                 textureFacts: "[{\"stage\":\"fs\",\"handle\":0,\"cbufSlot\":-1,\"samplerType\":\"2d\",\"format\":\"R8G8B8A8Unorm\",\"isBuffer\":false,\"normalized\":true,\"separate\":false,\"arrayLength\":0}]")),
                 "zero array length rejected");
+        }
+
+        // NVN c2 separate texture/sampler handle facts: the OR operands may arrive reversed.
+        {
+            using JsonDocument profileDoc = JsonDocument.Parse(profile);
+            DirectProfile p = DirectProfile.Parse(profileDoc.RootElement, "profile");
+            string facts = "[{\"stage\":\"vs\",\"handle\":90,\"cbufSlot\":2,\"samplerType\":\"cube\",\"format\":\"Unknown\",\"isBuffer\":false,\"normalized\":true,\"separate\":true,\"arrayLength\":1}," +
+                "{\"stage\":\"fs\",\"handle\":90,\"cbufSlot\":2,\"samplerType\":\"2d\",\"format\":\"Unknown\",\"isBuffer\":false,\"normalized\":false,\"separate\":true,\"arrayLength\":1}]";
+            using JsonDocument d = JsonDocument.Parse(RequestJson(profile, "graphics", 1, 1, "sep", vs, fs, textureFacts: facts));
+            DirectProgram prog = DirectProgram.Parse(d.RootElement.GetProperty("program"), "program", p);
+            var va = new DirectGpuAccessor(p, prog, prog.StageOf("vs"), 1, new DirectAllocator(p), new List<DirectQuery>());
+            var fa = new DirectGpuAccessor(p, prog, prog.StageOf("fs"), 5, new DirectAllocator(p), new List<DirectQuery>());
+            int slots = TextureHandle.PackSlots(2, 2);
+            int forward = TextureHandle.PackOffsets(90, 346, TextureHandleType.SeparateSamplerHandle);
+            int reversed = TextureHandle.PackOffsets(346, 90, TextureHandleType.SeparateSamplerHandle);
+            try {
+                Check(va.QuerySamplerType(forward, slots) == SamplerType.TextureCube && va.QueryTextureCoordNormalized(reversed, slots), "separate facts VS forward/reversed use its texture view");
+                Check(fa.QuerySamplerType(reversed, slots) == SamplerType.Texture2D && !fa.QueryTextureCoordNormalized(forward, slots), "separate facts FS forward/reversed use its texture view");
+            } catch (DirectCompileException e) { Check(false, "separate facts query should resolve: " + e.Code + " " + e.Message); }
+            Throws("MISSING_FACT", () => fa.QuerySamplerType(forward, TextureHandle.PackSlots(3, 2)), "separate facts cannot use another cbuf");
+            Throws("MISSING_FACT", () => fa.QuerySamplerType(TextureHandle.PackOffsets(90, 92, TextureHandleType.SeparateSamplerHandle), slots), "separate facts reject ambiguous texture operands");
+            Throws("MISSING_FACT", () => fa.QuerySamplerType(TextureHandle.PackOffsets(92, 346, TextureHandleType.SeparateSamplerHandle), slots), "separate facts do not borrow another texture slot");
+            Throws("MISSING_FACT", () => fa.QuerySamplerType(TextureHandle.PackOffsets(90, 602, TextureHandleType.SeparateSamplerHandle), slots), "separate facts reject sampler outside c2 table");
+            Throws("MISSING_FACT", () => fa.QuerySamplerType(TextureHandle.PackOffsets(91, 346, TextureHandleType.SeparateSamplerHandle), slots), "separate facts reject unaligned texture word");
+            Throws("MISSING_FACT", () => fa.QuerySamplerType(TextureHandle.PackOffsets(90, 346, TextureHandleType.SeparateSamplerId), slots), "separate facts reject unsupported handle kind");
+            using JsonDocument combinedDoc = JsonDocument.Parse(RequestJson(profile, "graphics", 1, 1, "wrong-kind", vs, fs,
+                textureFacts: facts.Replace("\"separate\":true", "\"separate\":false")));
+            DirectProgram combinedProgram = DirectProgram.Parse(combinedDoc.RootElement.GetProperty("program"), "program", p);
+            var combined = new DirectGpuAccessor(p, combinedProgram, combinedProgram.StageOf("fs"), 5, new DirectAllocator(p), new List<DirectQuery>());
+            Throws("MISSING_FACT", () => combined.QuerySamplerType(forward, slots), "separate query cannot borrow a combined texture fact");
+        }
+
+        // Separate NVN c2 texture/sampler words, translated by the real Maxwell compiler.
+        // Both operand orders produce the same pair of reflected sources.
+        {
+            const string separateFact = "[{\"stage\":\"fs\",\"handle\":90,\"cbufSlot\":2,\"samplerType\":\"2d\",\"format\":\"Unknown\",\"isBuffer\":false,\"normalized\":true,\"separate\":true,\"arrayLength\":1}]";
+            foreach (bool reverse in new[] { false, true })
+            {
+                byte[] shader = Guest(true, new[] { Fadd32i(2, 0.5f), Fadd32i(3, 0.5f),
+                    Ldc(6, 0x168, 2), Ldc(7, 0x568, 2), LopOr(4, reverse ? 7 : 6, reverse ? 6 : 7), TexBindless2D(0, 2, 4) });
+                try {
+                    using JsonDocument separateResult = ParseResult(DirectShaderCompiler.Compile(RequestJson(profile, "graphics", 1, 1, "separate-c2", vs, shader, textureFacts: separateFact, fsCbUse: 4)));
+                    var root = separateResult.RootElement;
+                    var binding = root.GetProperty("content").GetProperty("bindings").EnumerateArray()
+                        .Single(b => b.GetProperty("kind").GetString() == "texture");
+                    Check(root.GetProperty("schema").GetString() == "s2a-direct-program-v2" &&
+                          binding.GetProperty("slot").GetInt32() == 90 && binding.GetProperty("samp_slot").GetInt32() == 0,
+                          "real separate c2 shader emits v2 texture word 90 and sampler slot 0");
+                } catch (DirectCompileException error) {
+                    Check(false, "real separate c2 shader " + (reverse ? "reversed" : "forward") + " must compile: " + error.Code + " " + error.Message);
+                }
+            }
+        }
+
+        // 立即句柄直接读 c2 分离贴图表（空轨 2nd 9000：fs「QuerySamplerType has no source (handle=90,cbufSlot=-1)」）：
+        //   TEX 的立即句柄 90 = c2 字节 0x168 = 分离贴图槽 0。宿主照真机只按 (90, cbufSlot 2, separate) 给事实；
+        //   期望编出贴图绑定 slot 90、无 samp_slot（采样器取同字）。负控：只有非分离事实、相邻字、采样器表的字都不借。
+        {
+            string Fact(int handle, int cbufSlot, bool separate) => "{\"stage\":\"fs\",\"handle\":" + handle + ",\"cbufSlot\":" + cbufSlot +
+                ",\"samplerType\":\"2d\",\"format\":\"Unknown\",\"isBuffer\":false,\"normalized\":true,\"separate\":" + (separate ? "true" : "false") + ",\"arrayLength\":1}";
+            string Direct(int tid, string facts)
+            {
+                byte[] shader = Guest(true, new[] { Fadd32i(2, 0.5f), Fadd32i(3, 0.5f), Tex2D(0, 2, tid) });
+                try
+                {
+                    using JsonDocument r = ParseResult(DirectShaderCompiler.Compile(RequestJson(profile, "graphics", 1, 1, "direct-sep-" + tid, vs, shader, textureFacts: "[" + facts + "]")));
+                    string Field(JsonElement b, string name) => b.TryGetProperty(name, out JsonElement f) ? f.GetInt32().ToString() : "-";
+                    return string.Join(";", r.RootElement.GetProperty("content").GetProperty("bindings").EnumerateArray()
+                        .Where(b => b.GetProperty("kind").GetString() == "texture").Select(b => Field(b, "slot") + "/" + Field(b, "samp_slot")));
+                }
+                catch (DirectCompileException error) { return error.Code + " " + error.Message; }
+            }
+            string got = Direct(90, Fact(90, 2, true));
+            Check(got == "90/-", "direct handle 90 (c2 separate texture slot 0) uses the (90, cbuf 2, separate) fact and binds slot 90: " + got);
+            got = Direct(124, Fact(124, 2, true));
+            Check(got == "124/-", "direct handle 124 (separate slot 17) binds slot 124: " + got);
+            got = Direct(90, Fact(90, 2, false));
+            Check(got.StartsWith("MISSING_FACT", StringComparison.Ordinal) && got.Contains("handle=90,cbufSlot=-1"), "a non-separate (90, cbuf 2) fact is not borrowed: " + got);
+            got = Direct(92, Fact(90, 2, true));
+            Check(got.StartsWith("MISSING_FACT", StringComparison.Ordinal) && got.Contains("handle=92,cbufSlot=-1"), "another separate slot's fact is not borrowed: " + got);
+            got = Direct(346, Fact(346, 2, true));
+            Check(got.StartsWith("MISSING_FACT", StringComparison.Ordinal) && got.Contains("handle=346,cbufSlot=-1"), "a sampler-table word is not a separate texture: " + got);
+            got = Direct(8, Fact(8, -1, false));
+            Check(got == "8/-", "combined direct handle 8 is unchanged: " + got);
+        }
+
+        // 7b2) 同一对 c2 分离字在两条路径上各 OR 一次、汇合（phi）后才进 TEX.B（空轨 2nd compute_atmosphere_scatter 的形状）。
+        //      真实 decoder / translator：句柄要穿过 phi 按值比叶子才认得出（QueryBindlessPhiSeeThrough，同 iOS dmsh_xlate）。
+        //      循环里套分支，TEX 处的句柄 = phi(循环前算的 OR, phi(分支 A 的 OR, 分支 B 的 OR))：上游只比 phi 的直接输入（一个是 phi、一个是 OR）认不出。
+        //      R4 = R6|R7；L: TEX.B R0, R2, R4；@P0 BRA A；R4 = R6|R7；BRA J；A: R4 = R6|R7；J: @P0 BRA L。
+        {
+            const string separateFact = "[{\"stage\":\"fs\",\"handle\":90,\"cbufSlot\":2,\"samplerType\":\"2d\",\"format\":\"Unknown\",\"isBuffer\":false,\"normalized\":true,\"separate\":true,\"arrayLength\":1}]";
+            // 槽位：Guest 每 3 条指令前插一个调度字，第 oi 条在第 (oi/3)*4 + oi%3 + 1 个 8 字节；BRA 目标 = 自身地址 + 8 + Imm24
+            static int Slot(int oi) => oi / 3 * 4 + oi % 3 + 1;
+            static ulong Bra(int from, int to, int pred) => 0xE240000000000000UL | ((ulong)((Slot(to) - Slot(from) - 1) * 8 & 0xFFFFFF) << 20) | ((ulong)pred << 16) | 0xFUL;
+            const ulong IsetpNeP0R1 = 0x3660000000000000UL | (5UL << 49) | (7UL << 39) | (7UL << 16) | (1UL << 8) | 7UL;   // ISETP.NE.AND P0, PT, R1, 0, PT
+            byte[] shader = Guest(true, new[] {
+                Ald(1, 0, 1), IsetpNeP0R1, Ldc(6, 0x168, 2), Ldc(7, 0x568, 2), Fadd32i(2, 0.5f), Fadd32i(3, 0.5f),
+                LopOr(4, 6, 7), TexBindless2D(0, 2, 4), Bra(8, 11, 0), LopOr(4, 6, 7), Bra(10, 12, 7), LopOr(4, 6, 7), Bra(12, 7, 0) }, new[] { 1 });
+            try {
+                using JsonDocument phiResult = ParseResult(DirectShaderCompiler.Compile(RequestJson(profile, "graphics", 1, 1, "separate-c2-phi", vs, shader, textureFacts: separateFact, fsCbUse: 4)));
+                var binding = phiResult.RootElement.GetProperty("content").GetProperty("bindings").EnumerateArray()
+                    .Single(b => b.GetProperty("kind").GetString() == "texture");
+                Check(binding.GetProperty("slot").GetInt32() == 90 && binding.GetProperty("samp_slot").GetInt32() == 0,
+                      "phi-merged c2 separate handle resolves to texture word 90 and sampler slot 0");
+            } catch (DirectCompileException error) {
+                Check(false, "phi-merged c2 separate handle must compile: " + error.Code + " " + error.Message);
+            }
         }
 
         // 7c) guest UBO：c[0] 的 LDC 必须变成 set0 binding1 的 uniform binding、槽位 0，

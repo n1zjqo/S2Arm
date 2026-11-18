@@ -10,7 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 JOBS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(JOBS))
@@ -23,6 +23,42 @@ class NativeImport(unittest.TestCase):
                            capture_output=True, text=True, timeout=5)
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertEqual(p.stdout.strip(), 'imported')
+
+
+class HolderState(unittest.TestCase):
+    def setUp(self):
+        self.module = importlib.import_module('filelock')
+        from winproc import EPOCH_AS_FILETIME
+        self.epoch = EPOCH_AS_FILETIME
+        self.holder = dict(pid=123, host='this-host', startedAt=1000.0)
+
+    def test_remote_or_legacy_holder_is_unknown(self):
+        probe = Mock(return_value=str(self.epoch + 1000 * 10_000_000))
+        self.assertIsNone(self.module.holder_is_stale(self.holder, current_host='other-host', windows=True, pid_start=probe))
+        self.assertIsNone(self.module.holder_is_stale({"pid": 123, "startedAt": 1000.0}, current_host='this-host', windows=True, pid_start=probe))
+        probe.assert_not_called()
+
+    def test_invalid_start_time_is_unknown(self):
+        holder = dict(self.holder, startedAt=float('nan'))
+        probe = Mock()
+        self.assertIsNone(self.module.holder_is_stale(holder, current_host='this-host', windows=True, pid_start=probe))
+        probe.assert_not_called()
+
+    def test_exited_process_is_stale(self):
+        def missing(_pid):
+            raise ProcessLookupError(errno.ESRCH, 'process exited')
+        self.assertIs(self.module.holder_is_stale(self.holder, current_host='this-host', windows=True, pid_start=missing), True)
+
+    def test_reused_pid_is_stale_but_original_live_pid_is_not(self):
+        later = str(self.epoch + 1001 * 10_000_000)
+        earlier = str(self.epoch + 999 * 10_000_000)
+        self.assertIs(self.module.holder_is_stale(self.holder, current_host='this-host', windows=True, pid_start=lambda _pid: later), True)
+        self.assertIs(self.module.holder_is_stale(self.holder, current_host='this-host', windows=True, pid_start=lambda _pid: earlier), False)
+
+    def test_access_denied_is_unknown(self):
+        def denied(_pid):
+            raise PermissionError(errno.EACCES, 'access denied')
+        self.assertIsNone(self.module.holder_is_stale(self.holder, current_host='this-host', windows=True, pid_start=denied))
 
 
 class FileLocks(unittest.TestCase):
@@ -89,6 +125,7 @@ with open(sys.argv[2],'a') as f:
         p = self.holder()
         context = object.__new__(core.Context)
         context.library = directory
+        context.lock_wait = 0.3   # 排队上限调短：原先拿不到立刻报错，现在等到上限（剃刀 H1）
         with patch.object(context, 'check'), patch.object(context, 'require_library'):
             caught = None
             try:
@@ -139,3 +176,73 @@ with open(sys.argv[2],'a') as f:
 
 
 if __name__ == '__main__': unittest.main()
+
+
+class QueuedLibraryLock(unittest.TestCase):
+    """启动器剃刀 H1 / H2（11-11）：游戏库锁拿不到时排队（有上限），占锁者写进旁挂文件，等的一方说清在等谁。期望值手写"""
+    def setUp(self):
+        import core
+        self.core = core
+        self.tmp = tempfile.TemporaryDirectory(prefix='s2arm queued lock ')
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+        self.lock = self.dir / '.execution.lock'
+
+    def hold(self, seconds, holder=None):
+        # 另一个进程按 filelock.held 拿锁（holder 写旁挂文件），seconds 秒后放；seconds < 0 = 等 stdin 再放
+        code = ("import sys,json,time;sys.path.insert(0,sys.argv[1]);import filelock;"
+                "h=json.loads(sys.argv[3]) if sys.argv[3] else None;s=float(sys.argv[4])\n"
+                "with filelock.held(__import__('pathlib').Path(sys.argv[2]),holder=h):\n"
+                "    print('locked',flush=True)\n"
+                "    time.sleep(s) if s>=0 else sys.stdin.readline()\n")
+        p = subprocess.Popen([sys.executable, '-B', '-u', '-c', code, str(JOBS), str(self.lock),
+                              __import__('json').dumps(holder) if holder else '', str(seconds)],
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(lambda: (p.poll() is None and p.kill(), p.communicate(timeout=5)))
+        self.assertEqual(p.stdout.readline().strip(), 'locked')
+        return p
+
+    def context(self, wait):
+        c = object.__new__(self.core.Context)
+        c.library, c.lock_wait, c.task, c.operation, c.r = self.dir, wait, 't9', 'catalog', {}
+        return c
+
+    def test_short_job_waits_for_lock_instead_of_failing(self):
+        # 占锁 0.5 秒后放；等待上限 5 秒 → 拿到锁（旧代码：立刻抛「另一个任务正在使用游戏库」）
+        self.hold(0.5)
+        c = self.context(5)
+        with patch.object(c, 'check'), patch.object(c, 'require_library'), patch.object(c, 'emit'):
+            t0 = __import__('time').monotonic()
+            with c.lock('execution'):
+                got = 'acquired'
+        self.assertEqual(got, 'acquired')
+        self.assertLess(__import__('time').monotonic() - t0, 5)
+
+    def test_timeout_names_the_holder_and_reports_waiting(self):
+        # 出包任务 t7（游戏 0100000000010000）一直占着；上限 0.6 秒 → 报原句；internal 写「出包 · 0100000000010000（任务 t7）」；
+        #   等的期间发过一次 phase=waiting_lock 的进度，消息「在等「出包 · 0100000000010000（任务 t7）」结束…」、holder 原样带上
+        holder = dict(taskId='t7', operation='build', gameId='0100000000010000', pid=1, startedAt=1.0)
+        p = self.hold(-1, holder)
+        c = self.context(0.6)
+        events = []
+        with patch.object(c, 'check'), patch.object(c, 'require_library'), \
+                patch.object(c, 'emit', side_effect=lambda *a, **k: events.append((a, k))):
+            with self.assertRaises(self.core.Failure) as raised:
+                with c.lock('execution'):
+                    pass
+        self.assertEqual(str(raised.exception), '另一个任务正在使用游戏库，请稍后重试。')
+        self.assertIn('出包 · 0100000000010000（任务 t7）', raised.exception.internal)
+        self.assertEqual((raised.exception.code, raised.exception.holder), ('library_busy', holder))
+        waits = [k for a, k in events if k.get('phase') == 'waiting_lock']
+        self.assertEqual(len(waits), 1)
+        self.assertEqual(waits[0]['holder'], holder)
+        self.assertEqual(events[0][0][1], '在等「出包 · 0100000000010000（任务 t7）」结束…')
+        p.stdin.write('release\n'); p.stdin.flush(); p.wait(timeout=5)
+
+    def test_holder_record_is_removed_on_release(self):
+        c = self.context(1)
+        holder_file = self.lock.with_name('.execution.lock.holder')
+        with patch.object(c, 'check'), patch.object(c, 'require_library'):
+            with c.lock('execution'):
+                self.assertEqual(__import__('json').loads(holder_file.read_text())['taskId'], 't9')
+        self.assertFalse(holder_file.exists())

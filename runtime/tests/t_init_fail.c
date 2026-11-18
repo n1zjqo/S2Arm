@@ -36,8 +36,8 @@ static const struct { int code; const char *id, *summary, *msg; } k_want[] = {
     {S2A_INIT_FAIL_E_DGUARD_LIMIT, "dguard_limit", "直连安全网：此前已连续失败满 3 次，自动化局不停在提示页，收局（重新出包后从 0 数）", "启动过程中出了问题。"},
     {S2A_INIT_FAIL_E_GAME_FILES, "game_files_missing", "服务会话初始化失败：资源包里没有 exefs/main.npdm（游戏文件不在机上 / 没导完）",
      "游戏文件缺失，请重新导入：在 电脑上的 S2Arm 里对这款游戏再点一次「装到 iPhone」。"},
-    {S2A_INIT_FAIL_E_DIRECT_LIB, "direct_lib_missing", "包里没有本宿主口径的直连着色器库（没导完 / 旧版本出的包 / 设备跑不了直连；只有直连，11-07 拆通用模式后不再退通用）",
-     "游戏文件缺失，请重新导入：在 电脑上的 S2Arm 里对这款游戏再点一次「装到 iPhone」。"},
+    {S2A_INIT_FAIL_E_DIRECT_LIB, "direct_lib_missing", "设备跑不了直连（无 Metal 4 / Metal 3 路径）；包里没带直连库不再停在这里（11-13 起现编）",
+     "这台设备的图形芯片跑不了 S2Arm（需要 A13 / M1 或更新的芯片）：换一台更新的 iPhone / iPad 再试。"},
     {S2A_INIT_FAIL_E_UNKNOWN, "unknown", "未登记的初启失败", "启动过程中出了问题。"},
     {999, "unknown", "未登记的初启失败", "启动过程中出了问题。"},
     {-1, "unknown", "未登记的初启失败", "启动过程中出了问题。"},
@@ -110,13 +110,21 @@ int main(void) {
         char b[512]; s2a_init_fail_diag_file(b, sizeof b, S2A_INIT_FAIL_E_SERVICE_INIT, "B", "C", "/nonexistent/host.log");
         WANT(strstr(b, "失败摘要：服务会话初始化失败\n")); WANT(strstr(b, "最近的红行：无\n")); });
 
-    CASE("服务会话初始化失败归码（11-07 Duo）：资源包没有 exefs/main.npdm → game_files_missing；有 → service_init；没给资源包根 → service_init", {
+    CASE("服务会话初始化失败归码（11-07 Duo）：资源包没有 exefs/main.npdm 或 game.img 没传完 → game_files_missing；有 → service_init；没给资源包根 → service_init", {
         char d[] = "/tmp/t_init_fail_gd.XXXXXX"; WANT(mkdtemp(d) != NULL);
         WANT(s2a_init_fail_service_code(d) == S2A_INIT_FAIL_E_GAME_FILES);            // 资源包根在、exefs 不在（Duo 日志的 DirectoryNotFound）
         char p[256]; snprintf(p, sizeof p, "%s/exefs", d); WANT(!mkdir(p, 0755));
         WANT(s2a_init_fail_service_code(d) == S2A_INIT_FAIL_E_GAME_FILES);            // exefs 在、main.npdm 不在
         snprintf(p, sizeof p, "%s/exefs/main.npdm", d); FILE *f = fopen(p, "w"); WANT(f != NULL); if (f) fclose(f);
         WANT(s2a_init_fail_service_code(d) == S2A_INIT_FAIL_E_SERVICE_INIT);          // 游戏文件在：是别的原因
+        // 审计 P1-170：game.img 头里写的整个文件长 4096、实际只有 1000（推到一半）→ game_files_missing；长度对上 → 照旧 service_init
+        char img[256]; snprintf(img, sizeof img, "%s/game.img", d);
+        unsigned char hdr[1000] = {0}; memcpy(hdr, "S2AIMG01", 8); long long want = 4096; memcpy(hdr + 128, &want, 8);
+        FILE *g = fopen(img, "wb"); WANT(g != NULL); if (g) { fwrite(hdr, 1, sizeof hdr, g); fclose(g); }
+        WANT(s2a_init_fail_service_code(d) == S2A_INIT_FAIL_E_GAME_FILES);
+        want = sizeof hdr; memcpy(hdr + 128, &want, 8); g = fopen(img, "wb"); if (g) { fwrite(hdr, 1, sizeof hdr, g); fclose(g); }
+        WANT(s2a_init_fail_service_code(d) == S2A_INIT_FAIL_E_SERVICE_INIT);
+        unlink(img);
         WANT(s2a_init_fail_service_code("/nonexistent/资源包") == S2A_INIT_FAIL_E_GAME_FILES);
         WANT(s2a_init_fail_service_code(NULL) == S2A_INIT_FAIL_E_SERVICE_INIT); WANT(s2a_init_fail_service_code("") == S2A_INIT_FAIL_E_SERVICE_INIT);
         unlink(p); snprintf(p, sizeof p, "%s/exefs", d); rmdir(p); rmdir(d);

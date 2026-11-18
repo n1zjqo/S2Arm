@@ -22,6 +22,7 @@
 // 随包表：fps.tsv（出包组装 pack/ship_ext.py 从产物根拷进 App，runtime/build.mk 按这行自动收清单）
 #include "native.h"
 #include "s2a_unattended.h"
+#include "caps.h"   // s2a_caps_own：我方帧率表缺省不装
 #include <errno.h>
 static _Thread_local FILE *g_boot_file;
 void s2a_fps_abort_boot_inputs(void) {
@@ -59,32 +60,30 @@ static void *key_slot(int slot) { return g_fm ? g_fm->base + g_fm->key_page_off 
 static void host_store32(void *p, uint32_t v) { __atomic_store_n((uint32_t *)p, v, __ATOMIC_RELAXED); }
 // 起局开关只认 S2A_FPS60：S2A_FPS 是帧率上限（出图封顶，graphics/nvn nvn_fps.c、通用层 FramePacingPolicy），和游戏逻辑步长的 60 帧表是两件事
 //   （#619 审计 F-fps-cap-disables-table：原先 S2A_FPS=30 也算关，设置页上限选 30、60 帧开关留开时起局仍按关写表）
-static int fps_on_at_start(void) { const char *f = getenv("S2A_FPS60"); return !(f && !strcmp(f, "0")); }
+// 11-11 维护者：出包默认就是游戏原本的帧率，60 帧改成玩家手动开——只有 S2A_FPS60=1（设置页 / 启动器按款开了）才开；没设或 0 一律回游戏原生帧率
+static int fps_on_at_start(void) { const char *f = getenv("S2A_FPS60"); return f && !strcmp(f, "1"); }
 static _Atomic int g_on = 1, g_have;   // g_on：60 帧开 / 关（运行中可切）；g_have：这款有表（设置页据此决定显不显示开关）
-// 降档原因位（情报 10-28：通用模式没有热帽、低电量不降档）：热状态 ≥ 严重（2）或低电量模式开着 → 60 帧按关生效（同运行中关：w 行写回原值、
-//   槽写关时值、出图间隔退回游戏、社区帧率补丁跟随），原因去掉再恢复：热状态回到 ≤ 一般后稳 30 秒（防抖，同直连热帽 hle_nvn.c thermal_capped），
-//   低电量关掉即恢复。帧率表 / 社区帧率补丁都在游戏层生效，通用与直连两种模式一起管。只自动降、不改用户开关（设置页照旧显示开），
-//   HUD 读 s2a_fps_cap_reason 显示原因。S2A_FPS_CAP=0 不降档（测量满负荷用）。热状态 / 低电量取自 ios/app.m（iOS）与 runtime/src/host_main.c（Mac，审计 P1-80），都读 NSProcessInfo；下面的弱定义只给没链宿主的单测
-__attribute__((weak)) int dm_thermal_now(void) { return -1; }
-__attribute__((weak)) int dm_low_power_now(void) { return 0; }
-static _Atomic int g_cap;   // 0 无、1 热、2 低电量
-// 3 = 逻辑速度同局 A/B 正在测原帧率那一段（自动玩家 tests/autoplay/autoplay.c speed_ab 调 s2a_fps_ab_set）：同热降档一条路生效——
+// 不按发热 / 低电量自动关 60 帧（11-13 维护者「不读电量、不设自己挡自己的闸」「不许堵门」）：玩家自己开的 60 帧不替他关，真热到系统降频是系统的事；
+//   原先热状态危急或低电量模式开着就按关生效（审计 P1-80 / 情报 10-28 的降档原因 1 / 2），整段删了，帧率跟不跟得上交给实际帧率（宿主帧步、档位梯子按实测帧率）
+// 3 = 逻辑速度同局 A/B 正在测原帧率那一段（自动玩家 tests/autoplay/autoplay.c speed_ab 调 s2a_fps_ab_set）：同档位梯子压回一条路生效——
 //   帧率表 w 行写回原值、槽写关时值、出图间隔退回游戏自己设的（hle_nvn.c 看 s2a_fps_cap_reason）、社区帧率补丁跟随，所以测到的「关」就是玩家关 60 帧时的样子
 static _Atomic int g_ab;   // 同局 A/B 阶段：0 照常、1 回原帧率、2 放开（普查 A/B 模式下给「60 帧没开」的款测开段用）
 // 普查同局 A/B 模式（S2A_FPS_AB=1，tools/census 设，同时设 DM_PRESENT_INTERVAL=display）：60 帧没开的款（包内能力 fps60=0：没来源 / 强信号）
 //   整局照原帧率跑（降档原因 3），普查五问读数不变；只在自动玩家测开段时放开（阶段 2）。60 帧开着的款不受影响
 static int ab_mode(void) { const char *e = getenv("S2A_FPS_AB"); return e && !strcmp(e, "1"); }   // 每次读：单测中途设；每帧一次 getenv 不贵
-static uint64_t g_cap_calm_since;
-#define CAP_CALM_NS 30000000000ull
 // 档位梯子压回原生帧率（runtime/src/qladder.c，维护者 11-06 优雅降级）：60 帧开着、按档位暂时退回游戏原帧率，放开就回 60（与降档原因同一条热切路径，不动用户开关）
 static _Atomic int g_hold;
-static int eff(void) { return atomic_load(&g_on) && !atomic_load(&g_cap) && atomic_load(&g_ab) != 1 && !atomic_load(&g_hold); }   // 60 帧实际生效 = 用户开着且没有降档原因
+// 我方帧率表那一半（槽 / w 行 / 宿主帧步 / 放开出图间隔）只在旧口径（S2A_CAPS_OWN=1，caps.h s2a_caps_own）按 60 帧开关生效，缺省一律按「关」写
+//   （11-14 撤我方 60 帧）。表照装：改写器打进游戏代码的读槽指令一直在，槽必须有 30 帧口径的值——11-14 起初整张表不装，槽留 0，
+//   带表的包起局后游戏步长读到 0、停在加载黑屏（iPhone 实机同包同局：纯主线进局、不装表的一直黑屏）。60 帧开关此后只管社区帧率补丁（cpatch_follow 照跟 eff）
+static int g_own;
+static int eff(void) { return atomic_load(&g_on) && atomic_load(&g_ab) != 1 && !atomic_load(&g_hold); }   // 60 帧实际生效 = 用户开着、不在同局 A/B 的原帧率段、档位梯子没压
 int s2a_fps_cap_reason(void) {
     int ab = atomic_load(&g_ab);
     if (ab == 1 || (ab != 2 && ab_mode() && !fps_on_at_start())) return 3;
-    int c = atomic_load(&g_cap); return c ? c : atomic_load(&g_hold) ? 4 : 0;   // 4 = 档位梯子压回原帧率（s2a_fps_hold）
+    return atomic_load(&g_hold) ? 4 : 0;   // 4 = 档位梯子压回原帧率（s2a_fps_hold）；1 / 2（热 / 低电量）11-13 起不再有
 }
-// 运行中关 60 帧（玩家点「切回原生帧率」、热 / 低电量降档）能不能真退回原帧率：表里每条 w 行都写了关值才能（槽 / 速度 / 出图间隔本来就能热切）。
+// 运行中关 60 帧（玩家点「切回原生帧率」、档位梯子压回）能不能真退回原帧率：表里每条 w 行都写了关值才能（槽 / 速度 / 出图间隔本来就能热切）。
 //   0 = 有 w 行没关值：运行中关只退出图间隔与槽，游戏自己的限帧变量留在 60 帧口径，要重启（下一局表从起局就关、游戏的值没人碰）才完全回原帧率。体验线提示据此写「重启后生效」
 int s2a_fps_hot_revert_ok(void) { for (int i = 0; i < g_nfw; i++) if (!g_fw[i].has_off) return 0; return 1; }
 int s2a_fps_effective(void) { return eff(); }   // 60 帧此刻真在生效（撑不住就问玩家 runtime/src/qprompt_host.c 逐帧读）
@@ -116,7 +115,8 @@ static void fs_target(int on) {
 }
 static int fs_step(void) { return dm_fps_state ? (int)plat_guest_load32((uintptr_t)(dm_fps_state + 0x20)) : 0; }
 // 生效状态一变（用户开关或降档原因）：槽与社区帧率补丁按生效值写；w 行由写入线程每 100 ms 按 eff() 写
-static void apply(void) { int e = eff(); slots_apply(e); cpatch_follow(e); fs_target(e); }
+static int eff_table(void) { return g_own && eff(); }   // 我方帧率表此刻按「开」写
+static void apply(void) { int e = eff(); slots_apply(g_own && e); cpatch_follow(e); fs_target(g_own && e); }
 // 帧率表键页槽的当前值（graphics/nvn hle_nvn.c 每 300 帧「render targets」那行带出；11-02 塞尔达户外落 30 看动态分辨率系数 / 步长）：「2041=200 (0x43480000)」；类型表里没记，浮点与原始字都给
 void s2a_fps_slots_note(char *buf, size_t n) {
     size_t o = 0; buf[0] = 0; if (!g_fm) return;
@@ -124,24 +124,8 @@ void s2a_fps_slots_note(char *buf, size_t n) {
         int sl = i < g_nsl ? g_sl[i].sl : g_spd_slot; uint32_t v = plat_guest_load32((uintptr_t)key_slot(sl)); float f; memcpy(&f, &v, 4);
         o += (size_t)snprintf(buf + o, n - o, "%s%d=%g (%#x)", o ? ", " : "", sl, (double)f, v); }
 }
-// 降档 / 恢复告诉玩家（ios/app.m 横幅「已暂时回到原生帧率」；审计 P1-80：降档时设置里 60 帧仍显示开、画面却回到原帧率，要 30 秒后才弹「不稳定」）。Mac / 单测没有界面
+// 档位梯子压回 / 恢复告诉玩家（ios/app.m 横幅「已暂时回到原生帧率」，runtime/src/qladder_host.c 调）。Mac / 单测没有界面
 __attribute__((weak)) void s2a_ios_fps_capped(int reason) { (void)reason; }
-// 降档判定（写入线程每秒调一次；单测直接喂时间与状态）：返回新的原因
-int s2a_fps_cap_tick(uint64_t now, int thermal, int low_power) {
-    int cur = atomic_load(&g_cap), want;
-    // 热降档只在危急（3）：维护者 11-06 的目标是热机（热状态 ≥ 2）稳 60 帧；严重（2）就压回原帧率等于主动放弃——热机「60 帧维持不住」有一部分是这里自己压的。
-    //   热状态 2 时帧率跟不跟得上交给实际帧率（宿主帧步：60 撑不住连续迟到就按 30 保持，hle_nvn.c fstep_tick）
-    if (thermal >= 3) { g_cap_calm_since = 0; want = 1; }
-    else if (cur == 1 && (!g_cap_calm_since ? (g_cap_calm_since = now, 1) : now - g_cap_calm_since < CAP_CALM_NS)) want = 1;
-    else { g_cap_calm_since = 0; want = low_power ? 2 : 0; }
-    if (want != cur) {
-        atomic_store(&g_cap, want); apply();
-        LOG("帧率表：%s", want == 1 ? "热状态危急，60 帧降回游戏原生帧率，回到一般后稳 30 秒恢复" : want == 2 ? "低电量模式开着，60 帧降回游戏原生帧率，关掉即恢复"
-                                     : "降档原因消失，60 帧恢复");
-        if (atomic_load(&g_on) && !s2a_unattended()) s2a_ios_fps_capped(want);   // 玩家开着 60 帧才说；自动化局只记日志
-    }
-    return want;
-}
 // 同局 A/B（自动玩家调，任意线程）：phase 1 = 回原帧率（降档原因 3）、2 = 放开（开段）、0 = 照常（测完）。不改用户开关，只在自动化局里用。
 //   没有帧率表的款（出图间隔由引擎推导或 DM_PRESENT_INTERVAL=display 放开）g_ready = 0，只靠降档原因让 hle_nvn.c 退回 / 放开游戏间隔
 void s2a_fps_ab_set(int phase) {
@@ -152,9 +136,11 @@ void s2a_fps_ab_set(int phase) {
 int s2a_fps_available(void) { return atomic_load(&g_have) || s2a_cpatch_fps_count() > 0; }
 // 有能真改游戏帧率的来源：表里除 present display 外还有行（w / slot / speed / word 改指令），或社区帧率补丁。只有 present display（含引擎通用第一层）时，
 //   游戏自己设交换间隔 1 就已是 60 帧、没东西可放开（撑不住就问玩家 / 设置页「本款原生 60 帧」，runtime/src/qprompt_host.c）
-int s2a_fps_real_source(void) { return (atomic_load(&g_have) && (g_nfw > 0 || g_nsl > 0 || g_spd_slot >= 0 || g_word_rows > 0)) || s2a_cpatch_fps_count() > 0; }
+int s2a_fps_real_source(void) { return (g_own && atomic_load(&g_have) && (g_nfw > 0 || g_nsl > 0 || g_spd_slot >= 0 || g_word_rows > 0)) || s2a_cpatch_fps_count() > 0; }
 int s2a_fps_enabled(void) { return atomic_load(&g_on); }
-int s2a_fps_live(void) { return eff(); }   // 60 帧此刻真在生效（用户开 + 无降档 + 梯子没压）
+// 本帧帧率来源（11-14，补帧进主线）：2 = 真帧率来源开着（社区帧率补丁；S2A_CAPS_OWN=1 时也含我方帧率表）——出图补帧这一帧让路，游戏自己跑 60；
+//   1 = 没有，补帧可补（graphics/nvn/gfx/nvn/nvn_present_fi.inc fi_wanted 每帧读，弱定义恒 1）。优先级：社区帧率补丁 > 补帧 > 原帧率；60 帧开关局中切换随即跟上
+int s2a_fps_source(void) { return atomic_load(&g_on) && s2a_fps_real_source() ? 2 : 1; }
 void s2a_fps_hold(int hold) {
     pthread_mutex_lock(&g_control_mu);
     if (atomic_exchange(&g_hold, hold ? 1 : 0) != (hold ? 1 : 0)) { if (g_ready) apply(); LOG("帧率表：档位梯子%s", hold ? "压回游戏原帧率" : "放开，回 60 帧"); }
@@ -179,13 +165,11 @@ static void note_orig(fps_w *w, uint32_t old) {
 }
 static void *writer(void *a) { s2a_thread_name("s2a-fps-writer");
     (void)a; (void)plat_thread_name("s2a-帧率表");
-    int cap_off = getenv("S2A_FPS_CAP") && !strcmp(getenv("S2A_FPS_CAP"), "0");
     // 诊断（S2A_FPS_HOLD_AT=<起秒>-<止秒>，写入线程起来后计秒）：这段时间按档位梯子压回原帧率，验 60 ↔ 原帧率局中双向热切（frames.tsv 看帧间隔）
     long ha = -1, hb = -1; { const char *e = getenv("S2A_FPS_HOLD_AT"); if (e && sscanf(e, "%ld-%ld", &ha, &hb) != 2) ha = hb = -1; }
     for (unsigned k = 0; !atomic_load(&g_writer_stop); k++) {
         if (ha >= 0 && k % 10 == 0) { long sec = (long)(k / 10); if (sec == ha) s2a_fps_hold(1); else if (sec == hb) s2a_fps_hold(0); }
-        if (!cap_off && k % 10 == 0) s2a_fps_cap_tick(plat_now_ns(), dm_thermal_now(), dm_low_power_now());   // 每秒判一次降档
-        int on = eff();
+        int on = eff_table();
         for (int i = 0; i < g_nfw; i++) { fps_w *w = &g_fw[i]; uint32_t old;
             // 关时只写表里明写的关值（off）。不写回第一次读到的「原值」（11-02 原生崩溃线：那是游戏还没初始化时的快照——八方2 t.MaxFPS 0、
             //   巫师3 LimitFPS 0、怪猎上限 6000，写回去等于解除限帧；异度3 写回 −1 也退不回 30）。没有关值的行运行中关不了，重启后生效（s2a_fps_hot_revert_ok）
@@ -220,7 +204,7 @@ int s2a_fps_present_at(uint64_t now);   // 核心按传入的时间算（单测�
 int s2a_fps_present_hook(void) { return s2a_fps_present_at(plat_now_ns()); }
 int s2a_fps_present_at(uint64_t now) {
     // 关着时也记，再开的第一帧按真实帧间隔算；换局时清零。
-    if (!eff()) { g_present_last = now; return atomic_load(&g_have); }
+    if (!eff_table()) { g_present_last = now; return g_own && atomic_load(&g_have); }
     if (g_spd_slot >= 0) {
         int st = fs_step();
         if (st > 0) {   // 帧步在跑：步长是宿主定的整数 vsync，出图也按它保持
@@ -259,14 +243,6 @@ static int writer_start_locked(void) {
     g_writer_started = 1;
     return 0;
 }
-// No-table display mode still needs the shared thermal/low-power watcher.
-// Stop/reset keeps admission closed until the next real loader publication.
-void s2a_fps_cap_watch(void) {
-    pthread_mutex_lock(&g_writer_mu);
-    int error = writer_start_locked();
-    pthread_mutex_unlock(&g_writer_mu);
-    if (error) LOG("【红】帧率表写入线程创建失败：%d，未发布 writer，禁止退休会话", error);
-}
 static void start_published(int need_writer, int have_table) {
     pthread_mutex_lock(&g_writer_mu);
     // A stop that overlapped loader work cannot be undone by late publication.
@@ -288,7 +264,7 @@ void s2a_fps_start(const char *dir) {
     }
     pthread_mutex_unlock(&g_writer_mu);
     if (refused) { LOG("【红】帧率表尚未 reset 或已经发布，拒绝重复装载"); return; }
-    atomic_store(&g_on, fps_on_at_start()); cpatch_follow(atomic_load(&g_on));   // 没有我方帧率表的款，社区帧率补丁也按这个开关定
+    g_own = s2a_caps_own(); atomic_store(&g_on, fps_on_at_start()); cpatch_follow(atomic_load(&g_on));   // 没有我方帧率表的款，社区帧率补丁也按这个开关定
     char path[1100]; const char *e = getenv("S2A_FPS_TABLE");
     if (e && *e) strlcpy(path, e, sizeof path); else snprintf(path, sizeof path, "%s/fps.tsv", dir);
     FILE *f = fopen(path, "r"); if (!f) { start_published(s2a_cpatch_fps_count() > 0, 0); return; }
@@ -358,14 +334,14 @@ void s2a_fps_start(const char *dir) {
     //   只看 display 模式的路径（hle_nvn.c nvn_game_fps → 帧节拍行 / 显示链接目标 / 浮层目标）照报 60（10-28 巫师3 关局：host.log「帧节拍 … 60 帧/秒」，frames.tsv 实测 30）。
     //   代价：起局关、运行中 s2a_fps_set_enabled(1) 不放开出图间隔（产品开关是起局环境变量 S2A_FPS60、下次启动生效，没有运行中开的调用方）
     g_present_row = present;
-    if (present && atomic_load(&g_on) && !getenv("DM_PRESENT_INTERVAL") && !setenv("DM_PRESENT_INTERVAL", "display", 0)) g_default_present = 1;
+    if (present && g_own && atomic_load(&g_on) && !getenv("DM_PRESENT_INTERVAL") && !setenv("DM_PRESENT_INTERVAL", "display", 0)) g_default_present = 1;
     { const char *fe = getenv("S2A_FSTEP");
       if (g_spd_slot >= 0 && !(fe && !strcmp(fe, "0"))) { dm_fps_state = g_fs_page; LOG("帧率表：接宿主帧步（直连：每帧保持整数个 vsync，60 撑不住稳定 30、游戏速度不变；S2A_FSTEP=0 不接）"); } }
-    slots_apply(atomic_load(&g_on)); fs_target(eff());
+    slots_apply(g_own && atomic_load(&g_on)); fs_target(eff_table());
     { int no = 0; for (int i = 0; i < g_nfw; i++) no += !g_fw[i].has_off;
       if (no) LOG("帧率表：%d 条数据写入没写关值（off），运行中关 60 帧退不回这几处，重启后生效", no); }
-    LOG("帧率表 %s：60 帧%s；出图间隔%s，数据写入 %d 处%s", path, atomic_load(&g_on) ? "开" : "关（S2A_FPS60=0，回游戏原生帧率）",
-        present && atomic_load(&g_on) ? "放开（每个显示节拍一帧）" : present ? "按游戏（60 帧关：表里的 present display 不生效）" : "按游戏", g_nfw, bad ? "（有坏行，见上）" : "");
+    LOG("帧率表 %s：60 帧%s；出图间隔%s，数据写入 %d 处%s", path, !g_own ? "关（我方帧率表不用，按关值写；只用社区帧率补丁，S2A_CAPS_OWN=1 才按开关）" : atomic_load(&g_on) ? "开" : "关（S2A_FPS60=0，回游戏原生帧率）",
+        present && g_own && atomic_load(&g_on) ? "放开（每个显示节拍一帧）" : present ? "按游戏（60 帧关：表里的 present display 不生效）" : "按游戏", g_nfw, bad ? "（有坏行，见上）" : "");
     start_published(1, 1);   // 包含只有槽/社区补丁的款；所有表读完后才允许创建写入线程。
 }
 static int writer_stop_locked(void) {
@@ -401,7 +377,6 @@ int s2a_fps_session_reset(void) {
     dm_fps_state = NULL; memset(g_fs_page, 0, sizeof g_fs_page);
     memset(g_sl, 0, sizeof g_sl); g_nsl = g_word_rows = g_present_row = 0;
     atomic_store(&g_on, 1);
-    atomic_store(&g_cap, 0); g_cap_calm_since = 0;
     const char *present = getenv("DM_PRESENT_INTERVAL");
     if (g_default_present && present && !strcmp(present, "display")) unsetenv("DM_PRESENT_INTERVAL");
     g_default_present = 0;

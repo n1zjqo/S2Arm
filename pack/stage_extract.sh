@@ -9,7 +9,7 @@
 set -u
 G=${1:?款}; H=$(cd "$(dirname "$0")" && pwd); R=$(cd "$H/.." && pwd); source "$H/roots.sh"
 source "$H/stage_keyfiles.sh"; stage_deps_on || exit 1; SELF=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")   # 实际读入进键（声明表管调用到的代码，实际读入管真读了哪些文件和表）
-CUR=$(root_cur "$G"); [ -n "$CUR" ] && [ -d "$CUR/romfs" ] && [ -f "$CUR/exefs/main" ] || { echo "【红】$G 现行产物根没有 romfs/ 或 exefs/main"; exit 1; }
+CUR=$(root_cur "$G"); [ -n "$CUR" ] && { [ -d "$CUR/romfs" ] || [ -f "$CUR/romfs.std" ]; } && [ -f "$CUR/exefs/main" ] || { echo "【红】$G 现行产物根没有 romfs/（或镜像 romfs.std）或 exefs/main"; exit 1; }   # RomFS 目录或镜像都行（romfs_list.py image_of）
 bash "$H/stage_direct_profile.sh" "$G" --require-consumer || exit $?   # 配置档同直连库阶段（零配置推导 / 手写档），抽取按同一份档
 CUR=$(root_cur "$G")
 PY=${S2A_PYTHON:-${S2A_PY:-python3}}
@@ -37,7 +37,10 @@ source "$H/srcs.sh"; TID=$(prog_id "$CUR"); [ -n "$TID" ] || { echo "【红】$G
 source "$H/stage_keyfiles.sh"; KT=$(stage_files_key extract "$R") || exit 1
 KV=$("$VPY" -c 'import sys, lz4, numpy; print(sys.version.split()[0], lz4.__version__, numpy.__version__)' 2>&1)
 # 图形接口只按判出的类别进键（gfx_api.py 本身在 extract.tsv 归「外」）：类别变了才重抽
-K=$(printf '%s\n%s\n%s\n%s\n%s\n' "$KR" "$KT" "$KV" "$PK" "${API%%	*}" | shasum -a 256 | cut -c1-16)
+# 试跑开关 S2A_DIRECT_RUNTIME_ONLY=1（普查第②层：不抽不预编，全部着色器运行时首遇现编，9.9 万支的款几分钟起局）：开了才进键，不开时键与原先逐字节相同
+RTO=; [ "${S2A_DIRECT_RUNTIME_ONLY:-0}" = 1 ] && RTO='
+runtime-only'
+K=$(printf '%s\n%s\n%s\n%s\n%s%s\n' "$KR" "$KT" "$KV" "$PK" "${API%%	*}" "$RTO" | shasum -a 256 | cut -c1-16)
 KB=$K; K=$(stage_deps_key "$CUR" extract "$KB" "$SELF") || exit 1
 root_stage_done "$CUR" extract "$K" && { echo "🟢 $G 现行已是抽取 ${K}，跳过"; exit 0; }
 TAG=$(root_tag "$G" "ex-${K:0:8}"); W=$(root_begin "$G" "$TAG") || { root_abort "$G" "$TAG"; exit 1; }
@@ -67,7 +70,11 @@ if decoder_need "$R" "$W/romfs" || [ "$GN" = yes ]; then
       S2A_CS=$HCS bash "$R/tools/host_build.sh" --tree "$RN" ROOT="$RN" ) > "$W/host_build.log" 2>&1 || { echo "【红】$G 编译 Mac 宿主失败（$(tail -2 "$W/host_build.log" | tr '\n' ' ' | cut -c1-200)）"; root_abort "$G" "$TAG"; exit 1; }
   fi
 fi
+if [ -n "$RTO" ]; then   # 试跑：不调抽取器，按抽取缺口走（extract.sh 退 3 同一条路：下面写 direct_gap.txt，直连库阶段出运行时现编空库）
+  echo "直连库失败：试跑 S2A_DIRECT_RUNTIME_ONLY=1，不抽不预编，运行时首遇现编" > "$W/extract.log"; xrc=3
+else
 DM_GAMES_DIR="$(dirname "$PDIR")${DM_GAMES_DIR:+:$DM_GAMES_DIR}" DM_GAMES_FIRST=1 DM_GAME=$TID bash "$R/graphics/tools/direct/extract.sh" "$W" "$W/extract" > "$W/extract.log" 2>&1; xrc=$?
+fi
 # 退 3 = 只有直连用的那两份抽不出（extract.sh 头注释：Unreal 存档读不开、认不出着色器容器、运行时现编的 GLSL 没抓到输出、拆分出错……）：
 #   11-05 维护者定「直连库编不出也照出包、运行时由宿主现翻兜底」——不再作废本阶段，把原因写进 extract/direct_gap.txt 照常提交、退 0，
 #   直连库阶段（stage_direct.sh）见到它出一个合法的空库（离线 0 支），运行时每支着色器在 ProgramSetShaders 首遇现编（nvn_mtl.m s2a_dsh_compile）。
@@ -85,7 +92,17 @@ if [ $xrc != 0 ]; then mkdir -p "$S2A_ROOTS/.failed" && cp "$W/extract.log" "$S2
   root_abort "$G" "$TAG"
   [ $xrc = 3 ] && { echo "【红】$G $(grep -a '直连库失败：' "$S2A_ROOTS/.failed/${G}_extract.log" 2> /dev/null | tail -1 | sed 's/^.*\(直连库失败：\)/\1/' | cut -c1-260)"; exit 3; }
   echo "【红】$G 抽取失败（$(grep '抽取\]' "$S2A_ROOTS/.failed/${G}_extract.log" | tail -1 | sed "s#$W/extract/#$S2A_ROOTS/.failed/${G}_extract.d/#g" | cut -c1-240)）"; exit 1; fi   # 路径换成留下来的那份（临时根随 root_abort 删了，10-30 塞尔达照红行找日志以为丢了）
+# 降级汇总（v0.3.1）：离线 0 支（direct_gap.txt）、S2Arm 抽取没跑成 / 跳过读不了的部分（extract/s2x/degrade.tsv）→ 产物根 degrade.extract.tsv
+#   （格式同 degrade.rewrite.tsv：阶段 / 类别 / 处数 / 玩家提示 / 说明；出包作业收尾读它上屏、诊断包收它）；没有降级就删掉旧表
+{ rows=$(cat "$W/extract/s2x/degrade.tsv" "$W/extract/split/degrade.tsv" 2> /dev/null)
+  [ -s "$W/extract/direct_gap.txt" ] && rows="${rows:+$rows
+}extract	offline_zero	1	这款的着色器没能提前编好，第一次进新场景会卡一下，遇到请反馈	$(head -1 "$W/extract/direct_gap.txt")"
+  if [ -n "$rows" ]; then n=$(printf '%s\n' "$rows" | grep -c .)
+    [ -s "$W/extract/direct_gap.txt" ] || rows="extract	partial	${n}	这款有部分着色器没能提前编好，第一次进新场景可能会卡一下，遇到请反馈	逐类见下
+$rows"
+    printf '# 阶段\t类别\t处数\t玩家提示\t说明\n%s\n' "$rows" > "$W/degrade.extract.tsv" || { root_abort "$G" "$TAG"; exit 1; }
+  else rm -f "$W/degrade.extract.tsv"; fi; }
 K=$(stage_deps_save "$W" extract "$KB" "$SELF") || { root_abort "$G" "$TAG"; exit 1; }; echo "$K" > "$W/.stage_extract"
 # 与改写 / 能力表 / RomFS 索引并行（refresh.sh 快路，11-06）：本阶段只写这些，提交时现行被别的阶段改过就重放到新现行
-ROOT_REPLAY='extract extract.log host_build.log .stage_extract .stage_extract.deps' root_commit "$G" "$TAG" || exit 1
+ROOT_REPLAY='extract extract.log host_build.log degrade.extract.tsv .stage_extract .stage_extract.deps' root_commit "$G" "$TAG" || exit 1
 echo "$(grep '抽取\]' "$(root_cur "$G")/extract.log" | tail -1 | sed 's/^\[抽取\] //')；$(du -sh "$(root_cur "$G")/extract" | cut -f1)，阶段 $((SECONDS - t0)) 秒，现行 → $(basename "$(root_cur "$G")")"

@@ -31,6 +31,7 @@
 #   D                                            the fragment shader writes gl_FragDepth (Metal needs a depth attachment for it; the GL layer attaches a scratch one when the target has none)
 # <TAB> where it came from
 # Usage: gl_shaders.py <input path>... <out dir> [--ios <dir>]   (input paths: the RomFS, the main NSO, capture folders)
+import os as _pw_os, sys as _pw_sys; _pw_sys.path.append(_pw_os.path.join(_pw_os.path.dirname(_pw_os.path.abspath(__file__)), '..', 'tools')); from pool_workers import cores  # noqa: E402  核数 / 进程池路数唯一来源（tools/pool_workers.py，#1332）
 import argparse
 import concurrent.futures as cf
 import hashlib
@@ -95,14 +96,14 @@ def rel(p, r):   # 表里来源列一律 / 分隔（Windows 出包机上 relpath
 def sources(roots):
     """(source bytes, stage or None, where) for every shader in the input paths"""
     for r in roots:
-        if os.path.isfile(r):
+        if os.path.isfile(r):   # 单个文件（exefs/main）照旧；RomFS 目录或镜像 romfs.std 走下面 romfs_list
             with open(r, 'rb') as f: head = f.read(4)
             if head == b'NSO0':
                 for k, s in enumerate(nso_strings(r)): yield s, None, f'{os.path.basename(r)}#{k}'
             elif stage_of(r) or any_stage(r):
                 yield text_of(open(r, 'rb').read()), stage_of(r), os.path.basename(r)
             continue
-        if not os.path.isdir(r):
+        if not romfs_list.is_dir(r):   # 同 os.path.isdir；RomFS 不落散文件时 romfs/ 不在、旁边有 romfs.std 也算
             raise ValueError(f'输入路径不存在：{r}')
         for d, _, fs in romfs_list.walk(r):
             for fn in sorted(fs):
@@ -110,7 +111,7 @@ def sources(roots):
                 if fn.endswith('.mvgl'):
                     try: a = mvgl.Archive(p)
                     except ValueError:
-                        with open(p, 'rb') as probe:
+                        with romfs_list.open_file(p) as probe:
                             if probe.read(4) == b'AFS2': continue
                         raise
                     for nm in sorted(a.files):
@@ -124,21 +125,43 @@ def sources(roots):
                         st = 'vert' if nm.endswith('_v.shader') else 'frag' if nm.endswith('_f.shader') else None
                         yield text_of(b.read(nm)), st, f'/{rel(p, r)}:{nm}'
                 elif stage_of(fn) or any_stage(fn):
-                    yield text_of(open(p, 'rb').read()), stage_of(fn), '/' + rel(p, r)
+                    yield text_of(romfs_list.read_file(p)), stage_of(fn), '/' + rel(p, r)
 
 # GLSL 改写层（graphics/nvn/gfx/gl/gl_glsl_es.c）：离线链与宿主运行时兜底共用一份 C 实现；这里每个进程编一次它的命令行入口（S2A_GLSL_ES_MAIN），逐支调用
 ES_SRC = Path(__file__).resolve().parents[1] / "graphics/nvn/gfx/gl" / "gl_glsl_es.c"
 _es_lock, _es_bin = threading.Lock(), None
 
 
+def es_name():
+    """改写工具的文件名（按 gl_glsl_es.c 源码哈希）：现编与启动器预编件同名，源码一改就对不上、不会用旧件"""
+    h = hashlib.sha1(ES_SRC.read_bytes()).hexdigest()[:12]
+    return f"glsl_es-{h}" + (".exe" if os.name == "nt" else "")   # Windows：不带 .exe 起不来
+
+
+def es_prebuilt():
+    """启动器随发版预编的改写工具（S2A_PREBUILT_TOOLS/codecs/<es_name>，launchers/windows/bundle_prepare_win.py）：在就用，不现编、不要编译器。
+    #852：Windows 玩家机没有 C 编译器，原先每支都现编失败、离线库只剩表头，OpenGL 款全部落到运行时现编"""
+    tools = os.environ.get("S2A_PREBUILT_TOOLS")
+    p = Path(tools) / "codecs" / es_name() if tools else None
+    return p if p and p.is_file() else None
+
+
 def es_tool():
     global _es_bin
     with _es_lock:
         if _es_bin is None:
+            pre = es_prebuilt()
+            if pre:
+                _es_bin = pre
+                return _es_bin
             d = tempfile.mkdtemp(prefix="glsl-es-")
             atexit.register(shutil.rmtree, d, True)
-            exe = Path(d) / ("glsl_es.exe" if os.name == "nt" else "glsl_es")   # Windows：不带 .exe 起不来
-            run([os.environ.get("CC", "cc"), "-O2", "-DS2A_GLSL_ES_MAIN", ES_SRC, "-o", exe])
+            exe = Path(d) / es_name()
+            cc = os.environ.get("CC") or shutil.which("cc") or shutil.which("clang") or "cc"   # 同 nxfmt：Windows 发版机只有 clang
+            try:
+                run([cc, "-O2", "-DS2A_GLSL_ES_MAIN", ES_SRC, "-o", exe])
+            except OSError as e:   # 找不到编译器：说清缺什么（原先只有一句 FileNotFoundError，逐支报红）
+                raise ValueError(f"GLSL 改写工具编不出：没有 C 编译器 {cc}（{e.strerror}），也没有启动器预编件 S2A_PREBUILT_TOOLS/codecs/{es_name()}") from e
             _es_bin = exe
     return _es_bin
 
@@ -307,7 +330,12 @@ def one(task, temp, components):
     if not rows and len(errors) == 2:
         compiled = [e for e in errors if "SPIR-V is not generated" not in e and "ERROR:" not in e]
         if compiled: errors = compiled[:1]
-    return rows, [] if rows else errors
+    # 每个试过的阶段都只卡在 glslang 链接「Missing entry point」：源码里没有 main，不是一支完整着色器，而是引擎运行时拼接用的片段
+    #   （main 里的公共头「#version … precision …」、包含文件；#518 0100BB400B276000 main#0）。离线翻不出也不该翻，记跳过；
+    #   游戏运行时拼成的完整源码由宿主首遇现编（gl_prog.m）。只认这一种原因，别的编译错照旧计失败
+    if not rows and errors and all("Missing entry point" in e for e in errors):
+        return [], [], 1
+    return rows, [] if rows else errors, 0
 
 
 def metal(command, temp):
@@ -405,7 +433,7 @@ def main():
         help="只验证阶段组件，不出运行时 GL 表；允许计算 / UBO / SSBO",
     )
     parser.add_argument(
-        "-j", "--jobs", type=int, default=os.cpu_count() or 1, help="并行翻译与 Metal 编译数量"
+        "-j", "--jobs", type=int, default=cores(), help="并行翻译与 Metal 编译数量"
     )
     args = parser.parse_args()
     if len(args.paths) < 2 or args.jobs < 1:
@@ -455,7 +483,8 @@ def main():
                     pool.map(lambda task: one(task, temp, args.components_only), enumerate(items))
                 )
             rows = {}
-            for candidates, errors in translated:
+            skipped = sum(skip for _, _, skip in translated)
+            for candidates, errors, _ in translated:
                 if errors:
                     failed.append("\n".join(errors))
                 for row in candidates:
@@ -467,21 +496,27 @@ def main():
             ]
             with cf.ThreadPoolExecutor(args.jobs) as pool:
                 compiled = list(pool.map(lambda task: compile_msl(task, temp), tasks))
-            bad, airs = set(), {}
+            # 每个目标各记各的编不过（审计 P1-176：原先按着色器身份共用一份，Mac 编不过的支 iOS 编得过也不收）；
+            #   汇总行「失败」= 至少一个目标编不过的支（每支只记一次原话），「成功」= 至少一个目标编成的支
+            bad = {sdk: set() for _, sdk, _ in destinations}
+            airs, reported = {}, set()
             for identity, sdk, air, error in compiled:
                 if error:
-                    if identity not in bad:
+                    if identity not in reported:
                         failed.append(error)
-                    bad.add(identity)
+                    reported.add(identity)
+                    bad[sdk].add(identity)
                 else:
                     airs[identity, sdk] = air
-            rows = {identity: row for identity, row in rows.items() if identity not in bad}
+            mine = {sdk: {identity: row for identity, row in rows.items() if identity not in bad[sdk]} for _, sdk, _ in destinations}
+            rows = {identity: row for identity, row in rows.items() if any(identity in m for m in mine.values())}
             for error in failed:
                 print("[RED] " + error, file=sys.stderr)
             report = {
                 "schema_version": 1,
                 "runtime_table": not args.components_only,
                 "failed": len(failed),
+                "skipped": skipped,
                 "errors": failed,
                 "shaders": [],
             }
@@ -494,28 +529,45 @@ def main():
             (diagnostics / "gl_shaders.json").write_text(
                 json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", newline="\n"
             )
+            if not rows and not failed and not args.components_only:
+                # 只有跳过的片段：同离线一支没有，只出表头、全部运行时首遇现编
+                write_empty(destinations)
+                print(f"GLSL 汇总：成功 0、失败 0、跳过 {skipped}")
+                return 0
             if not rows:
-                clear_products(destinations)
-                print(f"GLSL 汇总：成功 0、失败 {len(failed)}、跳过 0")
-                return 1
-            table = table_header()
-            table += [
-                f"{key}\t{stage}\t{' '.join(row['fields'])}\t{row['source']}"
-                for (key, stage), row in sorted(rows.items())
-            ]
-            libraries = [
-                (library([airs[identity, sdk] for identity in rows], temp, sdk), destination)
-                for destination, sdk, _ in destinations
-            ]
-            for compiled_lib, destination in libraries:
+                if args.components_only:
+                    clear_products(destinations)
+                    print(f"GLSL 汇总：成功 0、失败 {len(failed)}、跳过 {skipped}")
+                    return 1
+                # 一支都没译成（v0.3.1 拿不准不停；#702 原先整款停）：同离线一支没有，只出表头、全部运行时首遇现编；失败数留在汇总行，direct_lib.sh 记降级
+                write_empty(destinations)
+                print(f"【黄】GLSL 离线一支没译成（{len(failed)} 支失败，见上方 [RED]），只出表头、运行时首遇现编", file=sys.stderr)
+                print(f"GLSL 汇总：成功 0、失败 {len(failed)}、跳过 {skipped}")
+                return 0
+            for destination, sdk, extra in destinations:
+                own = mine[sdk]
+                if not own:   # 这个目标一支不剩：只这个目标出表头（另一个目标已编成的库照出）
+                    if args.components_only:
+                        clear_products([(destination, sdk, extra)])
+                    else:
+                        write_empty([(destination, sdk, extra)])
+                    print(f"{sdk}: 0 shaders after dropping the ones this target cannot compile ({len(bad[sdk])}), table header only → {destination}/gl_shaders.tsv")
+                    continue
+                table = table_header()
+                table += [
+                    f"{key}\t{stage}\t{' '.join(row['fields'])}\t{row['source']}"
+                    for (key, stage), row in sorted(own.items())
+                ]
                 write_product(
-                    compiled_lib,
+                    library([airs[identity, sdk] for identity in own], temp, sdk),
                     destination,
                     None if args.components_only else "\n".join(table) + "\n",
                     diagnostics,
                 )
-        print(f"GLSL 汇总：成功 {len(rows)}、失败 {len(failed)}、跳过 0")
-        return 1 if failed else 0
+                print(f"{sdk}: {len(own)} shaders（这个目标编不过 {len(bad[sdk])}）→ {destination}")
+        print(f"GLSL 汇总：成功 {len(rows)}、失败 {len(failed)}、跳过 {skipped}")
+        # 部分译不过：译成的照出库、退 0（v0.3.1 拿不准不停），失败数在汇总行；只校验阶段组件（--components-only）时照旧退 1
+        return 1 if failed and args.components_only else 0
     except (ValueError, OSError, ImportError, subprocess.SubprocessError, SystemExit) as exc:
         if can_clear:
             clear_products(destinations)

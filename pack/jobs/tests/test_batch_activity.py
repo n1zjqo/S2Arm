@@ -5,7 +5,6 @@ import json
 import os
 import subprocess
 import sys
-import threading
 import unittest
 from unittest.mock import patch
 from jobcase import JobCase, ROOT
@@ -34,6 +33,15 @@ class BatchActivity(JobCase):
         self.assertEqual(event.get('activity'), dict(stage=self.stage, pid=123, target=5, pool=10, inFlight=3))
         self.assertEqual((event['done'], event['total']), (20, 100))
         self.assertTrue(event['message'].startswith(self.stage))
+
+    def test_crlf_progress_lines_still_count(self):
+        """Windows 文本模式写出的 CRLF 进度行照样发进度（v0.3.1 热修实测：写单一 IMG 24 行进度一条没发出去）"""
+        p = self.root / 'progress.tsv'
+        p.write_bytes('100\t写单一 IMG\t0\t4000\r\n101\t写单一 IMG\t1000\t4000\r\n'.encode('utf-8'))
+        with patch('core.time.monotonic', return_value=105), patch('core.time.time', return_value=105), patch.object(self.c, 'emit') as emit:
+            self.c.stage_progress(p, 0)
+        self.assertEqual(emit.call_count, 1)
+        self.assertEqual((emit.call_args.kwargs['done'], emit.call_args.kwargs['total']), (1000, 4000))
 
     def test_long_batch_pulse_preserves_done_weights_and_progress_file(self):
         p, pos, _ = self.begin_activity()
@@ -132,16 +140,40 @@ class BatchActivity(JobCase):
                     activity.snapshot()
             self.assertEqual(tree.call_count, 2)
 
-    def child(self, progress, delay=2.2, code=0):
+    def child(self, progress, delay=2.2, code=0, ack=None, need=0):
+        """ack / need：握手——子进程写完活动行后不按墙钟睡，等父作业发出 need 次活动脉冲（测试的 emit 每见一次往 ack 文件追加一行）才退出，
+        保底 60 秒（父作业真不发脉冲时超时退出、测试照样红）。脉冲数由事件顺序保证，不看机器负载"""
         script = '''import json,os,time,sys
 from pathlib import Path
 p=Path(os.environ['S2A_PROGRESS']); now=time.time()
 p.write_text(f"{now-1}\\t直连库·编批库（MB）\\t0\\t100\\n{now}\\t直连库·编批库（MB）\\t20\\t100\\n",encoding='utf-8')
 with p.open('a',encoding='utf-8') as f:
  f.write('#dsh_activity\\t'+json.dumps(dict(schema=1,pid=os.getpid(),stage='直连库·编批库（MB）',target=5,pool=10,state='active'))+'\\n')
-time.sleep(float(sys.argv[1])); sys.exit(int(sys.argv[2]))
+ack, need = os.environ.get('S2A_TEST_ACK'), int(sys.argv[3])
+if ack:
+ end = time.time() + 60
+ while time.time() < end and (not os.path.exists(ack) or len(open(ack).read().splitlines()) < need): time.sleep(.05)
+else:
+ time.sleep(float(sys.argv[1]))
+sys.exit(int(sys.argv[2]))
 '''
-        return [sys.executable, '-c', script, str(delay), str(code)], dict(os.environ, S2A_PROGRESS=str(progress))
+        env = dict(os.environ, S2A_PROGRESS=str(progress))
+        if ack:
+            env['S2A_TEST_ACK'] = str(ack)
+        return [sys.executable, '-c', script, str(delay), str(code), str(need)], env
+
+    def spy(self, ack, on_pulse=None):
+        """包住 Context.emit：照常发，见到活动脉冲就往 ack 追加一行（子进程据此推进），并可回调（如取消）"""
+        real = self.c.emit
+        def emit(*args, **kwargs):
+            result = real(*args, **kwargs)
+            if 'activity' in kwargs:
+                with open(ack, 'a', encoding='utf-8') as f:
+                    f.write('pulse\n')
+                if on_pulse:
+                    on_pulse()
+            return result
+        return patch.object(self.c, 'emit', side_effect=emit)
 
     def test_process_success_and_exception_clear_observer_lifetime(self):
         self.c._batch_activity = Activity(interval=.1)
@@ -149,13 +181,15 @@ time.sleep(float(sys.argv[1])); sys.exit(int(sys.argv[2]))
         for code in [0, 3]:
             with self.subTest(code=code):
                 p.unlink(missing_ok=True)
-                command, env = self.child(p, code=code)
-                with patch.object(self.c, 'emit', wraps=self.c.emit) as emit:
+                ack = self.root / f'ack-{code}'
+                # 握手：子进程等父作业发出 2 次脉冲才退出（原来子进程睡 2.2 秒、父作业每秒采一次，脉冲数看运气，高负载下 0–1 次）
+                command, env = self.child(p, code=code, ack=ack, need=2)
+                with self.spy(ack) as emit:
                     if code:
                         with self.assertRaises(Failure):
-                            self.c.run(command, env=env, timeout=6)
+                            self.c.run(command, env=env, timeout=90)
                     else:
-                        self.c.run(command, env=env, timeout=6)
+                        self.c.run(command, env=env, timeout=90)
                 pulses = [call.kwargs for call in emit.call_args_list if 'activity' in call.kwargs]
                 self.assertGreaterEqual(len(pulses), 2)
                 self.assertTrue(all((e['done'], e['total']) == (20, 100) for e in pulses))
@@ -168,18 +202,16 @@ time.sleep(float(sys.argv[1])); sys.exit(int(sys.argv[2]))
 
     def test_cancellation_clears_observer_and_reaps_child(self):
         self.c._batch_activity = Activity(interval=.1)
-        command, env = self.child(self.root / 'cancel.tsv', delay=30)
-        timer = threading.Timer(1.4, self.c.stop)
-        timer.start()
+        command, env = self.child(self.root / 'cancel.tsv', delay=60)   # 子进程自己不退：只能被取消
+        # 见到第一次活动脉冲就取消（原来定时 1.4 秒取消，高负载下可能一次脉冲都还没有）
         try:
-            with patch.object(self.c, 'emit', wraps=self.c.emit) as emit:
+            with self.spy(self.root / 'cancel-ack', on_pulse=self.c.stop) as emit:
                 with self.assertRaises(Cancelled):
-                    self.c.run(command, env=env, timeout=6)
+                    self.c.run(command, env=env, timeout=90)
             self.assertTrue(any('activity' in call.kwargs for call in emit.call_args_list))
             self.assertIsNone(self.c._batch_activity.data)
             self.assertFalse(self.c.children)
         finally:
-            timer.cancel(); timer.join(timeout=5)
             self.c.cancelled = False
 
     def test_observer_pulses_do_not_keep_an_idle_child_alive(self):
@@ -190,9 +222,13 @@ time.sleep(float(sys.argv[1])); sys.exit(int(sys.argv[2]))
         watched = [sys.executable, str(ROOT / 'tools/nostall.py'), '--watch', str(p), '2.3', '--', *command]
         with patch.object(self.c, 'emit', wraps=self.c.emit) as emit:
             with self.assertRaises(Failure):
-                self.c.run(watched, env=env, timeout=6)
+                # 阶段上限 60 秒：只判「看门狗按无进展停掉（124）」，不判多快——子进程睡 30 秒，看门狗真失效时它 30 秒后以 0 正常退出，这里照样红
+                #   （原 6 秒：负载 70 时两次起 Python + 2.3 秒无进展判定 + 收进程树要 8 秒多，先撞阶段上限报 stage_timeout，last_rc 还没记）
+                self.c.run(watched, env=env, timeout=60)
         self.assertEqual(self.c.last_rc, 124, 'watchdog must detect the idle child despite UI pulses')
-        self.assertGreaterEqual(sum('activity' in call.kwargs for call in emit.call_args_list), 2)
+        # 有脉冲（这条用例才不空转）而子进程照样被判无进展停掉：脉冲只在父作业里发，不进被盯的进程树 / 文件。
+        #   这里不要求两次：看门狗 2.3 秒无进展就停，期间父作业采到几次取决于调度；「脉冲持续发」由上面的握手用例保证
+        self.assertGreaterEqual(sum('activity' in call.kwargs for call in emit.call_args_list), 1)
         self.assertIsNone(self.c._batch_activity.data)
 
     @unittest.skipUnless(os.name == 'posix', 'legacy POSIX progress.sh consumer')

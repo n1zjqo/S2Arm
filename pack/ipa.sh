@@ -28,10 +28,9 @@ source "$R/tools/cores.sh"; s2a_cores || exit 1; source "$R/tools/progress.sh"  
 SIGN=${S2A_SIGN:-dev}; case $SIGN in dev|adhoc|none) ;; *) echo "【红】S2A_SIGN 只认 dev / adhoc / none"; exit 1;; esac   # none = 不签（交给侧载工具签，Windows 出包用）
 [ "$SIGN" != dev ] && [ $REG = 1 ] && { echo "【红】${SIGN} 包不登记调度（测试设备只装开发直签包）"; exit 1; }
 TEAM=${S2A_TEAM:-${S2A_TEAM_DEFAULT:-}}; [ -n "$TEAM" ] || [ "$SIGN" != dev ] || { echo "【红】没设 S2A_TEAM（复制 tools/machine.local.example 为 tools/machine.local 并填写签名团队）"; exit 1; }
-C=$(git -C "$R" rev-parse --short=9 HEAD) || exit 1
+source "$H/stage_keyfiles.sh"; C=$(src_commit9 "$R") || exit 1   # 发布快照没有 .git：读 engine.json 里打包时记下的提交号
 # 源码树干净才出（包号里的提交号要对得上源码）：防开发者用改了没提交的树出包。发布快照（App 内置引擎，根有 engine.json 清单）
-#   安装时已按清单逐文件核过 sha256、玩家机上没人改它，这条在玩家路径上没有意义，不判（11-02 维护者；beta.3 走查：快照缺
-#   根 .gitignore 时编译产物被当改动，玩家导出 iPhone 版全红——.gitignore 已补进快照，作第二道）
+#   安装时已按清单逐文件核过 sha256、玩家机上没人改它，这条在玩家路径上没有意义，不判（11-02 维护者）；快照也不再带 .git，没有可比的提交
 src_dirty() { [ -f "$1/engine.json" ] && return 1; [ -n "$(git -C "$1" status --porcelain -- runtime ios graphics translator services compat Makefile)" ]; }
 src_dirty "$R" && { echo "【红】本树构建相关目录有未提交改动，包版本对不上提交号，不出"; exit 1; }
 # 同一产物根、同款、同提交只许一份在出（10-20 20:5x 我手出与自动正式局同时出01006F8002326000 c85d1335a，两份抢 CPU）：后到的等先到的出完，
@@ -89,10 +88,8 @@ DN=$("${S2A_PY:-python3}" "$H/display_name.py" "$CUR" --suffix "$DSUF") || { ech
 DT=$("${S2A_PY:-python3}" "$H/display_name.py" "$CUR" --title) || { rm -f "$TL0"; exit 1; }   # 游戏名单独写进 Info.plist（S2AGameTitle）：装机时加后缀（pack/jobs/install.py）同一函数拼
 PK=$(ipa_pkg_key "$C$([ "$SIGN" = dev ] || echo " sign=$SIGN")${S2A_BUNDLE_ID:+ bid=$BID} dn=$DN$([ "${ALLCAPS:-0}" = 1 ] && echo " allcaps")$([ "${NATIVE:-0}" = 1 ] && echo " native")" "$CUR" "$G") || exit 1   # 资源输入键算不出 = 失败（ipa_key.sh 已报红），不拿缺项的键去比
 [ -z "$SIKEY" ] || PK="$PK save=$SIKEY"
-# 登记前核管线归档（10-21 维护者：归档 0 KB 的包判红、不登记，免得调度把首遇全现编的包装上测试设备 / 给 维护者）
 # 登记说明带上没解出的追加内容（审计 P2-30：解不出不拦本体，但不许静默算全绿）
-reg() { local an; root_pso0_gate "$(dirname "$1")" "$G" || return 1; an=$(root_aoc_note "$(dirname "$1")"); an=${an#；}
-  if root_pso0 "$(dirname "$1")" > /dev/null; then S2A_PKG_NOTE="例外：归档 0 KB，${S2A_ALLOW_PSO0}${an:+；$an}" bash "$S2A_PRIVATE_TOOLS/sched.sh" pkg "$G" "$1" "$C"; else S2A_PKG_NOTE=$an bash "$S2A_PRIVATE_TOOLS/sched.sh" pkg "$G" "$1" "$C"; fi; }
+reg() { local an; an=$(root_aoc_note "$(dirname "$1")"); an=${an#；}; S2A_PKG_NOTE=$an bash "$S2A_PRIVATE_TOOLS/sched.sh" pkg "$G" "$1" "$C"; }
 [ -z "$AO" ] && root_stage_done "$CUR" pkg "$PK" && { rm -f "$TL0"; echo "🟢 $G 现行已是包 $PK$(root_aoc_note "$CUR")"; [ $REG = 1 ] && { reg "$CUR/pkg" || exit 1; }; exit 0; }
 # -H：产物根的 romfs 是指向 RomFS 共享存储的相对软链（pack/roots.sh），临时目录里照抄会悬空；跟随它克隆成真目录（同原先）
 if [ -n "$AO" ]; then AOT=$(mktemp -d) || exit 1; trap 'plock_release "$PL_PID"; _root_rm_red "$AOT" "$G 只出程序（临时工作根）"' EXIT; W=$AOT/root; TAG=; mkdir -p "$W" && for e in $(ls -A "$CUR"); do [ "$e" = pkg ] || cp -cRH "$CUR/$e" "$W/" || exit 1; done || { echo "【红】$G 只出程序：克隆产物根 $CUR 失败"; exit 1; }   # 不克隆 pkg/（上一版资源包几万个文件，快道的资源包取自登记快照）
@@ -110,7 +107,9 @@ errline() { LC_ALL=C /usr/bin/grep -a -m1 -E 'error:|fatal error' "$1" 2> /dev/n
 #   10-21 查实：原先整个 pkg/ 先删，九款每版都把 3.5 万–13.8 万个文件（10–34 GB）全部重克隆、重算 SHA、再逐字节核对，资源包 + 核对 1–2 分钟
 t0=$SECONDS; for e in "$W/pkg"/*; do case "${e##*/}" in pack|pack.files|pack.image.key|pack.files.state.tsv|pack.files.verify.tsv) ;; *) _root_rm "$e";; esac; done; _root_rm "$W/build"; mkdir -p "$W/pkg"
 TL=$W/pkg/timing.tsv; { printf '步\t墙钟秒\tuser秒\tsys秒\t退出码\n'; cat "$TL0"; } > "$TL"; rm -f "$TL0"   # 出包子步拆账（10-20 维护者：有缓存时出包 476 秒，要分清是哪一步）
-PN=5; PD=0   # 出包步数：组装（预编壳）、签名、打 ipa、资源包、资源包核对（本提交第一次出包另加一步出壳）
+# 出包步数：收尾各步由 pack/ipa_tail.py plan_steps 按签名方式 / 只出程序定（不在这里手写常数，原先写死 5 显示过「出包 6/5」）；本提交第一次出包另加一步出壳
+TAILN=$("${S2A_PY:-python3}" "$H/ipa_tail.py" --count-steps --work - --game - --shell - --bundle-id - --key - --title - --sign "$SIGN" ${AO:+--app-only}) || fail "算不出出包步数"
+PN=$TAILN; PD=0
 tmk() { TM "$@"; local r=$?; PD=$((PD + 1)); prog_tick 出包 "$PD" "$PN"; return $r; }   # 计时（tools/tm.py）+ 记一步进度
 # 包内能力清单 s2a_caps.tsv（组装时 pack/ship_ext.py 拷进包、宿主 caps.c 读）：改写阶段已在各平台共用的产物根里出好两份（pack/stage_rewrite.sh → pack/gen_caps.sh），这里不再另生成：
 #   缺省 = 发布包（默认开、强信号才关）；--all-caps = 测试包（有来源即开），用 s2a_caps.all.tsv 顶替
@@ -138,19 +137,19 @@ if [ -z "$SHELL_DIR" ]; then
   fi
   if [ ! -f "$SHELL_DIR/manifest.json" ] || [ -n "$STALE" ]; then mkdir -p "$SC" || fail "建不了壳缓存目录 $SC"
     [ "$(uname -s)" = Darwin ] || fail "本机没有壳 ${SID}，也没给发布源 S2A_SHELL_SOURCE（只有 Mac 能现出壳）"
-    ST=$SC/.tmp.$SID.$$; tmk "出壳（本提交第一次）" "$TL" -- bash "$H/shell_build.sh" "$ST" >> "$W/pkg/build.log" 2>&1 || { rm -rf "${ST:?}"; fail "出壳失败（$(grep -a '【红】' "$W/pkg/build.log" | tail -1)）"; }
-    if [ -n "$STALE" ] && ! mv "$SHELL_DIR" "$SC/.tmp.stale.$SID.$$" 2> /dev/null; then   # 旧编译器出的那份挪开（.tmp.* 由 tools/gc.sh 两小时后删）
+    ST=$SC/.tmp.$SID.$$; PN=$((TAILN + 1)); tmk "出壳（本提交第一次）" "$TL" -- bash "$H/shell_build.sh" "$ST" >> "$W/pkg/build.log" 2>&1 || { rm -rf "${ST:?}"; fail "出壳失败（$(grep -a '【红】' "$W/pkg/build.log" | tail -1)）"; }
+    if [ -n "$STALE" ] && ! mv "$SHELL_DIR" "$SC/.tmp.stale.$SID.$$" 2> /dev/null; then   # 旧编译器出的那份挪开（.tmp.* 两小时后可清：维护方内部清扫器定期删，手动清要确认无出包在跑）
       [ ! -e "$SHELL_DIR" ] || fail "旧编译器出的壳 $SHELL_DIR 挪不开（不挪开新壳会被套进它里面）"; fi   # 别的单已先挪走 = 不在了，照常
     if ! mv "$ST" "$SHELL_DIR" 2> /dev/null; then rm -rf "${ST:?}"; fi   # 两单同时出同一提交的壳：先到的发布，后到的丢自己那份（内容相同）
     s2a_tc_fp > "$SC/.$SID.toolchain" || fail "记不下壳的工具链版本（$SC/.$SID.toolchain）"
   fi
 fi
-touch "$SHELL_DIR" 2> /dev/null   # 目录时间 = 最近使用（tools/gc.sh 按它清壳缓存）
+touch "$SHELL_DIR" 2> /dev/null   # 目录时间 = 最近使用（维护方内部清扫器按它清壳缓存）
 [ -f "$SHELL_DIR/root/S2AShell.tables" ] && [ -f "$SHELL_DIR/manifest.json" ] || fail "壳目录 $SHELL_DIR 不完整（要 root/S2AShell.tables 与 manifest.json，pack/shell_build.sh 出）"
 # 出包收尾（组装 → 存档身份 → 图标 → Info.plist → 签名 → 提高内存上限权限核实 → 打 ipa → 进包核对 → 资源包 → 资源包核对）：唯一实现在 pack/ipa_tail.py，
 #   Windows 的 Python 编排调同一份（#1100，11-04）。包号 / 着色器目标 / 画面模式 / 资源包要件的判法都在那里
 . "$H/build_id.sh"; PKID=$(s2a_build_id "$PK")
-S2A_PKG_PROG_DONE=$PD S2A_PKG_PROG_TOTAL=$PN "${S2A_PY:-python3}" "$H/ipa_tail.py" --work "$W" --game "$G" --shell "$SHELL_DIR" --bundle-id "$BID" --suffix "$DSUF" \
+S2A_PKG_PROG_DONE=$PD "${S2A_PY:-python3}" "$H/ipa_tail.py" --work "$W" --game "$G" --shell "$SHELL_DIR" --bundle-id "$BID" --suffix "$DSUF" \
   --key "$PK" --title "$DT" --sign "$SIGN" --team "$TEAM" ${SIKEY:+--save-identity "$SI"} ${AO:+--app-only} > "$W/pkg/tail.out" 2>&1; trc=$?
 grep -av "^【红】" "$W/pkg/tail.out"; [ $trc = 0 ] || fail "$(grep -a "^【红】" "$W/pkg/tail.out" | tail -1 | sed "s/^【红】//")"
 if [ -n "$AO" ]; then mkdir -p "${S2A_APP_ONLY_OUT:?只出程序要 S2A_APP_ONLY_OUT}" && cp "$W/pkg/$G.ipa" "$W/pkg/timing.tsv" "$W/pkg/build.log" "$S2A_APP_ONLY_OUT/" || fail "拷出 ipa 失败"

@@ -14,7 +14,7 @@ struct GameSizesList: View {
     let sizes: GameSizes
     var compact = false
 
-    private func t(_ id: String) -> String { BackendText.launcherText("library.sizes." + id, language: loc.lang == .zh ? "zh-Hans" : "en") }
+    private func t(_ id: String) -> String { BackendText.launcherText("library.sizes." + id, language: loc.lang.sharedCode) }
 
     static func rows(_ s: GameSizes) -> [(id: String, bytes: Int64)] {
         [("imageMac", s.imageMac), ("imageIos", s.imageIos), ("saves", s.saves), ("cache", s.cache), ("sources", s.sources)]
@@ -43,7 +43,7 @@ struct StorageOverviewSection: View {
     @ObservedObject var model: S2ArmLauncherModel
     @EnvironmentObject var loc: Localizer
 
-    private func t(_ id: String) -> String { BackendText.launcherText("storage." + id, language: loc.lang == .zh ? "zh-Hans" : "en") }
+    private func t(_ id: String) -> String { BackendText.launcherText("storage." + id, language: loc.lang.sharedCode) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 24) {
@@ -53,7 +53,8 @@ struct StorageOverviewSection: View {
             if let o = model.overview {
                 CardGroup(t("locations")) {
                     ForEach(o.locations) { l in
-                        CardRow(l.volume.isEmpty ? l.path : l.volume, detail: detail(l), detail2: l.path, dot: l.connected ? LauncherPalette.ready : LauncherPalette.unbuilt) {
+                        // 行首给具体路径（不再给卷名、路径缩到副行）：几行都叫「系统盘」分不清（名字同出包页下拉框 locationName）
+                        CardRow(S2ArmLauncherModel.locationName(path: l.path, volume: l.volume), detail: detail(l), dot: l.connected ? LauncherPalette.ready : LauncherPalette.unbuilt) {
                             Text(l.isDefault ? t("location.default") : "").font(.manrope(12)).foregroundStyle(.secondary)
                         }
                         if l.id != o.locations.last?.id { CardDivider() }
@@ -67,13 +68,16 @@ struct StorageOverviewSection: View {
                         if part.id != o.shared.last?.id { CardDivider() }
                     }
                 }
-                CardGroup(t("games"), footnote: BackendText.launcherText("library.sizes.sourcesNote", language: loc.lang == .zh ? "zh-Hans" : "en")) {
+                CardGroup(t("games"), footnote: BackendText.launcherText("library.sizes.sourcesNote", language: loc.lang.sharedCode)) {
                     ForEach(o.games) { g in
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text(g.name).font(.manrope(13.5, .semibold))
-                            GameSizesList(sizes: g.sizes, compact: true)
+                        // 游戏名和设置行共用同一条文字起始线。
+                        HStack(alignment: .top, spacing: LauncherTheme.Space.medium) {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text(g.name).font(.manrope(14, .semibold)).fixedSize(horizontal: false, vertical: true)
+                                GameSizesList(sizes: g.sizes, compact: true)
+                            }
                         }
-                        .padding(.horizontal, 16).padding(.vertical, 10)
+                        .padding(.horizontal, LauncherTheme.Metrics.cardInset).padding(.vertical, LauncherTheme.Space.large)
                         if g.id != o.games.last?.id { CardDivider() }
                     }
                 }

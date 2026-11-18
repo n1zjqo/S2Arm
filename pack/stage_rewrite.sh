@@ -11,7 +11,9 @@
 # 缓存键 = 改写器 + 扫描器源码树对象号 + 启用表 sha（+ 非苹果目标平台 S2A_TARGET）+ 本阶段脚本 + 实际读过的生成器与表（.stage_rewrite.deps，tools/stage_deps.py）：
 #   版本标签 rw-<不含实际读入部分的键前 10 位>（非苹果再带 -<平台>），现行根记的键相同就跳过。
 #   S2A_TARGET 决定改写器出的补丁代码（如鸿蒙线程槽取法），不进键会让一个平台的产物被当成另一个平台的现行产物复用；缺省 apple 时键与原先相同。
-# 改写失败（有缺口退出码 3 等）→ 中止新版本、现行不动、报红。单模块墙钟 ≤ 600 秒。
+# 改写有缺口（退出码 3、产物照出）→ 降级继续：缺口点保持原指令，按类汇总进产物根 degrade.rewrite.tsv、打【黄】（v0.3.1 拿不准不停）；
+#   退出码 3 却没产物（补丁区放不下 / 丢自旋回边）与其余失败 → 中止新版本、现行不动、报红。单模块按无进展看门狗停（tools/nostall.py：CPU 在涨 / 在写就不停，连续 S2A_NOSTALL_S 秒〔缺省 600〕没进展才停；
+#   v0.3.1 拿不准不停：原先固定墙钟 timeout 600，满载机上正常慢的大模块会被当挂死杀掉）。
 set -u
 G=${1:?款}; H=$(cd "$(dirname "$0")" && pwd); R=$(cd "$H/.." && pwd); source "$H/roots.sh"
 # 扫描器与本阶段各 Python 工具的解释器钉死一个（tools/rewriter-requirements.txt：capstone / lz4 版本固定，宽屏扫描器用；10-22 gate-host 的 /usr/bin/python3 没有 capstone，门禁改写全失败）
@@ -39,9 +41,11 @@ VT="${S2A_WIDEN_DIR:-$R/graphics/widen/tables}/verified.tsv"; VR=$([ -f "$VT" ] 
 # 同身份的仓库表和最近 30 局真实日志只提高已知下限（不读现行根上一次出的表：采集结果回灌自己会让旧值永不退场）。先采集再判缓存；坏表不可退成无表。
 # 帧率表（10-26，体系提升方案 D）：仓库 runtime/fps/<main 构建号前 16 位>.tsv 有就拷进产物根作 fps.tsv（runtime/src/fps.c 装载后读），按「文件名 + 内容」进键；没有 = 原生帧率
 FT="$R/runtime/fps/${BID:0:16}.tsv"; [ -f "${FT}" ] || FT=
+# 游戏缺陷修补表（11-16，runtime/fix/README.md）：仓库 runtime/fix/<main 构建号前 16 位>.tsv 有就交改写器（S2A_FIX_TSV，fix_rows），按内容进键；不进产物根
+XT="$R/runtime/fix/${BID:0:16}.tsv"; [ -f "${XT}" ] || XT=
 # 社区画面补丁（pack/cpatch.py）：匹配上的补丁编成「双路 + 槽」进包，开关在运行时。
-#   10-30 维护者 拍板：社区补丁一律学成我方通用能力（60 帧 / 满屏），公开发布的包不带上游补丁字节 ⇒ 缺省不打；内部开发 / 测试包要对照时显式设 S2A_COMMUNITY_PATCHES=1
-#   （依据：依赖许可核查 N1 / U3——上游补丁多数没有声明许可）。补丁索引目录照常认出（tools/fps_warehouse.py 从里面学帧率地址这类事实层，不带补丁字节）
+#   11-12 维护者拍板：出包时自动对接公开库（pack/jobs/patches.py 按真构建号查索引、取文件，交 S2A_CPATCH_DIRS），查到的全部进包、缺省关、玩家在启动设置里开；
+#   10-30「公开发布的包不带上游补丁字节」作废。我方不托管补丁字节，只在玩家本机按需下载
 #   缺省开 = 仓库 graphics/cpatch/verified.tsv 里本款「程序号 + main 构建号」的行（我方验过）
 #   + S2A_CPATCH（逗号分隔的编号；none = 这次不进社区补丁）+ 启动器玩家选择；补丁数据目录没有 = 不进，产物与原先逐字节相同。
 #   缺省开的编号、补丁索引与 pack/cpatch.py 进改写键
@@ -55,10 +59,16 @@ fi
 # 补丁索引目录：S2A_CPATCH_DIRS（冒号分隔）没给就同启动器（pack/jobs/community.py _indexes），S2A_COMMUNITY_DIR（环境 → tools/machine.local；都没有 = 没有社区补丁，不再缺省读开发机数据盘）下 INDEX.tsv 所在目录：
 #   第一轮布局 <包>/full/<名>/INDEX.tsv、第二轮布局 <包>/<类>/INDEX.tsv（10-27 gfxpatches：60fps / ultrawide / other-gfx，之前只认第一轮、整包没进）；名字以 -lite 结尾的包是同轮子集，不收
 CDIR=${S2A_COMMUNITY_DIR:-$(bash "$R/tools/machine.sh" get S2A_COMMUNITY_DIR 2> /dev/null)}
-[ -n "${S2A_CPATCH_DIRS:-}" ] || [ -z "$CDIR" ] || S2A_CPATCH_DIRS=$(for f in "$CDIR"/*/full/*/INDEX.tsv "$CDIR"/*/*/INDEX.tsv; do
+# S2A_CPATCH=none（出包页取消 S 级优化，pack/jobs/patches.py prepare）：不从本机补丁库目录兜底，帧率仓库条目（下面 fps_warehouse）也不读
+[ "${S2A_CPATCH:-}" = none ] || [ -n "${S2A_CPATCH_DIRS:-}" ] || [ -z "$CDIR" ] || S2A_CPATCH_DIRS=$(for f in "$CDIR"/*/full/*/INDEX.tsv "$CDIR"/*/*/INDEX.tsv; do
   [ -f "$f" ] || continue; [[ $f == */*-lite/* ]] && continue; dirname "$f"; done | paste -sd: -)
-CK=; if [ "${S2A_COMMUNITY_PATCHES:-0}" = 1 ] && [ -n "${S2A_CPATCH_DIRS:-}" ] && [ "${S2A_CPATCH:-}" != none ]; then
-  CK=" cpatch=$( { printf '%s\n' "$CSEL"; cat "$R/pack/cpatch.py"; IFS=:; for d in $S2A_CPATCH_DIRS; do cat "$d/INDEX.tsv" 2> /dev/null; done; } | shasum -a 256 | cut -c1-16)"
+# 金手指（11-12 维护者：出包时把能编进包的金手指带上）：S2A_CHEATS_DIRS（冒号分隔，玩家导入的 + 启动器从公开库取的 Atmosphere txt）里改代码的条目
+#   走同一条双路 + 槽（pack/cpatch.py scan_cheats），缺省全关、局内逐条开关；只写可写内存的条目不进包，照旧由运行时 Tamper 执行。
+#   金手指文件内容进改写键（开关 enabled.txt / 状态 status.txt 不进：玩家开关不重跑改写）
+CI=(); [ -n "${S2A_CPATCH_DIRS:-}" ] && IFS=: read -r -a CI <<< "$S2A_CPATCH_DIRS"   # 11-12 维护者：查到的补丁全部进包、缺省关、玩家自己开（10-30「玩家包不带上游补丁字节」作废）
+CK=; if { [ ${#CI[@]} -gt 0 ] || [ -n "${S2A_CHEATS_DIRS:-}" ]; } && [ "${S2A_CPATCH:-}" != none ]; then
+  CK=" cpatch=$( { printf '%s\n' "$CSEL"; cat "$R/pack/cpatch.py"; for d in ${CI[@]+"${CI[@]}"}; do cat "$d/INDEX.tsv" 2> /dev/null; done
+    IFS=:; for d in ${S2A_CHEATS_DIRS:-}; do for f in "$d"/*.txt; do case ${f##*/} in enabled.txt | status.txt) continue ;; esac; [ -f "$f" ] && { printf '%s\n' "${f##*/}"; cat "$f"; }; done; done; } | shasum -a 256 | cut -c1-16)"
 fi
 AN=$AD/addr_need.tsv
 # 程序号取 exefs/main.npdm 的 ACI0（真身份，每个根都有）；unpack.tsv 只有解包 / 直连播种才带（#459：只出通用的根没有它，出包停在这里）
@@ -70,7 +80,7 @@ UB=$(grep '^上限不定原因' "$AN" | cut -f2-); [ -z "$UB" ] || echo "  $G �
 # 改写器进键只取它的编译输入（rewriter.py source：CMakeLists / main.c / rewriter.c / rewriter.h / prepare_deps.py）+ 本阶段调的 nro_to_nso.py，
 #   不取整个 runtime/rewriter 目录的树号（10-31：原先 README / 许可说明改一行，全部款整段重改写）
 SD=$("$PY" "$H/rewriter.py" source) && [ -s "$R/runtime/rewriter/nro_to_nso.py" ] || { echo "【红】取不到改写器编译输入指纹（pack/rewriter.py source）或 runtime/rewriter/nro_to_nso.py"; exit 1; }
-KR=$( { echo "$SD"; cat "$R/runtime/rewriter/nro_to_nso.py"; } | shasum -a 256 | cut -c1-40); [ ${#KR} = 40 ] && KS=$(git -C "$R" rev-parse HEAD:graphics/widen/scan 2>/dev/null) || { echo "【红】改写器指纹不完整或取不到 graphics/widen/scan 的树对象号"; exit 1; }
+KR=$( { echo "$SD"; cat "$R/runtime/rewriter/nro_to_nso.py"; } | shasum -a 256 | cut -c1-40); [ ${#KR} = 40 ] && KS=$(scan_tree "$R") || { echo "【红】改写器指纹不完整或取不到 graphics/widen/scan 的树对象号"; exit 1; }
 RK=$("$PY" "$H/rewriter.py" key) || exit 1
 T=${S2A_TARGET:-apple}; TK=; [ "$T" = apple ] || TK=" target=$T"
 # 自旋闸（S2A_REWRITE_SPIN=1，原生层借鉴上游的一项）改改写产物（多出 S 行与 spin 门），要进键：不进键时私有根从共享现行起步会判「改写没变」跳过，出的包没有自旋区（10-24 测试出包线）
@@ -89,13 +99,16 @@ CP=; PK=; [ -n "${S2A_PATCH_DIR:-}" ] && [ -f "$S2A_PATCH_DIR/$PID/patch.tsv" ] 
 source "$H/patch_ship.sh"; PS=; [ -n "$CP" ] && ipa_patch_ship "$CP" "$BID" && PS=$CP
 [ -z "$PS" ] || PK="$PK ship=$(shasum -a 256 < "$PS" | cut -c1-16)"
 # 改写器进键：替换显式 C 二进制（S2A_REWRITER_C / App 自带）必须重改写，不能复用另一份二进制的阶段戳。
-K=$(printf '%s backend=%s%s%s%s%s' "$K" "$RK" "$CK" "$PK" "$([ -n "${FT}" ] && printf ' fps=%s' "$(shasum -a 256 < "${FT}" | cut -c1-16)")" "$([ -n "$VR" ] && printf ' verified=%s' "$(printf '%s' "$VR" | shasum -a 256 | cut -c1-16)")" | shasum -a 256 | cut -c1-10)
+K=$(printf '%s backend=%s%s%s%s%s' "$K" "$RK" "$CK" "$PK" "$([ -n "${FT}" ] && printf ' fps=%s' "$(shasum -a 256 < "${FT}" | cut -c1-16)")$([ -n "${XT}" ] && printf ' fix=%s' "$(shasum -a 256 < "${XT}" | cut -c1-16)")" "$([ -n "$VR" ] && printf ' verified=%s' "$(printf '%s' "$VR" | shasum -a 256 | cut -c1-16)")" | shasum -a 256 | cut -c1-10)
 # 仓库输入清单不含产物根：main 构建号相同也可能换了 subsdk 或 NRO，按相对路径 + 完整内容进键。
 # NRO 枚举同 nro_to_nso.py：任意深度（含点目录）、后缀不分大小写；分块读取只限内存，不抽样内容。
 # RomFS 遍历经 graphics/nvn/tools/romfs_list.py（仓库里唯一的 RomFS 遍历，walk 同 os.walk）
 # NRR 登记表（*.nrr）同样按内容进键：nro_to_nso.py 按它到 romfs 其余文件（一款第一方格斗游戏 data.arc）里找藏着的 NRO。那些大文件本身不进键（17.6 GB 每次判跳过都重算不可取）：
 #   收进的 NRO 只认 NRR 登记的 SHA-256，内容由登记表定死；只有「NRR 不变、归档里换了位置 / 删了」才会让表里来源列或有无变而键不变。
-IK=$("$PY" - "$CUR" "$R" <<'INPUT_KEY'
+# 运行时留下的 NRO（S2A_NRO_KEPT_DIR，启动器给游戏库 games/<号>/nro_kept/；#8be819 游戏自有加密归档里的 NRO，宿主 LoadNro 缺表时存下游戏解开的那份）：
+#   nro_to_nso.py 第三来源，*.nro 按文件名 + 内容进键（新留下一份 = 要重改写）。没设 / 目录不在 = 无，键与原先相同
+KEPT=${S2A_NRO_KEPT_DIR:-}; [ -n "$KEPT" ] && [ -d "$KEPT" ] || KEPT=
+IK=$("$PY" - "$CUR" "$R" "$KEPT" <<'INPUT_KEY'
 import hashlib, os, sys
 from pathlib import Path
 root = Path(sys.argv[1])
@@ -105,19 +118,23 @@ paths = [p for p in (root / 'exefs').iterdir() if p.is_file()]
 def walk_error(error):
     raise error
 romfs = root / 'romfs'
-if romfs.is_dir():
+if romfs_list.is_dir(romfs):   # RomFS 目录或镜像 romfs.std（romfs_list image_of）；镜像里的 NRO / NRR 下面经 open_file 读
     for directory, _, names in romfs_list.walk(romfs, onerror=walk_error):
         paths.extend(Path(directory) / name for name in names if name.lower().endswith(('.nro', '.nrr')))
 digest = hashlib.sha256(b'rewrite-inputs-v1\0')
 for path in sorted(paths, key=lambda p: os.fsencode(p.relative_to(root).as_posix())):
     relative = os.fsencode(path.relative_to(root).as_posix())
     content = hashlib.sha256()
-    with path.open('rb') as stream:
+    with romfs_list.open_file(path) as stream:   # 盘上的文件同 open；RomFS 只有镜像时从镜像读
         for block in iter(lambda: stream.read(1024 * 1024), b''):
             content.update(block)
     digest.update(len(relative).to_bytes(8, 'little'))
     digest.update(relative)
     digest.update(content.digest())
+if sys.argv[3]:
+    for path in sorted(Path(sys.argv[3]).glob('*.nro'), key=lambda p: os.fsencode(p.name)):
+        content = hashlib.sha256(path.read_bytes()).digest()
+        digest.update(b'kept\0' + len(path.name).to_bytes(8, 'little') + os.fsencode(path.name) + content)
 print(digest.hexdigest())
 INPUT_KEY
 ) || { echo "【红】$G 读不出改写输入内容指纹" >&2; exit 1; }
@@ -132,13 +149,13 @@ C=$("$PY" "$H/rewriter.py" c-path) || exit 1
 REWRITE=("$C")
 TAG=$(root_tag "$G" "$TAG")
 W=$(root_begin "$G" "$TAG") || exit 1
-rm -f "$W"/*.code_patch.tsv "$W"/*.patched.bin "$W"/*.fixups.tsv "$W"/*.gates.tsv "$W"/*.sites.tsv "$W"/*.gaps.tsv "$W"/*.npdm "$W"/*.widen.tsv "$W"/widen_sites.tsv "$W"/cpatch.tsv "$W"/cpatch_rows.tsv "$W"/cpatch_plan.log "$W"/cpatch_excluded.tsv "$W"/widen_enable*.tsv "$W"/widen_verified.tsv "$W"/widen_full*.tsv "$W"/addr_need.tsv "$W"/nro_exports.tsv "$W"/fps.tsv "$W"/patch.tsv   # 上一版改写产物不带进新版
+rm -f "$W"/*.code_patch.tsv "$W"/*.patched.bin "$W"/*.fixups.tsv "$W"/*.gates.tsv "$W"/*.sites.tsv "$W"/*.gaps.tsv "$W"/*.npdm "$W"/*.widen.tsv "$W"/widen_sites.tsv "$W"/cpatch.tsv "$W"/cpatch_rows.tsv "$W"/cpatch_plan.log "$W"/cpatch_excluded.tsv "$W"/cheat-src.*.txt "$W"/fpslocker.json "$W"/widen_enable*.tsv "$W"/widen_verified.tsv "$W"/widen_full*.tsv "$W"/addr_need.tsv "$W"/nro_exports.tsv "$W"/fps.tsv "$W"/patch.tsv   # 上一版改写产物不带进新版
 t0=$SECONDS; n=0
 # romfs 里的 NRO（10-29 普查 c1029c：大航海4 HD / 魔界战记6 / 忍者龟用 nn::ro 装，我方 LoadNro 映射未支持 → 游戏 Break）：
 #   转成 NSO 放 nroexe/、与 exefs 模块一样改写（模块名 nro0…），运行时 ro LoadNro 按 NRO 文件 SHA-256 查 nro_modules.tsv 映射改写好的映像（runtime/src/loader.c s2a_nro_map）。
 #   零配置：romfs 任意深度的 *.nro；有 .nrr 登记表时还收藏在 romfs 其余文件里（原样 / zstd 帧）、哈希登记过的 NRO（11-03 一款第一方格斗游戏 data.arc）；没有 NRO 不出表。nroexe/ 是中间产物，改写完删
 rm -f "$W/nro_modules.tsv"; rm -rf "$W/nroexe"
-"$PY" "$R/runtime/rewriter/nro_to_nso.py" "$W/romfs" "$W/nroexe" > "$W/nro_to_nso.log" 2>&1 || { echo "【红】$G 转 romfs 里的 NRO 失败（$(tail -1 "$W/nro_to_nso.log")）"; root_abort "$G" "$TAG"; exit 1; }
+"$PY" "$R/runtime/rewriter/nro_to_nso.py" "$W/romfs" "$W/nroexe" ${KEPT:+"$KEPT"} > "$W/nro_to_nso.log" 2>&1 || { echo "【红】$G 转 romfs 里的 NRO 失败（$(tail -1 "$W/nro_to_nso.log")）"; root_abort "$G" "$TAG"; exit 1; }
 [ ! -f "$W/nroexe/nro_modules.tsv" ] || mv "$W/nroexe/nro_modules.tsv" "$W/nro_modules.tsv" || { root_abort "$G" "$TAG"; exit 1; }
 "$PY" "$R/graphics/widen/scan/wide_scan.py" "$W/exefs" --tsv "$W/widen_sites.tsv" > "$W/widen_scan.log" 2>&1 || { echo "【红】$G 宽屏候选扫描失败（$(tail -1 "$W/widen_scan.log")）"; root_abort "$G" "$TAG"; exit 1; }
 for t in ${EN[@]+"${EN[@]}"}; do cp "$t" "$W/" || { root_abort "$G" "$TAG"; exit 1; }; done
@@ -147,10 +164,11 @@ for t in ${EN[@]+"${EN[@]}"}; do cp "$t" "$W/" || { root_abort "$G" "$TAG"; exit
 [ -z "$PS" ] || cp "$PS" "$W/patch.tsv" || { root_abort "$G" "$TAG"; exit 1; }
 # 帧率表的 c 行（按构建号改指令）由改写器读（rewriter.c）；没有帧率表就不给，改写产物与原先逐字节相同
 if [ -n "${FT}" ]; then export S2A_FPS_TSV="$W/fps.tsv"; else unset S2A_FPS_TSV; fi
+if [ -n "${XT}" ]; then export S2A_FIX_TSV="${XT}"; else unset S2A_FIX_TSV; fi
 if [ -n "$CP" ]; then export S2A_CODE_PATCH=$CP S2A_CODE_BUILD=$BID; else unset S2A_CODE_PATCH S2A_CODE_BUILD; fi
 # 各模块并行改写（10-25 维护者「多核加速……要适配机器的核心数」）：改写器只读本模块与 widen_sites.tsv、产物都带模块名前缀（<模块>.patched.bin / .fixups.tsv / …），
 #   互不依赖；同时最多 S2A_JOBS（缺省本机核数，读不出就停：#824 F-pack-sysctl-jobs）个，退出码记临时目录（不进产物根），全部跑完再按模块名顺序判
-# rw_all <容许缺口>：全部模块改写一遍；容许缺口 = 1 时退出码 3（有缺口）的模块记进 R3、不当失败（社区补丁轮：缺口由 cpatch.py prune 认领）
+# rw_all：全部模块改写一遍；退出码 3（有缺口、产物照出）的模块记进 R3、不当失败（社区补丁轮：缺口由 cpatch.py prune 认领；其余缺口降级继续）
 rw_all() {
 NJ=${S2A_JOBS:-$(getconf _NPROCESSORS_ONLN)}; [ "$NJ" -ge 1 ] 2> /dev/null || { echo "【红】$G 并行度读不出（S2A_JOBS / getconf 核数），不放开并发"; root_abort "$G" "$TAG"; exit 1; }
 RC=$(mktemp -d); MS=(); R3=(); n=0
@@ -160,30 +178,31 @@ for f in "$W"/exefs/* "$W"/nroexe/nro*; do
   #   （11-02 普查 010020D01B890000 exefs 有 486 字节文本 main.moduleconfig「VIA_MODULE_AUDIORENDER;…」，原先按「不是 rtld / *.npdm」当模块改写 → 断言 NSO0 失败、整款出包红）
   m=$(basename "$f"); case $f in "$W"/exefs/*) case $m in main|sdk|subsdk[0-9]) ;; *) continue;; esac;; esac
   while [ "$(jobs -rp | wc -l)" -ge "$NJ" ]; do wait -n; done
-  ( env -u S2A_DEPS_OUT timeout 600 "${REWRITE[@]}" "$f" "$W" "$m" "$W/widen_sites.tsv" > "$W/$m.rewrite.log" 2>&1; echo $? > "$RC/$m" ) & MS+=("$m")
+  ( env -u S2A_DEPS_OUT "$PY" "$R/tools/nostall.py" "${S2A_NOSTALL_S:-600}" -- "${REWRITE[@]}" "$f" "$W" "$m" "$W/widen_sites.tsv" > "$W/$m.rewrite.log" 2>&1; echo $? > "$RC/$m" ) & MS+=("$m")
 done; wait
 for m in ${MS[@]+"${MS[@]}"}; do rc=$(cat "$RC/$m" 2> /dev/null || echo 9)
-  if [ "$1" = 1 ] && [ "$rc" = 3 ]; then R3+=("$m"); n=$((n + 1)); continue; fi
-  [ "$rc" = 0 ] || { echo "【红】$G 改写 $m 失败（rc=${rc}：$([ "$rc" = 124 ] && echo "超过 600 秒被停" || tail -1 "$W/$m.rewrite.log" | cut -c1-160)；日志 $S2A_ROOTS/.failed/${G}_$m.log）"; mkdir -p "$S2A_ROOTS/.failed"; cp "$W/$m.rewrite.log" "$S2A_ROOTS/.failed/${G}_$m.log"; rm -rf "$RC"; root_abort "$G" "$TAG"; exit 1; }
+  if [ "$rc" = 3 ] && [ -f "$W/$m.patched.bin" ]; then R3+=("$m"); n=$((n + 1)); continue; fi
+  [ "$rc" = 3 ] && { echo "【红】$G 改写 ${m}：这款有程序代码需要的改写空间超过了能放下的上限，出不了包（日志 $S2A_ROOTS/.failed/${G}_$m.log）"; mkdir -p "$S2A_ROOTS/.failed"; cp "$W/$m.rewrite.log" "$S2A_ROOTS/.failed/${G}_$m.log"; rm -rf "$RC"; root_abort "$G" "$TAG"; exit 1; }
+  [ "$rc" = 0 ] || { echo "【红】$G 改写 $m 失败（rc=${rc}：$([ "$rc" = 124 ] && echo "${S2A_NOSTALL_S:-600} 秒没有进展被停" || tail -1 "$W/$m.rewrite.log" | cut -c1-160)；日志 $S2A_ROOTS/.failed/${G}_$m.log）"; mkdir -p "$S2A_ROOTS/.failed"; cp "$W/$m.rewrite.log" "$S2A_ROOTS/.failed/${G}_$m.log"; rm -rf "$RC"; root_abort "$G" "$TAG"; exit 1; }
   n=$((n + 1))
 done; rm -rf "$RC"
 }
 rw_all 0
 if [ -n "$CK" ]; then   # 社区补丁：先按不带补丁的改写点预筛出表，再带补丁行改写；补丁造成的缺口剔掉那份重来，别的缺口照旧报红
-  IFS=: read -r -a CD <<< "$S2A_CPATCH_DIRS"; : > "$W/cpatch_excluded.tsv"; : > "$W/cpatch_plan.log"
+  : > "$W/cpatch_excluded.tsv"; : > "$W/cpatch_plan.log"
   for cr in 1 2 3 4 5 6; do
-    "$PY" "$R/pack/cpatch.py" plan "$W" "${CSEL#none}" "${CD[@]}" 2>> "$W/cpatch_plan.log" || { echo "【红】$G 社区补丁出表出错（$(tail -1 "$W/cpatch_plan.log")）"; root_abort "$G" "$TAG"; exit 1; }
+    "$PY" "$R/pack/cpatch.py" plan "$W" "${CSEL#none}" ${CI[@]+"${CI[@]}"} 2>> "$W/cpatch_plan.log" || { echo "【红】$G 社区补丁出表出错（$(tail -1 "$W/cpatch_plan.log")）"; root_abort "$G" "$TAG"; exit 1; }
     [ -s "$W/cpatch_rows.tsv" ] || break   # 没有要改代码的补丁（只有数据补丁或一份都没匹配上）：不带补丁那一轮的产物就是终稿
     S2A_CPATCH_TSV="$W/cpatch_rows.tsv" rw_all 1
     "$PY" "$R/pack/cpatch.py" prune "$W" 2>> "$W/cpatch_plan.log"; prc=$?
     [ "$prc" = 10 ] && continue
     [ "$prc" = 0 ] || { echo "【红】$G 社区补丁认领缺口出错"; root_abort "$G" "$TAG"; exit 1; }
-    [ ${#R3[@]} = 0 ] || { echo "【红】$G 改写 ${R3[*]} 有补丁以外的缺口（$(tail -1 "$W/${R3[0]}.rewrite.log" | cut -c1-160)）"; root_abort "$G" "$TAG"; exit 1; }
-    break
+    break   # 剩下的是补丁以外的缺口：降级继续，见下面 degrade.rewrite.tsv
   done
-  [ ${#R3[@]} = 0 ] || { echo "【红】$G 社区补丁剔了 6 轮仍有缺口"; root_abort "$G" "$TAG"; exit 1; }
   echo "  $G 社区补丁：$(grep -c . "$W/cpatch.tsv" | awk '{print $1 - 1}') 份进包（双路 $(grep -c '^p' "$W/cpatch_rows.tsv") 字、常写 $(grep -c '^w' "$W/cpatch_rows.tsv") 字），不收 $(grep -c '^不收' "$W/cpatch_plan.log") 份（$W/cpatch_plan.log）"
 fi
+# 降级汇总（v0.3.1）：缺口按类别、兼容写法按处数，写 degrade.rewrite.tsv（出包作业收尾读它给玩家提示、诊断包收它）；没有降级就删掉旧表
+"$PY" "$R/pack/rewrite_degrade.py" "$W" "$G" || { echo "【红】$G 写降级汇总失败"; root_abort "$G" "$TAG"; exit 1; }   # 与 Windows pack/orch/stages.py 共用（#893）
 cp "$W/exefs/main.npdm" "$W/" || { root_abort "$G" "$TAG"; echo "【红】缺 main.npdm"; exit 1; }
 [ -z "$AN" ] || cp "$AN" "$W/addr_need.tsv" || { root_abort "$G" "$TAG"; exit 1; }
 cp "$AD/log" "$W/addr_need.log" || { root_abort "$G" "$TAG"; exit 1; }
@@ -204,7 +223,7 @@ if [ -z "${FT}" ] && [ "$fw" != 0 ]; then "$PY" "$R/tools/fps_generic.py" "$W" "
 rm -rf "$W/nroexe"   # NRO 转出的中间 NSO（nro_to_nso.py），改写完删；要在收集阶段依赖之前删，免得进依赖表
 K=$(stage_deps_save "$W" rewrite "$KB" "$H/stage_rewrite.sh") || { root_abort "$G" "$TAG"; exit 1; }
 echo "$K" > "$W/.stage_rewrite"
-ROOT_REPLAY='*.code_patch.tsv *.patched.bin *.fixups.tsv *.gates.tsv *.sites.tsv *.gaps.tsv *.npdm *.widen.tsv widen_sites.tsv cpatch.tsv cpatch_rows.tsv cpatch_plan.log cpatch_excluded.tsv widen_enable*.tsv widen_verified.tsv fps.tsv nro_modules.tsv nro_to_nso.log widen_full*.tsv patch.tsv addr_need.tsv addr_need.log nro_exports.tsv nro_exports.log gpu_drivers.tsv widen_scan.log fps_generic.log *.rewrite.log .stage_rewrite .stage_rewrite.deps' root_commit "$G" "$TAG" || exit 1   # 与系统数据 / 界面布局并行（pack/refresh.sh）：本阶段只写这些
+ROOT_REPLAY='degrade.rewrite.tsv *.code_patch.tsv *.patched.bin *.fixups.tsv *.gates.tsv *.sites.tsv *.gaps.tsv *.npdm *.widen.tsv widen_sites.tsv cpatch.tsv cpatch_rows.tsv cpatch_plan.log cpatch_excluded.tsv cheat-src.*.txt fpslocker.json widen_enable*.tsv widen_verified.tsv fps.tsv nro_modules.tsv nro_to_nso.log widen_full*.tsv patch.tsv addr_need.tsv addr_need.log nro_exports.tsv nro_exports.log gpu_drivers.tsv widen_scan.log fps_generic.log *.rewrite.log .stage_rewrite .stage_rewrite.deps' root_commit "$G" "$TAG" || exit 1   # 与系统数据 / 界面布局并行（pack/refresh.sh）：本阶段只写这些
 # 帧率表命中（情报 10-28：构建号对不上时增强静默失效）：没有本构建号的表要响亮；本款别的构建号有表（docs/名单_60帧/ 有登记、runtime/fps/ 有文件）就列出来——
 #   换了版本一眼看出。原生就 60 帧的款（0100152000022000）没有表、也不列
 FV=$(awk -F'\t' -v p="$PID" '!/^#/ && toupper($1) == p { print substr($2, 1, 16) }' "$R/docs/名单_60帧/"*.tsv 2> /dev/null | while read -r b; do [ -f "$R/runtime/fps/$b.tsv" ] && printf '%s ' "$b"; done)

@@ -14,46 +14,58 @@
 // goes on; one worker makes them in the same order (a shadow may start from the previous one). The GPU reads shadows only after its command buffer is committed, and every commit first
 // waits for the copies queued before it (ubc_wait, from the encode thread when Metal encoding is deferred); a CPU read of a shadow waits for its own copies. DM_NVN_UB_COPY_THREAD=0
 // copies on the submit thread as before
+// Hand-off (ported from nxnative, MIT): the copy thread sleeps on g_ubc_head and a waiter on g_ubc_done (os_sync_wait_on_address via host/addr_wait.h: the kernel compares the word, so a change before the
+// sleep is not lost), each woken only by the thread that advanced that word, after it did. A waker never clears the sleeper's flag; the sleeper does, once awake. A push whose wake call
+// comes late can meet the flag the thread set for its next sleep, on a word that already includes that push: had the call taken the flag, the thread would sleep with it clear, the next
+// push would not wake it and every later wait would hang. Waiters are counted for the same reason. No mutex: before, ubc_wait locked a mutex and signalled a condition on every spin
+// while the copy thread slept, and the woken thread could not get that mutex back (nxnative's measurement: the replay thread spent half its busy time there, 170-330k instructions a
+// draw against 32-48k)
 typedef struct { void *d; const void *s; size_t n; } ubc_op;
-enum { UBC_N = 8192 };
+enum { UBC_N = 8192, UBC_SPIN = 4096 };   // UBC_SPIN: a waiter's spins before it sleeps (the copies it waits for are usually a few KB)
 static ubc_op g_ubc[UBC_N];
-static _Atomic uint64_t g_ubc_head, g_ubc_done;   // ops queued / made (monotonic)
-static _Atomic int g_ubc_sleeping;
-static pthread_mutex_t g_ubc_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_ubc_cv = PTHREAD_COND_INITIALIZER;
-// S2Arm: a thread waiting for copies sleeps on g_ubc_done_cv instead of spinning (ubc_wait). Breath of the Wild's encode thread spent 196 of its 736 samples spinning there
-//   (10 s Time Profiler, botw_1025095845_2): a whole performance core held at speed to wait for a memcpy on another thread
-static pthread_cond_t g_ubc_done_cv = PTHREAD_COND_INITIALIZER; static _Atomic int g_ubc_waiters;
+static _Alignas(128) _Atomic uint64_t g_ubc_head;   // ops queued (monotonic; the copy thread sleeps on it)
+static _Alignas(128) _Atomic uint64_t g_ubc_done;   // ops made (a waiter sleeps on it)
+static _Alignas(128) _Atomic uint32_t g_ubc_sleeping, g_ubc_waiting;   // the copy thread is asleep or about to be (it clears this itself) / waiters asleep or about to be
+static _Atomic uint64_t g_ubc_wakes;   // wake calls made, both ways (t_nvn_ubc_wait)
+#ifndef UBC_T_SLEEPING   // t_nvn_ubc_wait: holds the copy thread on its way to sleep, so that a late wake call lands there
+#define UBC_T_SLEEPING() ((void)0)
+#endif
 static int ubc_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_UB_COPY_THREAD"); v = !(e && !strcmp(e, "0")); } return v; }
+// Wake the copy thread if it sleeps; only ubc_push, after its store to g_ubc_head (pushes between the wake and the thread clearing its flag make a call each, harmless)
+static inline void ubc_kick(void) {
+    if (atomic_load(&g_ubc_sleeping)) { atomic_fetch_add_explicit(&g_ubc_wakes, 1, memory_order_relaxed); addr_wake_one64((void *)&g_ubc_head); }
+}
 static void *ubc_thread(void *arg) {
     (void)arg; pthread_setname_np("dm-ub-copy"); s2a_qos_set_self(S2A_QOS_UB_COPY);
     for (uint64_t t = 0;;) {
         uint64_t h = atomic_load_explicit(&g_ubc_head, memory_order_acquire);
-        if (t == h) {
-            for (int spin = 0; spin < 2000 && t == h; spin++) h = atomic_load_explicit(&g_ubc_head, memory_order_acquire);   // a submission queues copies in bursts: stay awake a moment
-            if (t == h) { pthread_mutex_lock(&g_ubc_mu); atomic_store(&g_ubc_sleeping, 1);
-                while ((h = atomic_load_explicit(&g_ubc_head, memory_order_acquire)) == t) pthread_cond_wait(&g_ubc_cv, &g_ubc_mu);
-                atomic_store(&g_ubc_sleeping, 0); pthread_mutex_unlock(&g_ubc_mu); }
+        for (int spin = 0; spin < 2000 && t == h; spin++) h = atomic_load_explicit(&g_ubc_head, memory_order_acquire);   // a submission queues copies in bursts: stay awake a moment
+        while (t == h) {   // the flag first, then the word (both sequentially consistent, as the pusher's store and flag load): a push sees the flag or this sees the push
+            atomic_store(&g_ubc_sleeping, 1);
+            if ((h = atomic_load(&g_ubc_head)) != t) break;
+            UBC_T_SLEEPING();
+            addr_wait64((void *)&g_ubc_head, t);   // returns at once if the word is no longer t; EINTR and spurious returns loop
+            atomic_store(&g_ubc_sleeping, 0);   // awake: set again before the next sleep's look at the word
+            h = atomic_load(&g_ubc_head);
         }
+        atomic_store_explicit(&g_ubc_sleeping, 0, memory_order_relaxed);   // also when the look found a push
         for (; t < h; t++) { const ubc_op *o = &g_ubc[t % UBC_N]; memcpy(o->d, o->s, o->n); }
-        atomic_store_explicit(&g_ubc_done, t, memory_order_release);
-        atomic_thread_fence(memory_order_seq_cst);   // pairs with the fence in ubc_wait: of 'done stored then waiters read' and 'waiters raised then done read' one side sees the other
-        if (atomic_load(&g_ubc_waiters)) { pthread_mutex_lock(&g_ubc_mu); pthread_cond_broadcast(&g_ubc_done_cv); pthread_mutex_unlock(&g_ubc_mu); }
+        atomic_store(&g_ubc_done, t);
+        if (atomic_load(&g_ubc_waiting)) { atomic_fetch_add_explicit(&g_ubc_wakes, 1, memory_order_relaxed); addr_wake_all64((void *)&g_ubc_done); }
     }
     return NULL;
 }
-// Wait until the first seq ops are made
+// Wait until the first seq ops are made (the replay thread, or the encode thread at a commit): spin a moment, then sleep on g_ubc_done
 static void ubc_wait(uint64_t seq) {
     if (atomic_load_explicit(&g_ubc_done, memory_order_acquire) >= seq) return;
-    for (int spin = 0; spin < 200; spin++) {   // a short spin first: most waits are a copy or two away
-        if (atomic_load_explicit(&g_ubc_done, memory_order_acquire) >= seq) return;
-        if (atomic_load(&g_ubc_sleeping)) { pthread_mutex_lock(&g_ubc_mu); pthread_cond_signal(&g_ubc_cv); pthread_mutex_unlock(&g_ubc_mu); }
-        __builtin_arm_yield();
+    for (int spin = 0;; spin++) {   // the copies are queued, so the copy thread is awake or woken by their push
+        if (spin < UBC_SPIN) { __builtin_arm_yield(); if (atomic_load_explicit(&g_ubc_done, memory_order_acquire) >= seq) break; continue; }
+        atomic_fetch_add(&g_ubc_waiting, 1);   // counted first, then the word (as the copy thread's store and count load): it sees this waiter or this sees its store
+        uint64_t d = atomic_load(&g_ubc_done);
+        if (d < seq) addr_wait64((void *)&g_ubc_done, d);
+        atomic_fetch_sub(&g_ubc_waiting, 1);
+        if (atomic_load_explicit(&g_ubc_done, memory_order_acquire) >= seq) break;
     }
-    // then sleep until the worker reports progress (it broadcasts under g_ubc_mu after each batch whenever someone waits; the check below is under the same mutex: no lost wake-up)
-    pthread_mutex_lock(&g_ubc_mu); atomic_fetch_add(&g_ubc_waiters, 1); atomic_thread_fence(memory_order_seq_cst);
-    struct timespec ts = {0, 2000000};   // 2 ms at most per sleep: a belt-and-braces bound, so a missed wake-up would cost 2 ms, never a hang
-    while (atomic_load_explicit(&g_ubc_done, memory_order_acquire) < seq) { pthread_cond_signal(&g_ubc_cv); pthread_cond_timedwait_relative_np(&g_ubc_done_cv, &g_ubc_mu, &ts); }
-    atomic_fetch_sub(&g_ubc_waiters, 1); pthread_mutex_unlock(&g_ubc_mu);
 }
 static inline uint64_t ubc_head(void) { return atomic_load_explicit(&g_ubc_head, memory_order_relaxed); }
 // Queue a copy (submit thread only); returns the count of ops that must be made for it to be done
@@ -64,7 +76,7 @@ static uint64_t ubc_push(void *d, const void *s, size_t n) {
     if (h - atomic_load_explicit(&g_ubc_done, memory_order_acquire) >= UBC_N) ubc_wait(h - UBC_N + 1);
     g_ubc[h % UBC_N] = (ubc_op){d, s, n};
     atomic_store_explicit(&g_ubc_head, h + 1, memory_order_release);
-    if (atomic_load(&g_ubc_sleeping)) { pthread_mutex_lock(&g_ubc_mu); pthread_cond_signal(&g_ubc_cv); pthread_mutex_unlock(&g_ubc_mu); }
+    ubc_kick();
     return h + 1;
 }
 
@@ -76,7 +88,7 @@ enum {
     RO_R_DRAW, RO_R_DRAW_INST, RO_R_DRAW_IND, RO_R_DRAW_IDX, RO_R_DRAW_IDX_IND, RO_R_STORE_C, RO_R_STORE_D, RO_R_STORE_S,
     RO_C_TABLE, RO_C_PSO, RO_C_DISPATCH, RO_C_DISPATCH_IND, RO_C_DISPATCH_THREADS, RO_C_COPY_BB, RO_C_COPY_BT, RO_C_COPY_TB, RO_C_COPY_TT, RO_C_FILL,
     RO_T_ADDR, RO_T_TEX, RO_T_SAMP,
-    RO_LABEL, RO_R_TS, RO_C_TS,   // diagnostics: DM_NVN_ENC_LABEL, DM_NVN_GPUPROF
+    RO_LABEL, RO_R_TS, RO_C_TS, RO_SIGNPOST,   // diagnostics: DM_NVN_ENC_LABEL, DM_NVN_GPUPROF, DM_NVN_FAULT_ENC
     // Metal 3 (the old encoders on this thread; DM_NVN_ENC_THREAD=1 there): what m3_wait / m4_end / m3_table_apply / blit_barrier and the buffer-and-offset draws ask of an encoder,
     // the copy encoder and the descriptor forms (GPUPROF's sample buffer rides on the descriptor), and a commit of g_q3 (completed handlers, the event signal, commit: m3_commit)
     RO_M3_WAIT, RO_M3_UPD, RO_M3_MB, RO_M3_BUF, RO_M3_TEX, RO_M3_SMP, RO_CB_BLIT, RO_CE_BEGIN_D, RO_COMMIT_M3,
@@ -88,6 +100,10 @@ typedef struct { uint32_t op, nobj; uint64_t a[15]; } rec_t;   // the first nobj
 enum { REC_BLK = 256 };
 typedef struct rec_blk { struct rec_blk *next; int n; rec_t r[REC_BLK]; } rec_blk;
 
+// On by default on the Mac too (Metal 4) since 11-16: a Switch 2 title's fixed scene (save point, no input after it, same spot checked from screenshots), off / on / on / off:
+//   30.0-32.1 fps against 59.9-60.0, frame time p95 34-51 ms against 27-33, whole CPU power not higher; on the Mac it used to stay off and the game held 30 there.
+//   A 30 fps-locked Switch title (11-17, entered the game in all 4 runs, same spot): fps 29.98 / 29.90 off against 29.95 / 29.85 on, CPU power 1.96 / 2.09 W
+//   against 1.87 / 1.84 W (about 8% lower, no overlap), p95 +3.7% (about 1.3 ms); that run's load went 17.8 -> 20.3, so read it as a reference only.
 // On by default on iOS: Breath of the Wild on an iPhone 17 Pro Max (handheld, the Great Plateau) took about 8 ms of submit thread per frame without it and 3.3–4.5 ms with it
 static int g_rec = -1;
 static inline int rec_on(void) {
@@ -97,11 +113,7 @@ static inline int rec_on(void) {
         // Metal 3：只在显式 =1 时开（编码器 / 参数表绑定需要额外适配，暂为保守方案）
         g_rec = e && atoi(e) > 0;
     } else {
-#if TARGET_OS_IPHONE
-        g_rec = !e || atoi(e) > 0;
-#else
-        g_rec = e && atoi(e) > 0;
-#endif
+        g_rec = !e || atoi(e) > 0;   // Metal 4: on by default on the Mac too (11-16, the Mac A/B above), as on iOS; DM_NVN_ENC_THREAD=0 turns it off
     }
     if (g_rec) MLOG("Metal encoding runs on its own thread (DM_NVN_ENC_THREAD=0 turns it off)");
     return g_rec;
@@ -126,7 +138,7 @@ static void dlss_fx_run(id cb, const uint64_t *a);   // nvn_dlss.inc: a[0] scale
 static void rec_exec(const rec_t *r) {
     const uint64_t *a = r->a; id e = g_rx_enc;
     switch (r->op) {
-    case RO_CB_NEW: g_rx_cb = g_m3 ? [g_q3 commandBufferWithUnretainedReferences] : [g_dev newCommandBuffer]; break;   // Metal 3: as m3_cb
+    case RO_CB_NEW: g_rx_cb = g_m3 ? m3_cb() : [g_dev newCommandBuffer]; break;   // Metal 3: m3_cb
     case RO_CB_BEGIN: if (!g_m3) [(id<MTL4CommandBuffer>)g_rx_cb beginCommandBufferWithAllocator:rec_id(a[0])]; break;   // Metal 3: the old command buffer has no allocator
     case RO_CB_END: if (!g_m3) [(id<MTL4CommandBuffer>)g_rx_cb endCommandBuffer]; break;   // Metal 3: m3_commit takes a buffer without endCommandBuffer, as on the submit thread
     case RO_COMMIT: case RO_COMMIT_REAL: {
@@ -185,6 +197,7 @@ static void rec_exec(const rec_t *r) {
     case RO_T_TEX: [(id<MTL4ArgumentTable>)rec_id(a[0]) setTexture:(MTLResourceID){a[1]} atIndex:a[2]]; break;
     case RO_T_SAMP: [(id<MTL4ArgumentTable>)rec_id(a[0]) setSamplerState:(MTLResourceID){a[1]} atIndex:a[2]]; break;
     case RO_LABEL: [(id<MTL4CommandEncoder>)e setLabel:rec_id(a[0])]; break;
+    case RO_SIGNPOST: [(id<MTLCommandEncoder>)e insertDebugSignpost:rec_id(a[0])]; break;
     case RO_R_TS: [(id<MTL4RenderCommandEncoder>)e writeTimestampWithGranularity:a[1] afterStage:a[2] intoHeap:rec_id(a[0]) atIndex:a[3]]; break;
     case RO_C_TS: [(id<MTL4ComputeCommandEncoder>)e writeTimestampWithGranularity:a[1] intoHeap:rec_id(a[0]) atIndex:a[2]]; break;
     // Metal 3: the old encoders. The fence is g_fence3 in every case (m3_wait / m4_end); a[0] says render (stages in a[1]) or not
@@ -241,6 +254,7 @@ static inline void thr_lv_add(int who, uint64_t a[2][4], uint64_t b[2][4]) {
     for (int k = 0; k < 2; k++) { atomic_fetch_add(&g_thr_lv[who][k][0], (b[k][2] + b[k][3]) - (a[k][2] + a[k][3])); atomic_fetch_add(&g_thr_lv[who][k][1], b[k][1] - a[k][1]); }
 }
 void dm_thread_lv_stats(uint64_t out[2][2][2]) { for (int w = 0; w < 2; w++) for (int k = 0; k < 2; k++) for (int j = 0; j < 2; j++) out[w][k][j] = atomic_load(&g_thr_lv[w][k][j]); }
+__attribute__((weak)) void dm_rt_encode_tick(void);
 static void *rec_thread(void *arg) {
     (void)arg; pthread_setname_np("dm-encode");
     s2a_qos_set_self(S2A_QOS_ENCODE);
@@ -252,6 +266,7 @@ static void *rec_thread(void *arg) {
         uint64_t lv0[2][4], lv1[2][4]; thr_lv_take(lv0);
         @autoreleasepool { for (int i = 0; i < b->n; i++) rec_exec(&b->r[i]); }
         thr_lv_take(lv1); thr_lv_add(0, lv0, lv1);
+        if (dm_rt_encode_tick) dm_rt_encode_tick();   // DM_RT_SUBMIT 含 2 时给本线程实时声明（hle_nvn.c rt_work_tick；单测里没有 hle_nvn.c）
         pthread_mutex_lock(&g_rb_mu);
         b->n = 0; b->next = g_rb_free; g_rb_free = b; g_rb_busy = 0;
         if (!g_rb_head) pthread_cond_broadcast(&g_rb_idle);
@@ -417,6 +432,7 @@ static inline id rec_table_real(id t) { return [t isKindOfClass:[DmRecTable clas
 - (void)fillBuffer:(id)b range:(NSRange)rg value:(uint8_t)v { rec_t *r = rec_put(RO_C_FILL, 1); r->a[0] = rec_obj(b); r->a[1] = rg.location; r->a[2] = rg.length; r->a[3] = v; }
 // Diagnostics: encoder labels (DM_NVN_ENC_LABEL) and timestamps into a counter heap (DM_NVN_GPUPROF); the render form names a stage, the compute form none
 - (void)setLabel:(NSString *)l { rec_put(RO_LABEL, 1)->a[0] = rec_obj(l); }
+- (void)insertDebugSignpost:(NSString *)l { rec_put(RO_SIGNPOST, 1)->a[0] = rec_obj(l); }
 - (void)writeTimestampWithGranularity:(MTL4TimestampGranularity)g afterStage:(MTLRenderStages)st intoHeap:(id)h atIndex:(NSUInteger)i { rec_t *r = rec_put(RO_R_TS, 1); r->a[0] = rec_obj(h); r->a[1] = g; r->a[2] = st; r->a[3] = i; }
 - (void)writeTimestampWithGranularity:(MTL4TimestampGranularity)g intoHeap:(id)h atIndex:(NSUInteger)i { rec_t *r = rec_put(RO_C_TS, 1); r->a[0] = rec_obj(h); r->a[1] = g; r->a[2] = i; }
 @end

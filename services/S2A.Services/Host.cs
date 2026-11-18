@@ -281,7 +281,7 @@ namespace S2A.Services
             }
         }
 
-        // 系统语言：显式 S2A_SYSTEM_LANGUAGE 优先，否则跟设备系统首选语言（维护者 10-20：装上默认中文版，系统本身是中文）；地区不随语言变（缺省 USA，S2A_REGION 可改）
+        // 系统语言：显式 S2A_SYSTEM_LANGUAGE（玩家逐款选的游戏语言 / 开发局）优先，否则跟设备系统首选语言（维护者 10-20：装上默认中文版，系统本身是中文；11-13 起不再跟界面语言，见 SystemLocale）；地区不随语言变（缺省 USA，S2A_REGION 可改）
         // 带配置的会话（平台装配）：平台给了系统语言标签就按它映射，映射不了退回装配显式给的 Language；不碰 CoreFoundation（#1073）
         public static SystemLanguage Language => Configuration == null ? LegacyLanguage.Value
             : Configuration.SystemLanguageTag is Func<string> tag && SystemLocale.Map(tag()) is SystemLanguage mapped ? mapped
@@ -346,6 +346,80 @@ namespace S2A.Services
 
         // 已打过「[S2A 系统数据]」行的（号, 入口）：每号每入口只打一次
         private static readonly System.Collections.Generic.HashSet<(ulong, string)> SystemDataSeen = new();
+        private static readonly object SynthLock = new();
+
+        // 资源包里没有、但能合成的系统数据（0802 Mii、0806 旧版屏蔽词、0823 屏蔽词、0849 Switch 2 Mii：「空但格式合法」，不含任天堂数据）：
+        //   构建时由 pack/sysdata_synth.py 生成、打成 systemdata_synth.tar 嵌进本程序集；第一次要时解到 <baseDir>/systemdata-synth/<号>/ 再挂上。
+        //   诊断#3d2d3e / #5a5ee9：#886（0806 合成）之前出的资源包没有 0806，招募新人物一确认就 Break；随壳更新就补上，不要求重出资源包。
+        //   游戏自己资源包里的 systemdata/<号>/ 照旧优先（S2AHooks.SystemDataDir 先看它）。不认识的号 / 没嵌进来 → null（照旧报缺）
+        internal static string SynthSystemData(ulong id, string baseDir)
+        {
+            string name = id.ToString("X16");
+            string dir = Path.Combine(baseDir, "systemdata-synth", name), done = dir + ".ok";
+            lock (SynthLock)
+            {
+                if (File.Exists(done) && Directory.Exists(dir))
+                {
+                    return dir;
+                }
+
+                using Stream tar = typeof(Host).Assembly.GetManifestResourceStream("systemdata_synth.tar");
+                if (tar == null)
+                {
+                    return null;
+                }
+
+                string tmp = dir + ".tmp", root = Path.GetFullPath(tmp) + Path.DirectorySeparatorChar;
+                if (Directory.Exists(tmp))
+                {
+                    Directory.Delete(tmp, true);
+                }
+
+                int files = 0;
+                using (var reader = new System.Formats.Tar.TarReader(tar))
+                {
+                    for (var e = reader.GetNextEntry(); e != null; e = reader.GetNextEntry())
+                    {
+                        if (e.EntryType is not (System.Formats.Tar.TarEntryType.RegularFile or System.Formats.Tar.TarEntryType.V7RegularFile)
+                            || !e.Name.StartsWith(name + "/", StringComparison.OrdinalIgnoreCase))
+                        {
+                            continue;
+                        }
+
+                        string path = Path.GetFullPath(Path.Combine(tmp, e.Name[(name.Length + 1)..]));
+                        if (!path.StartsWith(root, StringComparison.Ordinal))
+                        {
+                            continue;   // 不越出这一号的目录
+                        }
+
+                        Directory.CreateDirectory(Path.GetDirectoryName(path));
+                        using FileStream f = File.Create(path);
+                        e.DataStream?.CopyTo(f);
+                        files++;
+                    }
+                }
+
+                if (files == 0)
+                {
+                    if (Directory.Exists(tmp))
+                    {
+                        Directory.Delete(tmp, true);
+                    }
+
+                    return null;
+                }
+
+                if (Directory.Exists(dir))
+                {
+                    Directory.Delete(dir, true);
+                }
+
+                Directory.Move(tmp, dir);
+                File.WriteAllText(done, "");
+                Console.Error.WriteLine($"[S2A 系统数据] {name} 资源包里没有，用内置合成件补上（{files} 个文件）");
+                return dir;
+            }
+        }
 
         // baseDir：Ryujinx 系统数据根（系统存档、bis、账号等）。iOS 为 App 沙盒内目录，Mac 由起局方给。
         // 找不到时区数据目录时，从宿主自带的 IANA 时区库一次性生成（与 systemdata/make_tzdata.sh 同一转换：取 TZif2 的 64 位段）
@@ -518,6 +592,7 @@ namespace S2A.Services
         {
             Ryujinx.HLE.S2AHooks.NroMap = &Native.NroMap;
             Ryujinx.HLE.S2AHooks.NroUnmap = &Native.NroUnmap;
+            Ryujinx.HLE.S2AHooks.NroKeep = &Native.NroKeep;
         }
 
         private static unsafe System.Memory<byte>? GuestViewOf(ulong va, int size) =>
@@ -616,6 +691,8 @@ namespace S2A.Services
             HookIpcAddr39();
             // nn::ro 装 NRO（ldr:ro LoadNro / UnloadNro）：映射出包时改写好、编进 App 的 NRO 映像（runtime/src/loader.c s2a_nro_map）；上游路径要 Ryujinx 内核进程对象，S2Arm 没有，一律走原生
             HookNro();
+            string synthBase = baseDir;
+            Ryujinx.HLE.S2AHooks.SystemDataFallback = id => SynthSystemData(id, synthBase);
             Ryujinx.HLE.S2AHooks.OpenSystemDataStorage = static id =>
                 Ryujinx.HLE.S2AHooks.SystemDataDir(id) is string dir ? Application.RomFsFromDirectory(dir) : null;
             // 游戏 / 系统服务要了哪个系统数据号：每号每入口打一行（出包期核对表 pack/sysdata_need.tsv 按这行普查；缺的号随后由上游路径报红）
@@ -774,6 +851,7 @@ namespace S2A.Services
         }
 
         private int _controllerStuck;
+        private (PlayerIndex Player, ControllerType Type, int Pads)? _controllerConfiguration;
 
         // 手柄设置小程序：真机上唯一手柄按「确定」即被分到游戏收的第一个手柄号。这里把唯一的虚拟手柄改配过去
         // （已发现外接手柄时优先 Pro / 双 Joy-Con；否则掌机能收就留掌机），等 HID 采样泵写进共享内存后回 true，
@@ -781,12 +859,26 @@ namespace S2A.Services
         public bool DisplayMessageDialog(ControllerAppletUIArgs args)
         {
             // 游戏声明至少 2 人（强制本地合作）：真机上要再连一个手柄，这里开出第二个虚拟手柄（InputPump.SetPads，镜像第一个的输入）
+            // 先按上限收回多的（#809：要 1 人、连着两个时原先照配两格，重验不过反复重开），再按下限补开
+            InputPump.CapPads(Host.Device, args.PlayerCountMax);
+            // 先交给 S2Arm 面板的「分配玩家」（#520 E：面板与游戏同步）：玩家在面板上按键登记，登记了几位就开几格（不超过游戏的上限）；
+            //   启动器没开 / 没人接 / 取消回 0，照下面原来的自动应答
+            int assigned = InputPump.AssignViaLauncher(args.PlayerCountMin, args.PlayerCountMax, args.SupportedStyles);
+            if (assigned > 0)
+            {
+                int want = Math.Min(assigned, args.PlayerCountMax > 0 ? args.PlayerCountMax : InputPump.MaxPads);
+                if (want > InputPump.Pads) InputPump.SetPads(Host.Device, want);
+            }
             if (args.PlayerCountMin > InputPump.Pads) InputPump.SetPads(Host.Device, args.PlayerCountMin);
             var players = new System.Collections.Generic.List<PlayerIndex>(args.SupportedPlayers);
             PlayerIndex player;
             ControllerType type;
-            ControllerType externalType = (args.SupportedStyles & ControllerType.ProController) != 0 ? ControllerType.ProController
-                                        : (args.SupportedStyles & ControllerType.JoyconPair) != 0 ? ControllerType.JoyconPair : ControllerType.None;
+            // 连着 Joy-Con 2 时游戏可能只声明 Joy-Con 2 的样式位（bit 12 / 13 / 14 = 一对 / 左只 / 右只，例：两人各横握一只的项目）：
+            //   照 NpadDevices.StyleSupported 认，同游戏内的样式判断（#747）；改前只认一代位 → 判成没有可配的样式、游戏提示要 Joy-Con 2
+            var npads = Host.Device.Hid.Npads;
+            bool takes(ControllerType t) => npads.StyleSupported(t, args.SupportedStyles);
+            ControllerType externalType = takes(ControllerType.ProController) ? ControllerType.ProController
+                                        : takes(ControllerType.JoyconPair) ? ControllerType.JoyconPair : ControllerType.None;
 
             if ((InputPump.ExternalController || InputPump.Pads > 1) && players.Exists(p => p != PlayerIndex.Handheld) && externalType != ControllerType.None)
             {
@@ -801,8 +893,8 @@ namespace S2A.Services
                 player = players.Find(p => p != PlayerIndex.Handheld);
                 // 游戏只收单只 Joy-Con（如 Zumba：样式 JoyconLeft / JoyconRight）：真机上小程序让玩家横握一只确认，HID 照报这只的物理键、
                 //   方向由游戏按样式自己解释（Ryujinx 同样不旋转）。唯一的虚拟手柄改配成单只：优先右只（有 + 和 ABXY），不收再左只
-                ControllerType single = (args.SupportedStyles & ControllerType.JoyconRight) != 0 ? ControllerType.JoyconRight
-                                      : (args.SupportedStyles & ControllerType.JoyconLeft) != 0 ? ControllerType.JoyconLeft : ControllerType.None;
+                ControllerType single = takes(ControllerType.JoyconRight) ? ControllerType.JoyconRight
+                                      : takes(ControllerType.JoyconLeft) ? ControllerType.JoyconLeft : ControllerType.None;
                 type = externalType != ControllerType.None ? externalType : single;
 
                 if (!players.Exists(p => p != PlayerIndex.Handheld) || type == ControllerType.None)
@@ -813,8 +905,16 @@ namespace S2A.Services
             }
 
             // 这里可选的 Pro / Handheld / JoyconPair / JoyconLeft / JoyconRight 与共享内存 FullKey / Handheld / JoyDual / JoyLeft / JoyRight 位值相同。
+            // 人数变更也会重配 Npad；不能仅凭主手柄号和样式相同，把新的多人配置累计成旧配置连续卡住。
+            var configuration = (player, type, InputPump.Pads);
+            if (_controllerConfiguration != configuration)
+            {
+                _controllerConfiguration = configuration;
+                _controllerStuck = 0;
+            }
             uint expectedStyle = (uint)type;
-            if (InputPump.Player == player && (uint)Host.Device.Hid.SharedMemory.Npads[(int)player].InternalState.StyleSet == expectedStyle)
+            const uint Joycon2Bits = 0x7000;   // 共享内存里的样式值另带 Joy-Con 2 位（NpadDevices.Joycon2StyleFor）：比一代那部分
+            if (InputPump.Player == player && ((uint)Host.Device.Hid.SharedMemory.Npads[(int)player].InternalState.StyleSet & ~Joycon2Bits) == expectedStyle)
             {
                 if (++_controllerStuck >= 3)
                 {
@@ -830,7 +930,7 @@ namespace S2A.Services
             }
 
             // 等采样泵（约 16 ms 一拍）把新样式写进共享内存，小程序的重验读的是那里
-            for (int i = 0; i < 20 && (uint)Host.Device.Hid.SharedMemory.Npads[(int)player].InternalState.StyleSet != expectedStyle; i++)
+            for (int i = 0; i < 20 && ((uint)Host.Device.Hid.SharedMemory.Npads[(int)player].InternalState.StyleSet & ~Joycon2Bits) != expectedStyle; i++)
             {
                 System.Threading.Thread.Sleep(10);
             }
@@ -917,7 +1017,7 @@ namespace S2A.Services
             return null;
         }
 
-        // 选用户小程序：只有一个用户（带存档起局时是存档的用户，见 Saves.SelectUser），真机上即选它
+        // 选用户小程序：答当前用户——游戏库里选的本地玩家（LocalPlayer.cs，#623）；带存档起局时是存档的用户（Saves.SelectUser）。玩家已在起局前选过，这里不再弹
         public UserProfile ShowPlayerSelectDialog()
         {
             UserProfile user = Host.Device.System.AccountManager.LastOpenedUser;

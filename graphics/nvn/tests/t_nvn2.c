@@ -276,10 +276,10 @@ int main(void) {
         // camera CreateAliasOutputBufferPool(UserImageHandle, unsigned)：句柄按值。按客人约定传句柄 1：不当地址写（原先写地址 1 → 信号 11，审计 P1-145），回 0
         uint64_t (*cam_alias)(uint16_t, uint32_t) = (uint64_t (*)(uint16_t, uint32_t))s2a_nv_entry("_ZN2nn6camera3sdk27CreateAliasOutputBufferPoolENS_3gsv15UserImageHandleEj");
         CHECK(cam_alias && !nvn2_red_of(cam_alias)); CHECK(!dies_alias(cam_alias)); CHECK(cam_alias(1, 4) == 0);
-        // camera CreateCameraContext：输出参数写 NULL
-        void (*cam_ctx)(void **) = (void (*)(void **))s2a_nv_entry("_ZN2nn6camera3sdk19CreateCameraContextEPNS_5gsdrv18UniqueNativeHandleE");
+        // camera CreateCameraContext：输出参数是 32 位句柄，只写 4 字节；服务层没链（本单测）时句柄 0
+        void (*cam_ctx)(uint32_t *) = (void (*)(uint32_t *))s2a_nv_entry("_ZN2nn6camera3sdk19CreateCameraContextEPNS_5gsdrv18UniqueNativeHandleE");
         CHECK(cam_ctx && !nvn2_red_of(cam_ctx));
-        void *p = (void *)0x5a5a; cam_ctx(&p); CHECK(p == NULL);
+        uint32_t ch[2] = {0x5a5a, 0xa5a5}; cam_ctx(ch); CHECK(ch[0] == 0 && ch[1] == 0xa5a5);
         // 其他 chat / camera 接口仍是红桩
         void *cg = s2a_nv_entry("_ZN2nn4chat3gsv10InitializeEv");
         CHECK(cg && nvn2_red_of(cg) && strstr(nvn2_red_of(cg), "GameChat"));
@@ -409,6 +409,22 @@ int main(void) {
     CHECK(nvn2_hsq_count(hq, 16) == 1);     // 截到第 1 条
     CHECK(nvn2_hsq_count(hm, 72) == 0);     // 上面 HMMA 那段里没有 HMUL2
 
-    printf("✓ t_nvn2：%u 项全过（Switch 2 NVN2：名字表 / 设备值 / GOB 次序 / 接管入口 / 推常量 / DLSS 布局 / 张量核计数 / 半精度平方计数）\n", checks);   // 门禁按「✓ t_」认结论行
+    // ---------- T sRGB 解码门限计数（nvn2_srgb_count）：HSETP2 Rd, Ra, 0.04045（0x434，立即数两半字 0x292d），手排 5 条 + 8 字节残尾 ----------
+    //   ① 0x434 + 0x292d292d 计；② 同 ① 换寄存器（Ra 位 24..31 = 7）计；③ 只一个半字是 0x292d 不计；④ 0x234（寄存器形式）不计；⑤ 0x832 × 0x2cf5（1/12.92 的 HMUL2）不计；
+    //   残尾放 ① 不足一条不计 → 期望 2。立即数取自出口层 725bcf5c3f4bb3f3 的实码（第 1227 条：0x434 Rd 0, Ra 2, 0x292d292d）
+    uint8_t sr[88] = {0};
+    #define SR(i, LO) do { uint64_t l_ = (LO), h_ = 0; memcpy(sr + 16 * (i), &l_, 8); memcpy(sr + 16 * (i) + 8, &h_, 8); } while (0)
+    SR(0, 0x434ull | 2ull << 24 | 0x292d292dull << 32);
+    SR(1, 0x434ull | 7ull << 24 | 0x292d292dull << 32);
+    SR(2, 0x434ull | 2ull << 24 | 0x3c00292dull << 32);
+    SR(3, 0x234ull | 2ull << 24 | 0x292d292dull << 32);
+    SR(4, 0x832ull | 2ull << 24 | 0x2cf52cf5ull << 32);
+    w = 0x434ull | 2ull << 24 | 0x292d292dull << 32; memcpy(sr + 80, &w, 8);
+    #undef SR
+    CHECK(nvn2_srgb_count(sr, 88) == 2);
+    CHECK(nvn2_srgb_count(sr, 16) == 1);    // 截到第 1 条
+    CHECK(nvn2_srgb_count(hq, 136) == 0 && nvn2_srgb_count(hm, 72) == 0);   // 平方 / HMMA 那两段里没有
+
+    printf("✓ t_nvn2：%u 项全过（Switch 2 NVN2：名字表 / 设备值 / GOB 次序 / 接管入口 / 推常量 / DLSS 布局 / 张量核计数 / 半精度平方计数 / sRGB 解码门限计数）\n", checks);   // 门禁按「✓ t_」认结论行
     return 0;
 }

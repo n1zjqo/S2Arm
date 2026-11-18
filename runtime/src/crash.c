@@ -1,10 +1,13 @@
 // 崩溃现场（旧库 crash.c 改后搬，只留信号处理本身）：出错地址、pc / lr 换成模块内偏移、寄存器、帧指针回溯、线程表。
+#include <errno.h>
 #include "native.h"
+#include "s2a_docs.h"   // 崩溃落点标记写在文档根（s2a_crash_install 时算好路径，信号里只 open / write）
 #include "../../platform/plat.h"
 #include <signal.h>
 #include <dlfcn.h>
 #include <sys/ucontext.h>
 #include <unistd.h>
+#include <fcntl.h>
 #if defined(__APPLE__)
 #include <mach/mach.h>
 #else
@@ -18,6 +21,7 @@
 
 __attribute__((weak)) int s2a_trap_brk(void *ctx);   // traps.c；只编 crash.c 的单测 / 安卓测试壳里没有它
 static void where(uint64_t a, char *b, size_t n) {   // 地址 → 「模块+偏移」或宿主符号
+    if (s2a_guest_where(a, b, n)) return;   // 游戏模块：「模块+偏移（导出名+偏移）」（loader.c，#806：玩家那版 sdk 我们手里没有时也能读回溯）
     module_t *m = module_of((void *)a);
     if (m) {   // 补丁区：近端在映像尾（偏移 ≥ patch_off），FAR 在基址前（偏移为负，按有符号打，原先无符号相减打成 0xffff… 回绕值）
         int64_t off = (int64_t)(a - (uint64_t)m->base);
@@ -45,6 +49,93 @@ static int s2a_frames(uint64_t fp, uint64_t *lr, int max) {
     while (k < max && fp && !(fp & 7) && frame_read(fp, rec) && rec[1]) { lr[k++] = rec[1]; if (rec[0] <= fp) break; fp = rec[0]; }   // 返回地址 0 = 链尾（不可读页经内核读出全 0 也落在这里）
     return k;
 }
+// 指令原文（#368：没有原件的款崩在游戏代码里，日志只有地址，定不了空指针是哪次调用的返回值、写的哪个字段）：
+//   a 前 before 条、后 after 条 32 位指令字（内存里的，即改写后真正跑的那份），a 那条用 [ ] 标出；经内核读（同 frame_read），不可读写「读不到」。
+//   离线用任意 AArch64 反汇编器就能读，不需要游戏原件；每处几十字节，不是游戏内容。信号里可调（不分配、不取锁）
+void s2a_code_words(uint64_t a, int before, int after, char *b, size_t n) {
+    uint32_t w[32]; int k = before + after + 1; size_t o = 0; b[0] = 0;
+    if (before < 0 || after < 0 || k > 32 || (a & 3)) { snprintf(b, n, "（参数不对）"); return; }
+    uint64_t from = a - 4ull * (uint64_t)before;
+#if defined(__APPLE__)
+    vm_size_t got = 0;
+    int ok = vm_read_overwrite(mach_task_self(), (vm_address_t)from, 4 * (vm_size_t)k, (vm_address_t)w, &got) == KERN_SUCCESS && got == 4 * (vm_size_t)k;
+#else
+    struct iovec l = {w, 4 * (size_t)k}, r = {(void *)(uintptr_t)from, 4 * (size_t)k};
+    int ok = process_vm_readv(getpid(), &l, 1, &r, 1, 0) == (ssize_t)(4 * k);
+#endif
+    if (!ok) { snprintf(b, n, "读不到"); return; }
+    for (int i = 0; i < k && o + 12 < n; i++)
+        o += (size_t)snprintf(b + o, n - o, i == before ? "%s[%08x]" : "%s%08x", i ? " " : "", w[i]);
+}
+// 调用点 → 被调的是谁（11-13 诊断#59429a：游戏刚调完一个函数就拿返回值读 +0x18 崩了，原先只列帧链里的调用点、漏了 lr 那一次，
+//   而且只有指令字，看不出 bl 进的 PLT 是哪个导入、绑到宿主接管还是 sdk）。site 那条是 bl：目标是 PLT 桩（adrp x16 / ldr x17, [x16, #o]）时
+//   回 GOT 槽地址（*slot）；目标本身也回。不是 bl 回 0。只经内核读，不二次缺页；信号里可调
+static int mem_read(uint64_t a, void *out, size_t n) {
+#if defined(__APPLE__)
+    vm_size_t got = 0;
+    return vm_read_overwrite(mach_task_self(), (vm_address_t)a, (vm_size_t)n, (vm_address_t)out, &got) == KERN_SUCCESS && got == n;
+#else
+    struct iovec l = {out, n}, r = {(void *)(uintptr_t)a, n};
+    return process_vm_readv(getpid(), &l, 1, &r, 1, 0) == (ssize_t)n;
+#endif
+}
+uint64_t s2a_call_target(uint64_t site, uint64_t *slot) {
+    uint32_t w, st[2]; *slot = 0;
+    if ((site & 3) || !mem_read(site, &w, 4) || (w & 0xFC000000u) != 0x94000000u) return 0;
+    uint64_t t = site + (uint64_t)((int64_t)((int32_t)(w << 6) >> 6) * 4);
+    if (mem_read(t, st, 8) && (st[0] & 0x9F00001Fu) == 0x90000010u && (st[1] & 0xFFC003FFu) == 0xF9400211u) {
+        int64_t pg = (int64_t)((((uint64_t)(st[0] >> 5) & 0x7FFFF) << 2) | ((st[0] >> 29) & 3));
+        pg = (pg << 43) >> 43;   // 21 位有符号页数
+        *slot = (t & ~0xFFFull) + (uint64_t)(pg * 4096) + ((st[1] >> 10) & 0xFFF) * 8;
+    }
+    return t;
+}
+// GOT 槽 → 导入名：在含它的游戏模块的 RELA / JMPREL 里找 r_offset 落在这个槽的那条（装载器 relocate 同一张表，装完一直留在模块里）。找不到回 NULL
+const char *s2a_import_name(uint64_t slot) {
+    for (int i = 0; i < g_nmod; i++) {
+        const module_t *m = &g_mod[i];
+        if (!m->dyn || !m->symtab || !m->strtab || slot < (uint64_t)m->base || slot >= (uint64_t)m->base + m->size) continue;
+        uint64_t tab[2] = {0}, sz[2] = {0};
+        for (const Elf64_Dyn *d = m->dyn; d->d_tag; d++) switch (d->d_tag) {
+            case 7: tab[0] = d->d_un.d_ptr; break; case 8: sz[0] = d->d_un.d_val; break;     // DT_RELA / DT_RELASZ
+            case 23: tab[1] = d->d_un.d_ptr; break; case 2: sz[1] = d->d_un.d_val; break;    // DT_JMPREL / DT_PLTRELSZ
+        }
+        for (int t = 0; t < 2; t++) {
+            const Elf64_Rela *r = (const Elf64_Rela *)(m->base + tab[t]);
+            for (uint64_t k = 0; tab[t] && k < sz[t] / sizeof *r; k++)
+                if ((uint64_t)m->base + r[k].r_offset == slot) { uint32_t si = (uint32_t)(r[k].r_info >> 32); return si ? m->strtab + m->symtab[si].st_name : NULL; }
+        }
+        return NULL;
+    }
+    return NULL;
+}
+#if defined(__APPLE__)
+// 一处调用点的「被调的是谁」：「 → 导入 <名>，绑到 <宿主符号 / 模块+偏移>」或「 → 调 <模块+偏移>」；不是 bl 写空串
+static void callee_text(uint64_t site, char *b, size_t n) {
+    uint64_t slot, t = s2a_call_target(site, &slot), v = 0; char at[160]; b[0] = 0;
+    if (!t) return;
+    if (slot && mem_read(slot, &v, 8)) {
+        const char *nm = s2a_import_name(slot); where(v, at, sizeof at);
+        snprintf(b, n, " → 导入 %s，绑到 %s", nm ? nm : "（槽不在重定位表里）", at);
+    } else { where(t, at, sizeof at); snprintf(b, n, " → 调 %s", at); }
+}
+// 崩溃完整报告里的指令原文（只 Mac / iOS 的完整报告调；安卓走 crash_android_fatal.inc）：pc 前 8 条后 2 条；
+//   lr 那次调用（崩溃函数里最近一次调用，帧链里没有它：返回值是空的多半就是它）、帧链里落在游戏模块的前 8 个返回地址，各取调用那条（返回地址 −4）前 3 条到它本身，并写被调的是谁
+static void code_note(uint64_t pc, uint64_t lr0, uint64_t fp) {
+    char b[400], at[160], ce[400];
+    where(pc, at, sizeof at); s2a_code_words(pc & ~3ull, 8, 2, b, sizeof b); LOG("指令 pc %s：%s", at, b);
+    uint64_t lr[32]; int k = s2a_frames(fp, lr, 32), shown = 0;
+    if (module_of((void *)(uintptr_t)lr0) && (k == 0 || lr[0] != lr0)) {
+        where(lr0 - 4, at, sizeof at); s2a_code_words((lr0 - 4) & ~3ull, 3, 0, b, sizeof b); callee_text((lr0 - 4) & ~3ull, ce, sizeof ce);
+        LOG("指令 lr 调用点 %s：%s%s", at, b, ce);
+    }
+    for (int i = 0; i < k && shown < 8; i++) {
+        if (!module_of((void *)(uintptr_t)lr[i])) continue;
+        where(lr[i] - 4, at, sizeof at); s2a_code_words((lr[i] - 4) & ~3ull, 3, 0, b, sizeof b); callee_text((lr[i] - 4) & ~3ull, ce, sizeof ce);
+        LOG("指令 #%d 调用点 %s：%s%s", i, at, b, ce); shown++;
+    }
+}
+#endif
 void s2a_backtrace(uint64_t fp) {
     uint64_t lr[32]; int k = s2a_frames(fp, lr, 32);
     for (int i = 0; i < k; i++) { char b[160]; where(lr[i], b, sizeof b); LOG("  #%d %s", i, b); }
@@ -88,10 +179,25 @@ static void android_crash_fatal(int sig, siginfo_t *si, const ucontext_t *contex
     if (sig == SIGABRT) android_sigabrt_ctx(context);
     s2a_android_fatal(sig, si, context->uc_mcontext.pc, context->uc_mcontext.sp, (void *)context);
 }
+static _Atomic uint64_t g_sp_unaligned;   // 替游戏模拟的「栈指针未对齐」读写条数（收局汇总报，s2a_sp_unaligned_count；同苹果段）
+uint64_t s2a_sp_unaligned_count(void) { return atomic_load(&g_sp_unaligned); }
 static void on_crash(int sig, siginfo_t *si, void *context) {
     ucontext_t *u = context;
     // 双补丁岛 brk 兜底点（traps.c）：两岛都够不着的必改点，按原语义模拟后 pc += 4
     if (sig == SIGTRAP && s2a_trap_brk && s2a_trap_brk(context)) return;
+    // 栈指针未对齐（ESR 类别 0x26）：Switch 不查、安卓内核查，替游戏做这一条读写（emul_sp.c 安卓段）。范围同苹果：
+    //   游戏代码（含补丁区）+ 系统调用门进出两头（entry.S [sw_gate, sw_gate_end) 用客体 sp 借 32 字节）
+    if (sig == SIGBUS) {
+        unsigned ec;
+        if (s2a_android_fault_ec(context, &ec) && ec == 0x26) {
+            int s2a_emul_sp_unaligned(void *); extern void sw_gate(void); extern char sw_gate_end[];
+            uint64_t pc0 = (uint64_t)u->uc_mcontext.pc;
+            int gate = pc0 >= (uint64_t)(uintptr_t)sw_gate && pc0 < (uint64_t)(uintptr_t)sw_gate_end;
+            if ((gate || module_of((void *)(uintptr_t)pc0)) && s2a_emul_sp_unaligned(context)) {
+                atomic_fetch_add_explicit(&g_sp_unaligned, 1, memory_order_relaxed); return;
+            }
+        }
+    }
     if (sig == SIGBUS || sig == SIGSEGV) {
         int write;
         if (s2a_android_fault_esr(context, &write)) {
@@ -137,9 +243,14 @@ void s2a_emul_store_bench(void) { LOG("Android 使用完整读回；未运行 Ma
 #include <sys/mman.h>
 #include <stdatomic.h>
 #include "s2a_emul_ld.h"
+// 门的起止（entry.S）：弱引用放文件级——只链 crash.c 的单测没有 entry.S，强引用会让程序一加载就找不到符号；生产里两个符号都在
+__attribute__((weak_import)) extern void sw_gate(void);
+__attribute__((weak_import)) extern char sw_gate_end[];
 // 拦写模拟自测（帧率能耗线 10-24，拦写模拟开着时（缺省开，S2A_TRACK_EMUL_STORE=0 关）起局跑一次）：一张只读测试页上连写 N 次，每次都「缺页 → 信号里经可写别名模拟 → 返回」，
 // 总时长 / N = 每次缺页 + 模拟的全部成本（含内核投递信号与返回；写跟踪计数里的每次耗时不含这一段）。测试页的缺页在信号处理最前面认领，不进写跟踪
 static _Atomic uint64_t g_esb_page;
+static _Atomic uint64_t g_sp_unaligned;   // 替游戏模拟的「栈指针未对齐」读写条数（收局汇总报，s2a_sp_unaligned_count）
+uint64_t s2a_sp_unaligned_count(void) { return atomic_load(&g_sp_unaligned); }
 void s2a_emul_store_bench(void) {
     const char *e = getenv("S2A_TRACK_EMUL_STORE"); if (e && *e == '0') return;
     uint8_t *p = mmap(NULL, 0x4000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0); if (p == MAP_FAILED) return;
@@ -182,6 +293,65 @@ static void crash_raw(int sig, siginfo_t *si, ucontext_t *uc, int other) {
         raw_end(&l);
     }
 }
+// 崩溃时寄存器指向的对象（#016fde：游戏对象成员里的「取对象」接口返回空、一用就读 0，崩溃现场只有寄存器，认不出成员指向哪个类）：
+//   x19–x28（被调用者保存，多是 this / 外层对象）能读的地址往下 0x100 字节，每 8 字节：落在模块里写「模块+偏移」；是指针、它指向的首字在模块里 =
+//   「对象 虚表 …」；再隔一层（指向的首字再指向的首字）在模块里写「→对象 虚表 …」。只经 mem_read 读（读不了跳过，不再缺页）
+static void reg_objects(ucontext_t *uc) {
+    for (int r = 19; r <= 28; r++) {
+        uint64_t a = uc->uc_mcontext->__ss.__x[r], q[32];
+        if (a < 0x10000 || !mem_read(a, q, sizeof q)) continue;
+        char line[1536]; size_t at = (size_t)snprintf(line, sizeof line, "x%d %#llx：", r, (unsigned long long)a); int any = 0;
+        for (int i = 0; i < 32 && at < sizeof line - 200; i++) {
+            char w[160]; uint64_t v = q[i], v1 = 0, v2 = 0; const char *kind = NULL;
+            if (v < 0x10000) continue;
+            if (module_of((void *)(uintptr_t)v)) { where(v, w, sizeof w); kind = ""; }
+            else if (mem_read(v, &v1, 8) && v1 >= 0x10000 && module_of((void *)(uintptr_t)v1)) { where(v1, w, sizeof w); kind = "对象 虚表 "; }
+            else if (v1 >= 0x10000 && mem_read(v1, &v2, 8) && v2 >= 0x10000 && module_of((void *)(uintptr_t)v2)) { where(v2, w, sizeof w); kind = "→对象 虚表 "; }
+            if (!kind) continue;
+            at += (size_t)snprintf(line + at, sizeof line - at, " +%#x=%s%s", i * 8, kind, w); any = 1;
+        }
+        if (any) LOG("崩溃时寄存器指向：%s", line);
+    }
+}
+// 出事那块内存（#523 / #815：游戏装完 NRO 后 SIGBUS 落在主程序 +0x579508，日志只有地址，定不了是只读还是没映射）：
+//   缺页类信号（SIGBUS / SIGSEGV）打一行——读还是写（ESR 的 WnR 位）、地址所在（或之后第一块）映射的起止、当前 / 最大权限、标签、共享方式，块起点换成「模块+偏移」。
+//   只用 Mach 调用和 LOG，不分配
+// 11-14 D-G2JB：游戏的 SetHeapSize 因超出宿主地址窗口回了内存不足，它没理会、照样写堆首，崩出 SIGBUS——日志里只见总线错误。
+//   出事地址落在最近一次地址越界的请求里时点名是它，指向起局「自检」行（窗口多大、有没有「提高内存上限」权限）
+int s2a_va_short_last(uint64_t fa, int *num, uint64_t *a, uint64_t *n, uint64_t *count) __attribute__((weak));
+uint64_t s2a_guest_x18_now(void) __attribute__((weak));   // thread.c
+int s2a_phys_unmap_hit(uint64_t fa, uint64_t *a, uint64_t *n, uint64_t *back, uint64_t *ago_ms, uint64_t *total) __attribute__((weak));   // svc_mem.c
+static void fault_region_note(int sig, siginfo_t *si, ucontext_t *uc) {
+    if (sig != SIGBUS && sig != SIGSEGV) return;
+    uint64_t fa = (uint64_t)(uintptr_t)si->si_addr, esr = uc->uc_mcontext->__es.__esr; const char *rw = (esr >> 6 & 1) ? "写" : "读";
+    { int num; uint64_t a, n, k;
+      if (s2a_va_short_last && s2a_va_short_last(fa, &num, &a, &n, &k))
+          LOG("【红】崩在游戏没要到的地址上：svc %#x 早先要在 %#llx +%#llx 映射，超出宿主占到的地址窗口、回了内存不足（地址越界共 %llu 次），游戏没理会照样访问 %#llx。%s",
+              num, (unsigned long long)a, (unsigned long long)n, (unsigned long long)k, (unsigned long long)fa,
+              "地址窗口比游戏要的小，看起局「自检」行；手机上缺「提高内存上限」权限时按首启提示重签带权限的包"); }
+    {   // 出事地址是游戏早先自己解除的物理映射（诊断#ff9a04）：命中 = 游戏拿着悬空指针；没命中最近 32 次 = 要么更早解除、要么从没映射 / 被我方弄丢
+        uint64_t a = 0, n = 0, back = 0, ago = 0, total = 0;
+        if (s2a_phys_unmap_hit && s2a_phys_unmap_hit(fa, &a, &n, &back, &ago, &total))
+            LOG("出事地址 %#llx 在游戏自己解除的物理映射段里：倒数第 %llu 次 UnmapPhysicalMemory %#llx +%#llx（%llu ms 前；本局共解除 %llu 次）——游戏拿着已释放内存的指针",
+                (unsigned long long)fa, (unsigned long long)back, (unsigned long long)a, (unsigned long long)n, (unsigned long long)ago, (unsigned long long)total);
+        else if (s2a_phys_unmap_hit) LOG("出事地址 %#llx 不在最近 %llu 次 UnmapPhysicalMemory 的段里（本局共解除 %llu 次）", (unsigned long long)fa, (unsigned long long)(total < 32 ? total : 32), (unsigned long long)total); }
+    // 游戏的 x18 在线程槽里（iOS 不许用 x18，补丁区转接代码从槽里取、用完写回）：补丁区里崩时出事指针常是它（诊断#ff9a04）
+    if (s2a_guest_x18_now) LOG("游戏 x18（线程槽）= %#llx", (unsigned long long)s2a_guest_x18_now());
+    vm_address_t r = (vm_address_t)fa; vm_size_t sz = 0; natural_t depth = 0; vm_region_submap_info_data_64_t info; mach_msg_type_number_t cnt;
+    for (;;) {
+        cnt = VM_REGION_SUBMAP_INFO_COUNT_64;
+        if (vm_region_recurse_64(mach_task_self(), &r, &sz, &depth, (vm_region_recurse_info_t)&info, &cnt) != KERN_SUCCESS) {
+            LOG("出事那块内存：%s %#llx（ESR %#llx），这个地址及之后都没有映射", rw, (unsigned long long)fa, (unsigned long long)esr); return; }
+        if (!info.is_submap) break;
+        depth++;
+    }
+    char ws[160]; where((uint64_t)r, ws, sizeof ws);
+    int p = info.protection, m = info.max_protection, in = fa >= (uint64_t)r && fa < (uint64_t)r + sz;
+    LOG("出事那块内存：%s %#llx（ESR %#llx）%s [%#llx, %#llx) %llu KB，权限 当前 %c%c%c / 最大 %c%c%c，标签 %u，共享方式 %u，子映射深 %u；块起点 %s",
+        rw, (unsigned long long)fa, (unsigned long long)esr, in ? "落在映射块" : "没有映射，之后第一块是", (unsigned long long)r, (unsigned long long)(r + sz), (unsigned long long)(sz >> 10),
+        p & VM_PROT_READ ? 'r' : '-', p & VM_PROT_WRITE ? 'w' : '-', p & VM_PROT_EXECUTE ? 'x' : '-', m & VM_PROT_READ ? 'r' : '-', m & VM_PROT_WRITE ? 'w' : '-', m & VM_PROT_EXECUTE ? 'x' : '-',
+        info.user_tag, info.share_mode, depth, ws);
+}
 // 写现场的线程（第一条崩的）。原先 `static int once; if (once++) _exit()`：第二条几乎同时崩的线程直接退出整个进程，
 //   第一条的现场写到一半（10-29 1-2-Switch：host.log 断在一行中间、rc=138），且 once++ 不是原子的。现在：
 //   第一条照旧写完两段再 _exit；它自己在第二段里又崩 = 立即 _exit（第一段已落盘，同原先）；
@@ -196,11 +366,83 @@ static void crash_other_wait(int sig) {
 //   （控制台「崩溃报告」/ ~/Library/Logs/DiagnosticReports），iOS 进系统崩溃日志——原先 _exit(128 + sig) 是正常退出，系统不出报告。
 //   处理函数里本信号是屏蔽的，先放开再抛；万一没结束（不该发生）照旧 _exit(128 + sig)。
 //   读退出码的地方：shell 里被信号结束的 $? 仍是 128 + sig；作业层 Context.run 把 Python 的负返回码折回 128 + sig（pack/jobs/core.py）
+static int g_crash_quiet;   // s2a_crash_install 时取（信号处理里不读环境）：native.h s2a_crash_quiet
+__attribute__((weak)) uint64_t s2a_window_span_crash(uint64_t low_largest) { (void)low_largest; return 0; }   // vawin.c 强定义：低区碰底死的局记跨度（#1143）
+// 崩溃落点（11-15 S 级优化「崩了自动关」归因）：<文档根>/crash_where 一行 game / patch / host——pc 或 lr 落在游戏模块（含补丁区）= game / patch，
+//   两个都在宿主代码 = host。读的一方：Mac pack/jobs/cheats.py note_crash（收局后）、iOS ios/game_options.m（下次启动前），读完删。
+//   宿主自己的崩溃第一次不替玩家关补丁（D-RRES：宿主贴图上传崩溃把自适应满屏关了，补丁没错，修好后也回不来）
+static char g_where_path[1100];
+static void crash_where_note(uint64_t pc, uint64_t lr) {
+    if (!g_where_path[0] || g_crash_quiet) return;
+    module_t *m = module_of((void *)pc), *ml = module_of((void *)lr);
+    const char *w = m ? (s2a_in_patch(m, pc) ? "patch\n" : "game\n") : ml ? "game\n" : "host\n";
+    int fd = open(g_where_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) { (void)!write(fd, w, strlen(w)); close(fd); }
+}
+__attribute__((weak)) void s2a_guest_run_mark_crash(void) {}   // runtime/src/vawin.c 强定义：「在跑」标记改写成 crash（闪退不算死于内存，#909）
+// graphics/nvn pso_archive.h：崩溃线程正在写管线归档 → 记全机标记（#756）。装信号时 dlsym 取一次（同 g_dsh_crash_dump；信号处理里不调 dlsym）：
+//   原先写成 __attribute__((weak)) 的未定义声明，Mach-O 静态链接时弱引用也要找得到定义，Mac 宿主不链图形层就报 Undefined symbols（11-16 合入后宿主构建红）
+static void (*g_pso_crash_note)(void);
 static void crash_reraise(int sig) {
+    s2a_guest_run_mark_crash();
+    if (g_pso_crash_note) g_pso_crash_note();
+    if (g_crash_quiet) _exit(128 + sig);   // 辅助运行 / 静默起局：现场已写进日志，不按信号死（不弹系统「意外退出」框）
     signal(sig, SIG_DFL);
     sigset_t m; sigemptyset(&m); sigaddset(&m, sig); pthread_sigmask(SIG_UNBLOCK, &m, NULL);
     raise(sig);
     _exit(128 + sig);
+}
+// ---------- 写监视（S2A_WRITE_WATCH=<游戏地址>:<字节数>[,…]，#016fde；诊断，缺省关，至多 4 处）----------
+// 对这些地址所在的 16 KB 页设只读；有人写到页内就缺页：写的地址落在监视区间（含前 8 字节，覆盖跨进区间的宽写）里就记一行
+//   （第几次、线程、pc / lr 的模块偏移、区间里当前的 16 字节）并打回溯；不在区间只计数。随后放开这一页让这条写重执行，
+//   后台线程约 1 ms 后重新设只读（窗口里别的写会漏，析构 / 重置这类少见写照抓）。页还没映射时后台每 1 ms 试一次。
+//   用途：游戏堆分配确定的款，把「谁、在哪条指令上改了这个对象」直接抓出来（织梦岛 0x70f78af0c8 的包装对象被提前析构）
+enum { WW_MAX = 4, WW_LOG = 32 };
+static struct { uint64_t a, n; _Atomic int armed, said; _Atomic uint64_t hits, other; } g_ww[WW_MAX]; static int g_nww;
+static void *ww_thread(void *arg) {
+    (void)arg; pthread_setname_np("s2a-write-watch");
+    for (;;) {
+        for (int i = 0; i < g_nww; i++) {
+            if (atomic_load(&g_ww[i].armed)) continue;
+            uint64_t pg = g_ww[i].a & ~0x3FFFull; uint8_t b;
+            if (!mem_read(pg, &b, 1) || mprotect((void *)(uintptr_t)pg, 0x4000, PROT_READ)) continue;
+            atomic_store(&g_ww[i].armed, 1);
+            if (!atomic_exchange(&g_ww[i].said, 1)) LOG("写监视：%#llx（%llu 字节）所在页已设只读", (unsigned long long)g_ww[i].a, (unsigned long long)g_ww[i].n);
+        }
+        usleep(1000);
+    }
+    return NULL;
+}
+static void ww_start(void) {
+    const char *e = getenv("S2A_WRITE_WATCH"); if (!e || !*e) return;
+    for (const char *s = e; s && *s && g_nww < WW_MAX; ) {
+        unsigned long long a = 0, n = 8; if (sscanf(s, "%llx:%llu", &a, &n) >= 1 && a) { g_ww[g_nww].a = a; g_ww[g_nww].n = n ? n : 8; g_nww++; }
+        s = strchr(s, ','); if (s) s++;
+    }
+    pthread_t t; if (g_nww && !pthread_create(&t, NULL, ww_thread, NULL)) pthread_detach(t);
+}
+static int ww_fault(void *ctx, uint64_t fa, int w) {
+    if (!g_nww || !w) return 0;
+    for (int i = 0; i < g_nww; i++) {
+        uint64_t pg = g_ww[i].a & ~0x3FFFull;
+        if ((fa & ~0x3FFFull) != pg) continue;
+        // 别的线程刚在这一页缺页、正在放开（armed 已清）：同样放开、重执行，不能当成「不是我的页」交给崩溃路径
+        //   （iPhone 实测：被监视对象与对象池自旋锁同页，两条线程同时写，后到的一条 stlxr 落空成 SIGBUS）
+        if (atomic_load(&g_ww[i].armed) && fa + 8 > g_ww[i].a && fa < g_ww[i].a + g_ww[i].n) {
+            uint64_t k = atomic_fetch_add(&g_ww[i].hits, 1) + 1;
+            if (k <= WW_LOG) {
+                ucontext_t *uc = ctx; uint64_t pc = uc->uc_mcontext->__ss.__pc, lr = uc->uc_mcontext->__ss.__lr, cur[2] = {0, 0};
+                char bp[160], bl[160], tn[32] = ""; where(pc, bp, sizeof bp); where(lr, bl, sizeof bl); mem_read(g_ww[i].a, cur, sizeof cur); pthread_getname_np(pthread_self(), tn, sizeof tn);
+                LOG("【红】写监视 %#llx 第 %llu 次被写：写 %#llx，线程 %s，pc %s lr %s；写前区间内 %016llx %016llx；回溯：", (unsigned long long)g_ww[i].a, (unsigned long long)k,
+                    (unsigned long long)fa, tn[0] ? tn : "?", bp, bl, (unsigned long long)cur[0], (unsigned long long)cur[1]);
+                s2a_backtrace(uc->uc_mcontext->__ss.__fp);
+            }
+        } else atomic_fetch_add(&g_ww[i].other, 1);
+        atomic_store(&g_ww[i].armed, 0);
+        mprotect((void *)(uintptr_t)pg, 0x4000, PROT_READ | PROT_WRITE);
+        return 1;
+    }
+    return 0;
 }
 static void (*g_dsh_crash_dump)(void);   // graphics/nvn/host/dsh_miss.inc s2a_dsh_crash_dump：现编时崩溃，落盘正在编的那支输入；装信号时 dlsym 取一次（信号处理里不调 dlsym），只链运行时的单测取不到 = 空
 static void on_crash(int sig, siginfo_t *si, void *ctx) {
@@ -214,8 +456,15 @@ static void on_crash(int sig, siginfo_t *si, void *ctx) {
     if (sig == SIGTRAP && s2a_trap_brk && s2a_trap_brk(ctx)) return;
     if (sig == SIGBUS || sig == SIGSEGV) {
         uint32_t esr = ((ucontext_t *)ctx)->uc_mcontext->__es.__esr, ec = esr >> 26;
+        // 栈指针未对齐（EC 0x26）：Switch 不查、苹果查，替游戏做这一条读写（emul_sp.c）。范围 = 游戏代码（含补丁区）+ 系统调用门进出两头
+        //   （门用客体 sp 借 32 字节，entry.S [sw_gate, sw_gate_end)）；宿主自己的代码不会让 sp 不对齐，不在此列
+        { int s2a_emul_sp_unaligned(void *);
+          uint64_t pc0 = ((ucontext_t *)ctx)->uc_mcontext->__ss.__pc;
+          int gate = pc0 >= (uint64_t)(uintptr_t)sw_gate && pc0 < (uint64_t)(uintptr_t)sw_gate_end;
+          if (ec == 0x26 && (gate || module_of((void *)pc0)) && s2a_emul_sp_unaligned(ctx)) { atomic_fetch_add_explicit(&g_sp_unaligned, 1, memory_order_relaxed); return; } }
         if (ec == 0x24 || ec == 0x25) {
             int w = (int)(esr >> 6 & 1); uint64_t pc = ((ucontext_t *)ctx)->uc_mcontext->__ss.__pc;
+            if (ww_fault(ctx, (uint64_t)si->si_addr, w)) return;   // 写监视（S2A_WRITE_WATCH，诊断）：记下写的人后放开重执行
             { uint64_t bp = atomic_load(&g_esb_page), fa0 = (uint64_t)si->si_addr;   // 拦写模拟自测页（见 s2a_emul_store_bench）
               if (bp && w && (fa0 & ~0x3FFFull) == bp) { uint8_t *wa = s2a_alias_page_rw(bp); if (wa && s2a_emul_store(ctx, fa0, wa + (fa0 & 0x3FFF), NULL, NULL, NULL)) return; } }
             // 远端（far.c，乙布局）：别名区伸出宿主窗口那段一碰即缺页，在影子上代执行这条访存并记点
@@ -261,21 +510,30 @@ static void on_crash(int sig, siginfo_t *si, void *ctx) {
         crash_raw(sig, si, uc, 1); crash_other_wait(sig);
     }
     uint64_t pc = uc->uc_mcontext->__ss.__pc, lr = uc->uc_mcontext->__ss.__lr, fp = uc->uc_mcontext->__ss.__fp;
+    crash_where_note(pc, lr);
     crash_raw(sig, si, uc, 0);
     // 崩在现编着色器里（graphics/nvn/host/dsh_miss.inc，#467）：把正在编的那支输入落盘成 <键>.inflight.*，诊断包带走。只用 open / write，排在原始现场之后、完整报告之前
     { if (g_dsh_crash_dump) g_dsh_crash_dump(); }
     { void (*ev)(const char *, int) = (void (*)(const char *, int))dlsym(RTLD_DEFAULT, "s2a_dguard_evidence"); if (ev) ev("崩溃", 0); }   // 直连安全网：这局算失败（有证据）；动态取，单测没链 dguard.c
     char bp[160], bl[160]; where(pc, bp, sizeof bp); where(lr, bl, sizeof bl);
     LOG("【红】CRASH 信号 %d 地址 %p pc %s lr %s sp %#llx", sig, si->si_addr, bp, bl, (unsigned long long)uc->uc_mcontext->__ss.__sp);
+    { const char *(*wn)(void) = (const char *(*)(void))dlsym(RTLD_DEFAULT, "s2a_waived_note"); const char *w = wn ? wn() : NULL;   // waived.c
+      if (w && *w) LOG("【红】之前这些校验没过（照常继续了）：%s", w); }
     for (int i = 0; i < 29; i += 4) LOG("  x%-2d %016llx %016llx %016llx %016llx", i, uc->uc_mcontext->__ss.__x[i], uc->uc_mcontext->__ss.__x[i + 1], i + 2 < 29 ? uc->uc_mcontext->__ss.__x[i + 2] : 0, i + 3 < 29 ? uc->uc_mcontext->__ss.__x[i + 3] : 0);
     s2a_backtrace(fp);
+    code_note(pc, lr, fp);
+    fault_region_note(sig, si, uc);
+    reg_objects(uc);
     { uint64_t ht, hl, fs, fh; int fn; s2a_low_holes(&ht, &hl); s2a_fd_usage(&fn, &fs, &fh);   // 资源耗尽类崩溃先看这两样：低区地址 / 文件句柄
-      LOG("崩溃时余量：低区空洞合计 %llu MB、最大一块 %llu MB；文件句柄已开 %d 个，软上限 %llu、硬上限 %llu", (unsigned long long)(ht >> 20), (unsigned long long)(hl >> 20), fn, (unsigned long long)fs, (unsigned long long)fh); }
+      LOG("崩溃时余量：低区空洞合计 %llu MB、最大一块 %llu MB；文件句柄已开 %d 个，软上限 %llu、硬上限 %llu", (unsigned long long)(ht >> 20), (unsigned long long)(hl >> 20), fn, (unsigned long long)fs, (unsigned long long)fh);
+      uint64_t sp = s2a_window_span_crash(hl);   // 低区碰底死的局记下已碰到的跨度（vawin.c，#1143）
+      if (sp) LOG("低区碰底：本局已碰到的地址跨度 %llu MB 记为本款学到的跨度，下一局窗口按它缩、其余给宿主", (unsigned long long)(sp >> 20)); }
     s2a_lowva_crash_note();   // 低区账（各家账面、保留量、拦不到的）
     { void s2a_vm_low(const char *); s2a_vm_low("崩溃时"); }   // 低区地址耗尽类崩溃（Metal / spirv_cross / 暂存缓冲）看当时谁占着
     { void s2a_guest_va_report(const char *); s2a_guest_va_report("崩溃时"); }   // 窗口里游戏真映射了多少、落在哪
     { void s2a_diag_stamp_report(void), s2a_lockwake_report(void); s2a_diag_stamp_report(); s2a_lockwake_report(); }
     { void s2a_svc_count_report(const char *); s2a_svc_count_report("崩溃"); }   // 诊断打点（S2A_DIAG_STAMP 设了才打）
+    { void s2a_gate_ipc_recent(const char *); s2a_gate_ipc_recent("崩溃线程"); }   // 崩的这条线程最近 16 次 IPC（服务名 / 命令 / 结果，gate.c）
     LOG("线程表："); s2a_thread_dump();
     { void s2a_direct_wait_dump(void); s2a_direct_wait_dump(); }   // 直连模式：各等待点（s2a_crash_wait_dump_register 登记）
     { int s2a_dump_threads(const char *why); char w[64]; snprintf(w, sizeof w, "崩溃 信号 %d", sig); s2a_dump_threads(w); }
@@ -291,11 +549,15 @@ void s2a_crash_thread_init(void) {
     // 缺页处模拟读的只读别名槽（alias.c，每线程 16 KB）
     s2a_alias_thread_init();
     int e = plat_fault_altstack_init();
-    if (e) LOG("【红】崩溃：备用栈安装失败 errno=%d", e);
+    if (e && e != ENOTSUP) LOG("【红】崩溃：备用栈安装失败 errno=%d", e);   // ENOTSUP = tvOS 没有备用栈（platform/apple/plat_apple.c），不算故障
 }
 void s2a_crash_install(void) {
+    s2a_docs_path(g_where_path, sizeof g_where_path, "crash_where");
     int sigs[] = {SIGSEGV, SIGBUS, SIGILL, SIGTRAP, SIGFPE, SIGABRT};   // SIGABRT：die() 与 C# FailFast 都走 abort，要现场
     g_dsh_crash_dump = (void (*)(void))dlsym(RTLD_DEFAULT, "s2a_dsh_crash_dump");
+    g_pso_crash_note = (void (*)(void))dlsym(RTLD_DEFAULT, "s2a_pso_archive_crash_note");
+    g_crash_quiet = s2a_crash_quiet();
+    ww_start();
     for (size_t i = 0; i < sizeof sigs / sizeof *sigs; i++) {
         int e = plat_fault_install(sigs[i], on_crash, PLAT_FAULT_ONSTACK);
         if (e) LOG("【红】崩溃：安装信号 %d 失败 errno=%d", sigs[i], e);

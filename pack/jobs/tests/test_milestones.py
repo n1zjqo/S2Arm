@@ -29,7 +29,8 @@ class Estimates(unittest.TestCase):
 
     def test_plans_per_kind(self):
         # 只有直连（11-07 拆兼容模式 build / ipa 两种只出通用的计划）：打 iPhone 包 / Mac 打包各一种
-        self.assertEqual(set(ms.PLANS), {"ipa_dual", "build_dual"})
+        self.assertEqual(set(ms.PLANS), {"ipa_dual", "build_dual", "ipa_downstream"})
+        self.assertEqual(ms.PLANS["ipa_downstream"], ["unpack", "ipa"])   # 下游深度方案：共用解包 → 下游做包工具（pack/jobs/downstream.py）
         # 出包不再整份重算原件校验（11-07 维护者：玩家导入之后不会换原件，导入时算过一次 sha256）：任何计划里都没有 verify 段
         for kind, plan in ms.PLANS.items(): self.assertNotIn("verify", plan, kind)
 
@@ -267,3 +268,18 @@ class WatcherLifecycle(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExportModeLabelTests(unittest.TestCase):
+    def test_last_step_follows_export_request(self):
+        """出包页起分两路（维护者 11-13）；11-15 起看这次出包请求带不带 mode = export（游戏库「导出自签包」点在没出过包的款上）。
+        导出时最后一步不叫「编 App 与签名」（这一路不签名、不连手机）；没带 / 一键装照旧。期望手写"""
+        import milestones as m
+        c = types.SimpleNamespace(r={})
+        self.assertEqual(m.label_of(c, "ipa")[0], "编 App 与签名")                    # 没带 mode：按一键装
+        c.r = {"mode": "export"}
+        self.assertEqual(m.label_of(c, "ipa")[0], "整理 iPhone 版程序与资源包")
+        self.assertIn("未签名的 S2Arm.ipa", m.label_of(c, "ipa")[1])
+        self.assertEqual(m.label_of(c, "unpack")[0], "解包")                          # 别的步不变
+        c.r = {"mode": "device"}
+        self.assertEqual(m.label_of(c, "ipa")[0], "编 App 与签名")

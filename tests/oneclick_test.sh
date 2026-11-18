@@ -65,11 +65,11 @@ o=$(OCA); ck "⑤e Android 直连单轨" 'grep -q "① 画面：直连单轨" <<
 mkdir -p "$T/real/subreal" "$T/g7"; head -c 2048 /dev/zero > "$T/real/base.nsp"; head -c 2048 /dev/zero > "$T/real/subreal/upd1.nsp"; head -c 2048 /dev/zero > "$T/real/subreal/upd2.nsp"
 ln -s "$T/real/base.nsp" "$T/g7/base.nsp"; ln -s "$T/real/subreal" "$T/g7/sub"; o=$(OC "$T/g7")
 ck "⑭ 软链原件：认出 Game A（1.1.1）、用 3 个包（实得：$(grep -E '①|🔴' <<< "$o" | cut -c1-160 | tr '\n' ' ')）" 'grep -q "认出：Game A（1.1.1，程序号 0100A3501946E000" <<< "$o" && grep -q "用 3 个包" <<< "$o"'
-s7=$(S2A_NX_UNPACK=$T/nxu S2A_SRC_IDS=$T/ids7.tsv S2A_GAME_SRC=$T/g7 bash -c "source '$H/pack/srcs.sh'; src_ids" | awk -F'\t' '{print $2}' | sort | uniq -c | awk '{print $1 "x" $2}')
+s7=$(S2A_NX_UNPACK=$T/nxu S2A_SRC_IDS=$T/ids7.tsv S2A_GAME_SRC=$T/g7 bash -c "source '$H/pack/srcs.sh'; src_ids" | awk -F'\t' '{print $2}' | LC_ALL=C sort | uniq -c | awk '{print $1 "x" $2}')
 ck "⑭ src_ids 列出软链原件：「${s7}」（3 个、每个 2048 字节）" '[ "$s7" = 3x2048 ]'
 # ⑭b 系统 / 隐藏目录里的 .xci / .nsp 不当原件（11-02：回收站 $RECYCLE.BIN 的 $I*.xci 被探测）：源目录里另放回收站、System Volume Information、.Trashes 各一个，src_ids 仍只列那 3 个
 mkdir -p "$T/g7/\$RECYCLE.BIN" "$T/g7/System Volume Information" "$T/g7/.Trashes"; for d in '$RECYCLE.BIN' 'System Volume Information' '.Trashes'; do head -c 1024 /dev/zero > "$T/g7/$d/\$IJUNK.xci"; done
-s7b=$(S2A_NX_UNPACK=$T/nxu S2A_SRC_IDS=$T/ids7b.tsv S2A_GAME_SRC=$T/g7 bash -c "source '$H/pack/srcs.sh'; src_ids" | awk -F'\t' '{print $2}' | sort | uniq -c | awk '{print $1 "x" $2}')
+s7b=$(S2A_NX_UNPACK=$T/nxu S2A_SRC_IDS=$T/ids7b.tsv S2A_GAME_SRC=$T/g7 bash -c "source '$H/pack/srcs.sh'; src_ids" | awk -F'\t' '{print $2}' | LC_ALL=C sort | uniq -c | awk '{print $1 "x" $2}')
 ck "⑭b src_ids 跳过回收站 / 系统 / 隐藏目录：「${s7b}」（仍是 3 个、每个 2048 字节）" '[ "$s7b" = 3x2048 ]'
 # ⑥ 自签
 mkdir -p "$T/A.app/Frameworks"; printf 'int main(void){return 0;}\n' > "$T/m.c"; printf 'int f(void){return 1;}\n' > "$T/l.c"
@@ -78,6 +78,12 @@ printf '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict><key>
 o=$(bash "$H/pack/oneclick/adhoc_sign.sh" "$T/A.app" "$H/pack/app.entitlements" 2>&1); r=$?
 keys=$(codesign -d --entitlements - --xml "$T/A.app" 2> /dev/null | plutil -convert json -o - - 2> /dev/null | python3 -c 'import json,sys; print(" ".join(sorted(json.load(sys.stdin))))' 2> /dev/null)
 ck "⑥ 自签 rc=${r}、权限恰好 1 项（${keys}）、内嵌库已签、严格校验过" '[ $r = 0 ] && [ "$keys" = com.apple.developer.kernel.increased-memory-limit ] && codesign -v "$T/A.app/Frameworks/libx.dylib" 2> /dev/null && codesign -v --strict "$T/A.app" 2> /dev/null'
+# ⑥b 内嵌库带扩展属性（Finder 信息：iCloud 同步的桌面 / 文稿里会被挂上，#1138）：codesign 原样会拒签「detritus not allowed」，自签先清掉照样签过
+mkdir -p "$T/B.app/Frameworks/X.framework"; cp "$T/A.app/Info.plist" "$T/B.app/"; xcrun clang -o "$T/B.app/S2Arm" "$T/m.c" 2> /dev/null
+xcrun clang -dynamiclib -o "$T/B.app/Frameworks/X.framework/X" "$T/l.c" 2> /dev/null
+xattr -wx com.apple.FinderInfo 0000000000000000000400000000000000000000000000000000000000000000 "$T/B.app/Frameworks/X.framework/X"
+o=$(bash "$H/pack/oneclick/adhoc_sign.sh" "$T/B.app" "$H/pack/app.entitlements" 2>&1); r=$?
+ck "⑥b 内嵌库带 Finder 信息也签得过（rc=${r}：$(tail -1 <<< "$o")）、内嵌库校验过" '[ $r = 0 ] && codesign -v "$T/B.app/Frameworks/X.framework" 2> /dev/null'
 # ⑦ pack/ipa.sh 共享根只出正式包（测试出包线 10-23）：共享根（S2A_ROOTS = S2A_ROOTS_SHARED）上给 S2A_SIGN=adhoc / S2A_BUNDLE_ID / S2A_DISPLAY_SUFFIX 各报红退出，在刷新产物根之前（产物根不动）；
 #   已停用的 S2A_DISPLAY_NAME（11-04：显示名只取游戏自带 nacp 标题，pack/display_name.py）任何根上都报红
 mkdir -p "$T/shr"; for kv in S2A_SIGN=adhoc S2A_BUNDLE_ID=x.y S2A_DISPLAY_SUFFIX=z; do

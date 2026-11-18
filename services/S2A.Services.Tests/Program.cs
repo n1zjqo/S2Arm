@@ -603,7 +603,9 @@ namespace S2A.Services.Tests
         private static void Run()
         {
             TimeZoneBinaryTest.Run(Check);
+            SystemDataSynthTest.Run(Check);
             CheatsTest.Run(Check);
+            TouchGestureTest.Run(Check);
             GuestBufferAllocatorTest.Run(Check);
             GuestMemoryFar();
             ShaderCodeTableTest.Run(Check);
@@ -864,11 +866,11 @@ namespace S2A.Services.Tests
                     "Handheld Handheld → Player1 ProController / Player1 JoyconRight → Player1 ProController / Player1 ProController → Player1 ProController", got);
             }
             // 单只 Joy-Con 横握（11-03 010036B0034E4000）：横握后看到的 ABXY / 摇杆换成物理键 / 物理方向（右只顺时针 90°：A→X、B→A、X→Y、Y→B，摇杆 (x,y)→(−y,x)；
-            //   左只逆时针 90°：A→下、B→左、X→右、Y→上，摇杆 (x,y)→(y,−x)）；竖握 / Pro 手柄不动
+            //   左只逆时针 90°：A→下、B→左、X→右、Y→上，摇杆 (x,y)→(y,−x)）；竖握 / Pro 手柄不动。右只横握的物理摇杆是右摇杆（#592），读右摇杆槽
             {
                 var HZ = Ryujinx.HLE.HOS.Services.Hid.Types.NpadJoyHoldType.Horizontal; var VT = Ryujinx.HLE.HOS.Services.Hid.Types.NpadJoyHoldType.Vertical;
                 string R(Ryujinx.HLE.HOS.Services.Hid.ControllerType t, Ryujinx.HLE.HOS.Services.Hid.Types.NpadJoyHoldType h, Ryujinx.HLE.HOS.Services.Hid.ControllerKeys k, int x, int y)
-                { var g = new Ryujinx.HLE.HOS.Services.Hid.GamepadInput { Buttons = k }; g.LStick = new Ryujinx.HLE.HOS.Services.Hid.JoystickPosition { Dx = x, Dy = y }; InputPump.RotateSideways(ref g, t, h); return $"{g.Buttons}({g.LStick.Dx},{g.LStick.Dy})"; }
+                { var g = new Ryujinx.HLE.HOS.Services.Hid.GamepadInput { Buttons = k }; g.LStick = new Ryujinx.HLE.HOS.Services.Hid.JoystickPosition { Dx = x, Dy = y }; InputPump.RotateSideways(ref g, t, h); var st = t == Ryujinx.HLE.HOS.Services.Hid.ControllerType.JoyconRight && h == HZ ? g.RStick : g.LStick; return $"{g.Buttons}({st.Dx},{st.Dy})"; }
                 string got = string.Join(" / ", R(Ryujinx.HLE.HOS.Services.Hid.ControllerType.JoyconRight, HZ, Ryujinx.HLE.HOS.Services.Hid.ControllerKeys.A, 0, 32767),
                     R(Ryujinx.HLE.HOS.Services.Hid.ControllerType.JoyconRight, HZ, Ryujinx.HLE.HOS.Services.Hid.ControllerKeys.B | Ryujinx.HLE.HOS.Services.Hid.ControllerKeys.Plus, 32767, 0),
                     R(Ryujinx.HLE.HOS.Services.Hid.ControllerType.JoyconLeft, HZ, Ryujinx.HLE.HOS.Services.Hid.ControllerKeys.A | Ryujinx.HLE.HOS.Services.Hid.ControllerKeys.Y, 0, 32767),
@@ -1038,6 +1040,36 @@ namespace S2A.Services.Tests
 
                 styleProp.SetValue(npads, styleKeep);
                 Ryujinx.Common.S2AInputCaps.Reset();
+            }
+
+            // #cef2ab 虚拟手柄在声明这一刻跟随：经真 IPC 调 SetSupportedNpadIdType（hid 102）只给 Player1 → 这次调用返回时主手柄已改到 Player1（不等输入泵的 250 ms 一拍）；
+            //   再声明 Player1 + 掌机格 → 返回时已挪回掌机格。期望手写（同真机：掌机里握着的 Joy-Con 在声明时就归到游戏收的手柄号）。
+            //   反证：IHidServer 里不调 NpadDevices.S2ASupportedChanged（或 InputPump.Start 不登记）→ 第一项仍是 Handheld
+            {
+                InputPump.Start(Host.Device);   // 登记回调；非主机档时主手柄在掌机格
+                InputPump.SetPrimary(Host.Device, Ryujinx.HLE.HOS.Services.Hid.PlayerIndex.Handheld, Ryujinx.HLE.HOS.Services.Hid.ControllerType.Handheld);
+                var npid = (uint*)(_game + 0x3E00);
+                Msg IdType(int n) { Msg m = Msg.Cmif(102, Bytes(0L)); m.X.Add(((ulong)npid, (ulong)(n * 4))); return m; }   // SetSupportedNpadIdType(aruid, X 数组)
+                // 审计 P1-192：游戏读的是手柄共享内存，不是 InputPump 的变量。这次调用返回那一刻，共享内存里 Player1 / 掌机格的样式（StyleSet 非 0 = 已连接）
+                //   期望手写：只收 Player1 → Player1 已连、掌机格断开；再收掌机格 → 掌机格已连、Player1 断开。反证：只靠输入泵下一拍 Remap 时两次都还是调用前的连接
+                string Shm() { var n = Host.Device.Hid.SharedMemory.Npads; return $"P1={(n[(int)Ryujinx.HLE.HOS.Services.Hid.PlayerIndex.Player1].InternalState.StyleSet != 0 ? "连" : "断")} 掌机={(n[(int)Ryujinx.HLE.HOS.Services.Hid.PlayerIndex.Handheld].InternalState.StyleSet != 0 ? "连" : "断")}"; }
+                Host.Device.Hid.Npads.S2AApplyConfiguration();   // 起点：掌机格已写进共享内存
+                string before = Shm();
+                npid[0] = 0;   // NpadIdType.Player1
+                Call(hid, IdType(1));
+                string only1 = InputPump.Player.ToString(), shm1 = Shm();
+                npid[0] = 0; npid[1] = 0x20;   // Player1 + Handheld
+                Call(hid, IdType(2));
+                string back = InputPump.Player.ToString(), shm2 = Shm();
+                Check("P1-192 声明那次 hid 调用返回时，共享内存里的连接已改（起点 / 只收 Player1 / 再收掌机格）", "P1=断 掌机=连 / P1=连 掌机=断 / P1=断 掌机=连", $"{before} / {shm1} / {shm2}");
+                var npads = Host.Device.Hid.Npads;
+                for (int i = 0; i < 9; i++) npads.SetSupportedPlayer((Ryujinx.HLE.HOS.Services.Hid.PlayerIndex)i);   // 还原成都收
+                InputPump.SetPrimary(Host.Device, Ryujinx.HLE.HOS.Services.Hid.PlayerIndex.Handheld, Ryujinx.HLE.HOS.Services.Hid.ControllerType.Handheld);
+                Check("声明手柄号的那次 hid 调用里就跟随改接（只收 Player1 → Player1；再收掌机格 → 挪回）", "Player1 / Handheld", $"{only1} / {back}");
+                // 审计 P1-192：收局摘回调（之后服务线程的声明不再改已拆掉的手柄）；再 Start 登记回去，后面的用例照旧
+                InputPump.Stop();
+                Check("P1-192 收局后声明回调已摘", "空", Ryujinx.HLE.HOS.Services.Hid.NpadDevices.S2ASupportedChanged == null ? "空" : "还挂着");
+                InputPump.Start(Host.Device);
             }
 
             // 每帧都调的上游桩（01006F8002326000 pctl IsFreeCommunicationAvailable 每秒 25 次）：稳态零分配、汇总里次数照计
@@ -2670,9 +2702,31 @@ namespace S2A.Services.Tests
                         var none = new System.Collections.Generic.HashSet<string>();
                         string sd_p1 = D("p1", ("slot0/data.bin", [1])), sd_p2 = D("p2", ("0123456789abcdef/data.bin", [1])), sd_p3 = D("p3", ("JKSV/Game/P1 - 2026.01.01 @ 10.00.00/x.bin", [1]));
                         var hexOwn = new System.Collections.Generic.HashSet<string> { "0123456789abcdef" };
-                        Check("存档位置识别（P1-161）：首次放入单层目录不剥 / 游戏自己的十六进制顶层不剥 / 首次 JKSV 照剥",
-                            "save:. / save:. / save:JKSV/Game/P1 - 2026.01.01 @ 10.00.00",
-                            $"{K(sd_p1, SaveFolder.Detect(sd_p1, Application.ProgramId, none, out w), w)} / {K(sd_p2, SaveFolder.Detect(sd_p2, Application.ProgramId, hexOwn, out w), w)} / {K(sd_p3, SaveFolder.Detect(sd_p3, Application.ProgramId, none, out w), w)}");
+                        // 余项：首次放入（ownTop 空）的单层 16 / 32 位十六进制目录也不剥——十六进制编号层只在已认出的 Ryujinx / yuzu 结构里剥（上面 ② ③）
+                        string sd_p4 = D("p4", ("0123456789abcdef/data.bin", [1])), sd_p5 = D("p5", ("0123456789abcdef0123456789abcdef/data.bin", [1]));
+                        Check("存档位置识别（P1-161）：首次放入单层目录不剥 / 游戏自己的十六进制顶层不剥 / 首次 JKSV 照剥 / 首次放入单层十六进制目录不剥（16 / 32 位）",
+                            "save:. / save:. / save:JKSV/Game/P1 - 2026.01.01 @ 10.00.00 / save:. / save:.",
+                            $"{K(sd_p1, SaveFolder.Detect(sd_p1, Application.ProgramId, none, out w), w)} / {K(sd_p2, SaveFolder.Detect(sd_p2, Application.ProgramId, hexOwn, out w), w)} / {K(sd_p3, SaveFolder.Detect(sd_p3, Application.ProgramId, none, out w), w)}"
+                            + $" / {K(sd_p4, SaveFolder.Detect(sd_p4, Application.ProgramId, none, out w), w)} / {K(sd_p5, SaveFolder.Detect(sd_p5, Application.ProgramId, none, out w), w)}");
+
+                        // 审计 P1-178：恢复只含部分本地玩家的备份时，目标里有、备份里没有的玩家 = 要清掉「上次读写摘要」的人；手写期望：
+                        //   目标 账号组 {U1, U2} + 设备组 {全 0}，备份 账号组 {U1} → {U2}；备份里有、目标没有的 U3 不算；全 0 不算；完全相同 → 空
+                        {
+                            string p178_u1 = "0123456789abcdef0123456789abcdef", p178_u2 = "1111111111111111aaaaaaaaaaaaaaaa", p178_u3 = "2222222222222222bbbbbbbbbbbbbbbb", p178_z = new string('0', 32);
+                            var p178_tgt = new System.Collections.Generic.Dictionary<string, System.Collections.Generic.HashSet<string>> {
+                                ["0100000000001000/account"] = new() { p178_u1, p178_u2 }, ["0100000000001000/device"] = new() { p178_z } };
+                            var p178_bak = new System.Collections.Generic.Dictionary<string, System.Collections.Generic.HashSet<string>> {
+                                ["0100000000001000/account"] = new() { p178_u1, p178_u3 }, ["0100000000001000/device"] = new() { p178_z } };
+                            string p178_d1 = string.Join(",", SaveTransfer.DroppedUsers(p178_tgt, p178_bak).Order());
+                            string p178_d2 = string.Join(",", SaveTransfer.DroppedUsers(p178_tgt, p178_tgt).Order());
+                            Check("存档恢复（P1-178）：备份里没有的本地玩家 / 两边相同", $"{p178_u2} / （空）", $"{p178_d1} / {(p178_d2.Length == 0 ? "（空）" : p178_d2)}");
+                            // 余项：要删的摘要文件名。拿掉 U2、第一个玩家是 U2 → 带后缀那份 + 无后缀那份；第一个玩家是 U1（在备份里）→ 只删 U2 带后缀那份；认不出第一个玩家（null）→ 也只删带后缀那份
+                            string p178_n1 = string.Join(",", SaveTransfer.StateFilesToDrop(new[] { p178_u2 }, p178_u2.ToUpperInvariant()));
+                            string p178_n2 = string.Join(",", SaveTransfer.StateFilesToDrop(new[] { p178_u2 }, p178_u1));
+                            string p178_n3 = string.Join(",", SaveTransfer.StateFilesToDrop(new[] { p178_u2 }, null));
+                            Check("存档恢复（P1-178 余项）：第一个玩家被拿掉 / 没被拿掉 / 认不出", $"savedata-state-{p178_u2}.txt,savedata-state.txt / savedata-state-{p178_u2}.txt / savedata-state-{p178_u2}.txt",
+                                  $"{p178_n1} / {p178_n2} / {p178_n3}");
+                        }
 
                         // 审计 P1-163：摘要按内容。同路径同大小同修改时间、内容不同 → 摘要不同；只改修改时间 → 摘要不变（原先两向都错）
                         string dg = D("dg", ("save/slot.bin", [1, 2, 3, 4]));
@@ -2682,6 +2736,26 @@ namespace S2A.Services.Tests
                         File.SetLastWriteTimeUtc(slot, keepT.AddDays(3)); string d2 = SaveFolder.Digest(dg);
                         Check("存档位置摘要（P1-163）：保留时间的同大小替换看得出 / 只动修改时间不算换过", "换了内容：不同；只改时间：相同",
                             $"换了内容：{(d0 != d1 ? "不同" : "相同")}；只改时间：{(d1 == d2 ? "相同" : "不同")}");
+
+                        // #755：0.2.5 及更早写的记录（按修改时间算的旧摘要）。升级后第一次起局：存档位置自旧版写回后没动过 → 不读入、沿用当前进度、记录改成新摘要；
+                        //   旧记录之后玩家真换了文件 → 照常读入。期望按规则手写（原先两种都读入：当前进度被换成旧版写回的那份）
+                        if (Directory.Exists(folder)) Directory.Delete(folder, true);
+                        D("SaveData", ("save_device/dev.dat", [5, 6]));
+                        string nine755 = D("nine755", ("dev.dat", [9]));
+                        Saves.SeedFrom(Host.Device, Application.ProgramId, [("device", nine755)]);
+                        File.WriteAllText(state, SaveFolder.LegacyDigest(folder));
+                        long red755 = Red.Total;
+                        SaveFolder.ReadIn(Host.Device, Application.ProgramId);
+                        byte[] kept755 = ReadDeviceSave("/dev.dat");
+                        bool rec755 = File.ReadAllText(state).Trim() == SaveFolder.Digest(folder);
+                        File.WriteAllText(state, SaveFolder.LegacyDigest(folder));
+                        string dev755 = Path.Combine(folder, "save_device/dev.dat");
+                        File.WriteAllBytes(dev755, [7, 7]); File.SetLastWriteTimeUtc(dev755, DateTime.UtcNow.AddDays(1));
+                        SaveFolder.ReadIn(Host.Device, Application.ProgramId);
+                        byte[] read755 = ReadDeviceSave("/dev.dat");
+                        Check("存档位置（#755）：旧版记录、没动过 → 沿用当前进度并升级记录 / 旧版记录之后换了 → 读入",
+                            "设备仍 [9]、记录改成新摘要；换了之后设备 [7,7]、报红 +0",
+                            $"设备仍 {(kept755 == null ? "缺" : "[" + string.Join(",", kept755) + "]")}、记录{(rec755 ? "改成新摘要" : "没改")}；换了之后设备 {(read755 == null ? "缺" : "[" + string.Join(",", read755) + "]")}、报红 +{Red.Total - red755}");
 
                         // 审计 P1-162：写回带上用户号；存档位置里的 user 文件 / Ryujinx 导出 ExtraData0 偏移 0x8 的用户号都认得出
                         if (Directory.Exists(folder)) Directory.Delete(folder, true);
@@ -3022,12 +3096,14 @@ namespace S2A.Services.Tests
                 Ryujinx.HLE.HOS.SystemState.SystemLanguage a = SystemLocale.FromPreferred(new[] { "xx-YY", "zh-Hant-HK", "en-US" }, out _), b = SystemLocale.FromPreferred(Array.Empty<string>(), out _);
                 Check("系统语言：跳过认不出的取下一个 / 列表空回美式英语", "TraditionalChinese / AmericanEnglish", $"{a} / {b}");
                 string env = Environment.GetEnvironmentVariable("S2A_SYSTEM_LANGUAGE");
-                Check("系统语言：显式 S2A_SYSTEM_LANGUAGE 优先，否则跟本机首选", string.IsNullOrEmpty(env) ? SystemLocale.FromPreferred(SystemLocale.Preferred(), out _).ToString() : env, Host.Language.ToString());
-                // 游戏不支持系统语言时的退路（维护者 11-10「根据咱们宿主来识别语言种类」）：只看宿主主语言，① 主语言 → ② 同族变体 → ③ 美式 / 英式英语 → ④ 简中 / 繁中 → ⑤ 支持表第一项
+                Check("系统语言：显式 S2A_SYSTEM_LANGUAGE 优先，否则本机首选（不看界面语言 S2A_UI_LANGUAGE）", string.IsNullOrEmpty(env) ? SystemLocale.FromPreferred(SystemLocale.Preferred(), out _).ToString() : env, Host.Language.ToString());
+                // 游戏不支持主语言时的退路（维护者 11-13：落英语，英语也没有用游戏自己的缺省；简繁不互相落）：① 主语言 → ② 美式 / 英式英语 → ③ 支持表第一项
                 var TL = typeof(Ryujinx.HLE.HOS.SystemState.TitleLanguage);
                 var SL = Ryujinx.HLE.HOS.SystemState.SystemLanguage.SimplifiedChinese;
-                Check("语言退路列表：宿主简中 / 美式英语 / 日语 / 德语", "SimplifiedChinese,TraditionalChinese,AmericanEnglish,BritishEnglish / AmericanEnglish,BritishEnglish,SimplifiedChinese,TraditionalChinese / Japanese,AmericanEnglish,BritishEnglish,SimplifiedChinese,TraditionalChinese / German,AmericanEnglish,BritishEnglish,SimplifiedChinese,TraditionalChinese",
-                    string.Join(" / ", Array.ConvertAll(new[] { SL, Ryujinx.HLE.HOS.SystemState.SystemLanguage.AmericanEnglish, Ryujinx.HLE.HOS.SystemState.SystemLanguage.Japanese, Ryujinx.HLE.HOS.SystemState.SystemLanguage.German },
+                Check("语言退路列表：宿主简中 / 繁中 / 美式英语 / 英式英语 / 日语",
+                    "SimplifiedChinese,AmericanEnglish,BritishEnglish / TraditionalChinese,AmericanEnglish,BritishEnglish / AmericanEnglish,BritishEnglish / BritishEnglish,AmericanEnglish / Japanese,AmericanEnglish,BritishEnglish",
+                    string.Join(" / ", Array.ConvertAll(new[] { SL, Ryujinx.HLE.HOS.SystemState.SystemLanguage.TraditionalChinese, Ryujinx.HLE.HOS.SystemState.SystemLanguage.AmericanEnglish,
+                        Ryujinx.HLE.HOS.SystemState.SystemLanguage.BritishEnglish, Ryujinx.HLE.HOS.SystemState.SystemLanguage.Japanese },
                         l => string.Join(",", SystemLocale.TitleFallback(l)))));
                 // 支持位按 TitleLanguage：美式英语 0、日 2、德 4、韩 12、繁 13、简 14。#445 那款声明 0x3005 = 美 / 日 / 韩 / 繁
                 var pick = Ryujinx.HLE.HOS.Services.Am.AppletOE.ApplicationProxyService.ApplicationProxy.IApplicationFunctions.PickDesiredLanguage;
@@ -3040,9 +3116,20 @@ namespace S2A.Services.Tests
                     return $"{Enum.GetName(TL, p)}（{step(hostT, p, fb)}）";
                 }
                 int g445 = 0x3005, jaEn = (1 << 2) | (1 << 0), enHant = (1 << 0) | (1 << 13), koOnly = (1 << 12) | (1 << 2), asia = (1 << 12) | (1 << 13) | (1 << 14);
-                Check("语言选择：宿主简中 + 美 / 日 / 韩 / 繁 → 繁中；宿主简中 + 日 / 英 → 英语；宿主日语 + 英 / 繁 → 英语；宿主简中 + 简 → 简中；宿主德语 + 日 / 韩 → 日语（支持表第一项）；宿主美式英语 + 韩 / 繁 / 简 → 简中（11-03 亚洲版不回退韩语）",
-                    "TraditionalChinese（第 2 步：同族变体） / AmericanEnglish（第 3 步：英语） / AmericanEnglish（第 3 步：英语） / SimplifiedChinese（第 1 步：宿主主语言） / Japanese（第 5 步：游戏支持表第一项） / SimplifiedChinese（第 4 步：中文）",
+                Check("语言选择：宿主简中 + 美 / 日 / 韩 / 繁 → 英语（不落繁中）；宿主简中 + 日 / 英 → 英语；宿主日语 + 英 / 繁 → 英语；宿主简中 + 简 → 简中；宿主德语 + 日 / 韩 → 日语（支持表第一项）；宿主美式英语 + 韩 / 繁 / 简 → 韩语（支持表第一项）",
+                    "AmericanEnglish（第 3 步：英语） / AmericanEnglish（第 3 步：英语） / AmericanEnglish（第 3 步：英语） / SimplifiedChinese（第 1 步：宿主主语言） / Japanese（第 5 步：游戏支持表第一项） / Korean（第 5 步：游戏支持表第一项）",
                     $"{Sel(SL, g445)} / {Sel(SL, jaEn)} / {Sel(Ryujinx.HLE.HOS.SystemState.SystemLanguage.Japanese, enHant)} / {Sel(SL, 1 << 14)} / {Sel(Ryujinx.HLE.HOS.SystemState.SystemLanguage.German, koOnly)} / {Sel(Ryujinx.HLE.HOS.SystemState.SystemLanguage.AmericanEnglish, asia)}");
+                // 维护者 11-13 矩阵：设备语言（简中 / 繁中 / 英 / 日）× 游戏支持 / 不支持它。语言标签映射成主语言，再按五步选；期望按规则手写：
+                //   支持 → 就是它；不支持、有英语 → 美式英语；不支持、也没英语 → 支持表第一项。三种游戏：全语言（日 2 英 0 繁 13 简 14 都有）、只有英 + 德（0、4）、只有法 + 德（3、4；TitleLanguage 1 是英式英语）
+                int all = (1 << 0) | (1 << 2) | (1 << 13) | (1 << 14), enDe = (1 << 0) | (1 << 4), frDe = (1 << 3) | (1 << 4);
+                string Ui(string tag, int supported) => Enum.GetName(TL, pick(Enum.Parse<Ryujinx.HLE.HOS.SystemState.TitleLanguage>(SystemLocale.FromPreferred(new[] { tag }, out _).ToString()), supported,
+                    SystemLocale.TitleFallback(SystemLocale.FromPreferred(new[] { tag }, out _))));
+                string[] uis = { "zh-Hans", "zh-Hant", "en", "ja" };
+                Check("界面语言 × 游戏支持：全语言款", "SimplifiedChinese,TraditionalChinese,AmericanEnglish,Japanese", string.Join(",", Array.ConvertAll(uis, u => Ui(u, all))));
+                Check("界面语言 × 游戏不支持（有英语）：英 + 德款", "AmericanEnglish,AmericanEnglish,AmericanEnglish,AmericanEnglish", string.Join(",", Array.ConvertAll(uis, u => Ui(u, enDe))));
+                Check("界面语言 × 游戏不支持（也没英语）：法 + 德款 → 支持表第一项法语", "French,French,French,French", string.Join(",", Array.ConvertAll(uis, u => Ui(u, frDe))));
+                Check("简繁不互相落：繁中界面 + 只有简中的游戏 → 简中是支持表第一项才用（没英语）；简中界面 + 只有繁中 + 英 → 英语",
+                    "SimplifiedChinese / AmericanEnglish", $"{Ui("zh-Hant", 1 << 14)} / {Ui("zh-Hans", (1 << 13) | (1 << 0))}");
                 // #465：Switch 2 合成件（导出没有控制分区，显示版本 "?"、只声明英语）→ 直接回宿主主语言；Switch 1 合成件（#401 NUP）不走这条，照旧英语退路；真游戏走五步
                 var s2u = Ryujinx.HLE.HOS.Services.Am.AppletOE.ApplicationProxyService.ApplicationProxy.IApplicationFunctions.Switch2LanguagesUnknown;
                 Check("Switch 2 语言未知判定：04 款合成件（只声明英语、版本 ?）/ 04 款位为 0 / 01 款合成件（#401）/ 04 款真 NACP 0x3005 版本 1.0.2", "True / True / False / False",
@@ -3054,6 +3141,11 @@ namespace S2A.Services.Tests
                     $"{noLang(0)} / {noLang(1 << 16)} / {noLang(1 << 17)} / {noLang(1 << 18)} / {s2u(0x0400486024DEC000, 1 << 16, "1.0.0")}");
                 // 01 款合成件 + 宿主简中：不进 Switch 2 那条，按五步走 → 只声明英语 → 美式英语（不回退 #401）
                 Check("Switch 1 合成件（只声明英语）+ 宿主简中 → 美式英语（#401 不回退）", "AmericanEnglish（第 3 步：英语）", Sel(SL, 1));
+                // #617：01 开头（Switch 2 本体 + 升级包）的合成件 + 玩家显式指定游戏语言 → 占位支持表（缺省只声明美式英语）不作数，按宿主主语言回；
+                //   没显式指定时占位表照旧作数（上面那条 #401 护栏不动）；真 NACP（显示版本不会是 ?）与旧版无 ? 标记的合成件即使显式指定也不放行
+                var synthEx = Ryujinx.HLE.HOS.Services.Am.AppletOE.ApplicationProxyService.ApplicationProxy.IApplicationFunctions.SynthTableHonorsExplicitLanguage;
+                Check("合成件 + 显式语言放行判定：合成件 + 显式 / 合成件 + 没显式 / 真 NACP + 显式 / 无 ? 标记 + 显式", "True / False / False / False",
+                    $"{synthEx("?", true)} / {synthEx("?", false)} / {synthEx("1.0.2", true)} / {synthEx("", true)}");
                 // 支持语言位为 0（合成的 control.nacp）：缺省回美式英语（#401）；玩家显式指定系统语言时回它。语言码 = ASCII 小端："ja" = 0x616A、"en-US" = 0x53552D6E65
                 var zero = Ryujinx.HLE.HOS.Services.Am.AppletOE.ApplicationProxyService.ApplicationProxy.IApplicationFunctions.ZeroSupportedLanguageCode;
                 Check("支持语言位为 0：系统日语、没显式指定 → en-US；显式指定日语 → ja", "0x53552D6E65 / 0x616A", $"0x{zero(0x616A, false):X} / 0x{zero(0x616A, true):X}");

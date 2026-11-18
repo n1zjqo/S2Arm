@@ -23,7 +23,8 @@
 退出码：0 成功；1 失败（标准输出最后一行【红】说明停在哪一步）；3 内容缺口（直连库出不了）；75 环境缺件（--check 同口径）。
 今晚实测（11-05 Windows 出包机 20 核）：旷野之息 解包 39 秒 / 轻阶段 ~260 秒 / 直连库 267 秒 / ipa 136 秒；金刚 导出整理 91 秒 / 轻阶段 ~300 秒 / 直连库 493 秒 / ipa 196 秒。
 """
-import argparse, glob, json, os, re, shutil, subprocess, sys, tempfile, time
+import os as _pw_os, sys as _pw_sys; _pw_sys.path.append(_pw_os.path.join(_pw_os.path.dirname(_pw_os.path.abspath(__file__)), '..', '..', 'tools')); from pool_workers import cores  # noqa: E402  核数 / 进程池路数唯一来源（tools/pool_workers.py，#1332）
+import argparse, glob, json, os, re, shutil, stat, subprocess, sys, tempfile, time
 from pathlib import Path
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 from pack.orch import shortroot   # noqa: E402
@@ -169,6 +170,9 @@ def metal_bin():
     return metal_exe().parent
 
 
+ROMFS_EXE = 'romfs/' + ('romfs_index.exe' if WIN else 'romfs_index')   # 预编 RomFS 索引：NativeAOT 单文件（launchers/windows/bundle_prepare_win.py），玩家机不要 .NET
+
+
 def prebuilt(rel, ident=None):
     """启动器随发版预编的件（S2A_PREBUILT_TOOLS = Binaries/Prepare，launchers/windows/bundle_prepare_win.py 编；同 dsh_batch.py prebuilt 的口径）：
     文件在、且给了身份时与同目录 .src_digest 相同 → 路径；没设 / 不在 / 身份不符（引擎源码比预编件新）→ None，调用方照旧现编"""
@@ -182,14 +186,6 @@ def prebuilt(rel, ident=None):
     return p if p.is_file() else None
 
 
-def dotnet_runtime_ok():   # 预编件只要 .NET 10 运行时（framework-dependent）：dotnet --list-runtimes 里有 Microsoft.NETCore.App 10.x
-    dn = os.environ.get('DOTNET') or shutil.which('dotnet')
-    if not dn: return False
-    try: out = subprocess.run([dn, '--list-runtimes'], capture_output=True, text=True).stdout
-    except OSError: return False
-    return bool(re.search(r'^Microsoft\.NETCore\.App 10\.', out, re.M))
-
-
 def env_items(target, shell):
     """环境自检：(项, 好?, 说明, 状态, 官方下载页)。只读不改、不下载；缺件写清去哪拿。
     状态：ok / missing / mismatch（有、但版本或身份不符，给了 found 为真的）；官方下载页（第 5 项）只给玩家要自己装、不能随包带的件（许可不许再分发），现无（Metal 由 winenv 核，下载页在 winenv.OFFICIAL）"""
@@ -198,12 +194,11 @@ def env_items(target, shell):
     pre = os.environ.get('S2A_PREBUILT_TOOLS')   # 启动器随发版预编（launchers/windows/bundle_prepare_win.py）：编译器 / 构建工具 / .NET SDK 各项改核对应预编件在不在
     add('python', sys.version_info >= (3, 12), f'{sys.version.split()[0]}（要 ≥ 3.12）', found=True)
     if pre:
-        add('dotnet', dotnet_runtime_ok(), '预编的 C# 件要 .NET 10 运行时（dotnet --list-runtimes 有 Microsoft.NETCore.App 10.x）')
         sys.path.insert(0, str(R / 'translator')); import dsh_batch
         try: gd = prebuilt('gamedec/' + ('gamedec.exe' if WIN else 'gamedec'), gamedec_id())
         except Fail: gd = None
         miss = [n for n, ok in (('nx_unpack', prebuilt('nx_unpack/' + ('nx_unpack.exe' if WIN else 'nx_unpack'), nx_unpack_id())), ('gamedec', gd),
-                                ('romfs', prebuilt('romfs/romfs_index.dll')),
+                                ('romfs', prebuilt(ROMFS_EXE)),
                                 ('dsh_batch', dsh_batch.prebuilt(dsh_batch.src_digest(os.path.join(dsh_batch.DSH, 'batch', 'dsh_batch.csproj'))) and dsh_batch.prebuilt_xfp())) if not ok]
         add('prebuilt-dotnet', not miss, f'预编 C# 件（{pre}，源码身份与本引擎相同才用）' + (f'缺或身份不符：{"、".join(miss)}' if miss else '齐'))
     else:
@@ -226,7 +221,7 @@ def env_items(target, shell):
     add('tzdata', (R / 'Binaries/Prepare/Tzdata/output').is_dir() or (tz and Path(tz, 'output').is_dir()),
         '钉版时区离线产物（S2A_TZDATA_CACHE/output，Mac 上 services/systemdata/make_tzdata.sh 生成后带来）')
     fonts = os.environ.get('S2A_FONTS')
-    add('fonts', fonts and len(glob.glob(os.path.join(fonts, '*.bfttf'))) == 7, '开源共享字体 7 份（S2A_FONTS，Mac 上 pack/fonts/make_open_fonts.py 生成后带来）')
+    add('fonts', fonts and len(glob.glob(os.path.join(glob.escape(fonts), '*.bfttf'))) == 7, '开源共享字体 7 份（S2A_FONTS，Mac 上 pack/fonts/make_open_fonts.py 生成后带来）')
     if pre:
         from pack import rewriter
         rw = rewriter.bundled()
@@ -266,7 +261,10 @@ class Run:
         self.evf = open(events, 'w', encoding='utf-8', newline='\n') if events else None; self.k = 0
 
     def ev(self, kind, **kw):   # 事件流一行（--events，见文件头）；没给就不写
-        kw = {k: shortroot.show(v) if isinstance(v, str) else v for k, v in kw.items()}   # 事件给界面：玩家只看到自己选的路径
+        # 事件给界面：玩家只看到自己选的路径。show 逐字替换（文案中间的路径），to_long 再按不分大小写、不分 / \\ 换前缀
+        #   （诊断#0e3bd5：result 的 ipa 路径大小写 / 分隔符和登记的短入口不一致，show 没换回，子进程退出拆了联接，父进程拷 ipa 报 WinError 3）
+        tbl = shortroot.table_now()
+        kw = {k: shortroot.to_long(shortroot.show(v), tbl) if isinstance(v, str) else v for k, v in kw.items()}
         if self.evf: self.evf.write(json.dumps({'ev': kind, 't': int(time.time()), **kw}, ensure_ascii=False) + '\n'); self.evf.flush()
 
     def say(self, msg):
@@ -287,14 +285,24 @@ class Run:
         with open(self.out / log, 'w', encoding='utf-8', newline='\n') as f:
             p = subprocess.run(args, stdout=f, stderr=subprocess.STDOUT, env=env, cwd=cwd or R)
         if p.returncode not in ok:
-            tail = (self.out / log).read_text(encoding='utf-8', errors='replace').strip().splitlines()[-3:]
-            raise Fail(f'{log}：rc={p.returncode}；' + ' / '.join(tail)[-300:], p.returncode if p.returncode in (3, 75) else 1)   # 3 内容缺口 / 75 环境缺件（如缺 Git Bash、gamedec 编不出）原样上交，Windows 出包机道按 75 落回 Mac
+            raise Fail(f'{log}：rc={p.returncode}；' + log_reason((self.out / log).read_text(encoding='utf-8', errors='replace')), p.returncode if p.returncode in (3, 75) else 1)   # 3 内容缺口 / 75 环境缺件（如缺 Git Bash、gamedec 编不出）原样上交，Windows 出包机道按 75 落回 Mac
         return p.returncode
+
+
+def log_reason(text, limit=600):
+    """工具日志 → 一句原因：有 Python 异常就以异常那一行（「XxxError: …」）开头、保住它，后面的附注（清理也失败之类，PEP 678 打在异常行之后）
+    能放多少放多少；没有异常行照旧取末 3 行。原先一律取末 3 行的末 300 字，附注把原异常挤掉（#754：玩家报告里只剩「改名回去也失败」）"""
+    lines = text.strip().splitlines()
+    exc = max((i for i, l in enumerate(lines) if re.match(r'^[A-Za-z_][\w.]*(Error|Exception|Exit|Interrupt|Fail|Conflict|UnsafeRoot)\b.*', l)), default=None)
+    if exc is None:
+        return ' / '.join(lines[-3:])[-300:]
+    head = ' / '.join(lines[exc:])
+    return head if len(head) <= limit else head[:limit] + '…'
 
 
 def nx_unpack_id():   # 源码身份（现编目录名与预编件 .src_digest 共用）
     import hashlib
-    src = b''.join(Path(f).read_bytes() for f in sorted(glob.glob(str(R / 'pack/nx_unpack/*.cs')) + glob.glob(str(R / 'pack/nx_unpack/*.csproj'))))
+    src = b''.join(Path(f).read_bytes() for f in sorted(glob.glob(os.path.join(glob.escape(str(R / 'pack/nx_unpack')), '*.cs')) + glob.glob(os.path.join(glob.escape(str(R / 'pack/nx_unpack')), '*.csproj'))))
     return hashlib.sha256(src).hexdigest()[:12]
 
 
@@ -345,10 +353,10 @@ def unpack(run, sources, title_id, program_index=0):
     exe = run.step('编 nx_unpack', lambda: nx_unpack(run))
     env = dict(os.environ, PYTHONUTF8='1', S2A_NX_UNPACK=str(exe))
     s = Path(sources[0])
-    nup = [p for p in sources if p.lower().endswith('.nup')] or (glob.glob(os.path.join(sources[0], '*.nup')) if s.is_dir() else [])
-    export = next((d for d in [s] + ([Path(p) for p in glob.glob(os.path.join(sources[0], '*'))] if s.is_dir() else []) if (d / 'base/exefs/main.npdm').is_file()), None)
+    nup = [p for p in sources if p.lower().endswith('.nup')] or (glob.glob(os.path.join(glob.escape(sources[0]), '*.nup')) if s.is_dir() else [])
+    export = next((d for d in [s] + ([Path(p) for p in glob.glob(os.path.join(glob.escape(sources[0]), '*'))] if s.is_dir() else []) if (d / 'base/exefs/main.npdm').is_file()), None)
     drop_seed_link(x)
-    shutil.rmtree(x, ignore_errors=True)
+    rmtree_loud(x)
     if export is None and nup:   # Switch 2 NUP 容器：先展开成导出目录
         name = re.sub(r' \[.*$', '', Path(nup[0]).stem)
         export = run.out / 'ns2_dump' / name
@@ -359,7 +367,7 @@ def unpack(run, sources, title_id, program_index=0):
     else:   # Switch 1 原件：按内容清单认款（pack/source_pick.py，与 Mac 一键出包同一份规则），本体 + 更新 + DLC 一起解
         keys = os.environ.get('S2A_KEYS') or os.path.expanduser('~/.switch/prod.keys')
         if not os.path.isfile(keys): raise Fail(f'prod.keys 不在：{keys}', 75)
-        files = sorted(f for d in sources for f in ([d] if os.path.isfile(d) else glob.glob(os.path.join(d, '**', '*'), recursive=True)) if f.lower().endswith(SRC_EXT))
+        files = sorted(f for d in sources for f in ([d] if os.path.isfile(d) else glob.glob(os.path.join(glob.escape(d), '**', '*'), recursive=True)) if f.lower().endswith(SRC_EXT))
         if not files: raise Fail(f'{sources} 下没有 {"/".join(SRC_EXT)}')
         def pick():
             with tempfile.TemporaryDirectory() as t:
@@ -407,12 +415,12 @@ def gamedec(run):
     b = Path(os.environ.get('S2A_BIN') or run.out / 'bin') / ('gamedec_' + ident)
     exe = b / ('gamedec.exe' if WIN else 'gamedec')
     if not exe.is_file():
-        tmp = b.with_name(b.name + f'.tmp{os.getpid()}'); shutil.rmtree(tmp, ignore_errors=True)
+        tmp = b.with_name(b.name + f'.tmp{os.getpid()}'); rmtree_loud(tmp)
         run.sh(['dotnet', 'build', '-c', 'Release', str(R / 'pack/gamedec/gamedec.csproj'), '-o', str(tmp), '-nologo', '-v', 'q'], 'gamedec_build.log', ok=(0,))
         try: tmp.rename(b)
         except OSError:   # 别的作业同时编好了同一身份：用它的
             if not exe.is_file(): raise
-            shutil.rmtree(tmp, ignore_errors=True)
+            rmtree_loud(tmp, strict=False)
     return exe
 
 
@@ -465,7 +473,7 @@ def stages(run, game, x, src_dir, own=False):
     # RomFS 索引阶段按合同 --no-restore 编（不在阶段里悄悄下载）：新检出的代码树（Windows 出包机道按提交新建，11-05 海贼无双4 联调退 75）先在这里还原一次；
     #   包都在本机 NuGet 全局缓存里时不联网，缺包才会去源取
     proj = R / 'services/romfs_index'
-    if not prebuilt('romfs/romfs_index.dll') and not (proj / 'obj/project.assets.json').is_file():   # 用预编 RomFS 索引（stages.py 同口径）就不编、不用还原
+    if not prebuilt(ROMFS_EXE) and not (proj / 'obj/project.assets.json').is_file():   # 用预编 RomFS 索引（stages.py 同口径）就不编、不用还原
         run.step('还原 RomFS 索引依赖', lambda: run.sh(['dotnet', 'restore', str(proj), '-nologo', '-v', 'q'], 'romfs_index_restore.log'))
     run.step('八个轻阶段', lambda: run.sh([PY, '-X', 'utf8', '-m', 'pack.orch.refresh', game, '--roots', str(roots), '--stages', 'all-light'], 'light.log', env=env))
     cur = roots / f'{game}@现行'
@@ -511,17 +519,55 @@ def dcache_lru(run, root, tid):
     except Fail as e: run.say(f'【黄】直连缓存淘汰没跑成（{e}），本单产物不受影响；缓存可能超预算')   # 淘汰是收尾附带的，不改本单结论
 
 
+def mem_gb():
+    """本机物理内存（GB，取整）；读不到返回 None。S2A_MEM_TOTAL_GB 可手动指定（同 tools/cores.sh）"""
+    v = os.environ.get('S2A_MEM_TOTAL_GB')
+    if v and v.isdigit() and int(v) > 0:
+        return int(v)
+    if sys.platform == 'win32':   # 按真实平台（WIN 在单测里会被打桩成 True）
+        import ctypes
+        class MS(ctypes.Structure):
+            _fields_ = [('dwLength', ctypes.c_ulong), ('dwMemoryLoad', ctypes.c_ulong)] + \
+                       [(n, ctypes.c_ulonglong) for n in ('total', 'avail', 'pagefile', 'availpage', 'virt', 'availvirt', 'availext')]
+        m = MS(); m.dwLength = ctypes.sizeof(MS)
+        return int(m.total >> 30) if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)) and m.total else None
+    try: return int(os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES') >> 30) or None
+    except (ValueError, OSError, AttributeError): return None
+
+
+def parallel(jobs, gb):
+    """(抽取 / 改写这类吃内存的重活路数 S2A_CPU_BAKE, 直连库编译路数 J)：同 Mac tools/cores.sh 的口径，按物理内存封顶。
+    #711（11-11）：原先两者都直接取 --jobs（缺省逻辑核数），16 GB / 16 核以上的 Windows 机抽取开满核数路、MemoryError。
+    Windows 有提交上限（物理内存 + 页面文件），超了直接 MemoryError，不像 Mac 能靠交换区硬扛。
+    - 重活：min(jobs, 物理内存 × 3/4 ÷ 1.5 GB)
+    - 直连库：min(jobs, 1 + (物理内存 × 3/4 − dsh 主进程 1740 MB − 1 个 metal 峰值 1065 MB) ÷ metal p90 420 MB)
+    都至少 1；环境给了 S2A_CPU_BAKE / S2A_DIRECT_J 就用给的；内存读不到按 jobs（不拦，照旧跑）"""
+    bake = direct_j = jobs
+    if gb:
+        bake = min(jobs, gb * 3 // 4 * 2 // 3)
+        direct_j = min(jobs, 1 + (gb * 1024 * 3 // 4 - 1740 - 1065) // 420)
+    env = lambda k, d: int(os.environ[k]) if os.environ.get(k, '').isdigit() and int(os.environ[k]) > 0 else d
+    return max(1, env('S2A_CPU_BAKE', bake)), max(1, env('S2A_DIRECT_J', direct_j))
+
+
 def direct(run, cur, target, jobs, tid=None, name='direct'):
     """直连库。缓存：S2A_DIRECT_CACHE（整条路径）> S2A_DIRECT_CACHE_ROOT/<程序号>（常驻，按款共用，11-06 出包速度线：Windows 出包机原先每单私有、成功即删，同款再出从零翻译 + 编 Metal）
     > <工作目录>/dcache（本单私有）。常驻时同款两单按文件锁串行（日志 logs/、跑局知识快照同目录），出完把本次 logs/ 拷回 <工作目录>/dcache/logs
     （tools/tianyan_lane.py 拉 direct_fail.log / 判红日志的路径不变），再按预算淘汰"""
+    if WIN and not metal_exe().is_file():   # 物理上做得下去：不带着色器库照出包（product 收 dlib=None），游戏里首次遇到的画面现编、前几分钟会卡
+        run.say(f'【黄】没找到 Metal 开发工具（{metal_exe().parent}）：这次不带着色器库，游戏能玩，首次遇到的画面现编、前几分钟会卡；'
+                f'在「准备这台电脑」装好 Metal 开发工具后重新出包就不卡')
+        run.ev('direct_skipped', reason='metal_missing')
+        return None
     out = run.out / name   # 多程序合集序号 n：direct_p<n>（sub_programs）
     dsx = (prebuilt('dsx/dsx.dll') or R / 'build/dsx/win/dsx.dll') if WIN else None   # 直连翻译库：启动器随发版预编的在就用（同 Mac pack/stage_direct.sh 内置 dsx/libdsx.dylib）
     if WIN and not prebuilt('dsx/dsx.dll'): run.step('编 dsx', lambda: run.sh([PY, '-X', 'utf8', str(R / 'graphics/dsx/dsx_win.py'), str(dsx)], 'dsx_build.log'))
     dp = cur / 'direct_profile.json'   # 配置推导阶段写的档（零配置生成的在产物根 direct-profile/<键>/，手写档在仓库 graphics/nvn/games）
     prof = json.loads(dp.read_text(encoding='utf-8')) if dp.is_file() else {}
     games = cur / prof['DM_GAMES_DIR'] if prof.get('DM_GAMES_DIR') else R / 'graphics/nvn/games'
-    env = dict(os.environ, PYTHONUTF8='1', S2A_DIRECT_TARGETS=target, S2A_DIRECT_PUBLISH=target, J=str(jobs), S2A_CPU_BAKE=str(jobs),
+    gb = mem_gb(); bake, dj = parallel(jobs, gb)
+    run.say(f'并行度：核数 {jobs}、物理内存 {gb if gb else "读不到"} GB → 抽取 / 改写 {bake} 路、直连库编译 {dj} 路')
+    env = dict(os.environ, PYTHONUTF8='1', S2A_DIRECT_TARGETS=target, S2A_DIRECT_PUBLISH=target, J=str(dj), S2A_CPU_BAKE=str(bake),
                DM_GAMES_DIR=mixed(games), DM_GAMES_FIRST='1',
                S2A_PY=sys.executable, S2A_PYTHON=sys.executable)
     # Python / C# 编译器包装都读这个目录，metal 与 metallib 必须来自同一安装。
@@ -533,7 +579,7 @@ def direct(run, cur, target, jobs, tid=None, name='direct'):
     if src: env['S2A_PSO_SOURCES'] = src
     bash = bash_exe()
     if not bash: raise Fail('没有 Git Bash（直连库脚本要它）', 75)
-    shutil.rmtree(out, ignore_errors=True)
+    rmtree_loud(out)
     label = '抽取 + 直连库' if name == 'direct' else f'抽取 + 直连库（{name}）'; dname = 'dcache' if name == 'direct' else f'dcache_{name}'   # 多程序合集各序号的私有缓存 / 日志分开
     croot = os.environ.get('S2A_DIRECT_CACHE_ROOT') if not os.environ.get('S2A_DIRECT_CACHE') and tid else None
     if not croot:
@@ -546,18 +592,56 @@ def direct(run, cur, target, jobs, tid=None, name='direct'):
         run.say(f'直连缓存（常驻）：{c}')
         try: run.step(label, lambda: run.sh([bash, mixed(R / 'graphics/tools/direct/direct_lib.sh'), mixed(cur), mixed(out)], 'direct_lib.log', env=env))
         finally:
-            mine = run.out / dname / 'logs'; shutil.rmtree(mine, ignore_errors=True); mine.mkdir(parents=True)
+            mine = run.out / dname / 'logs'; rmtree_loud(mine); mine.mkdir(parents=True)
             for f in (c / 'logs').glob('*.log'): shutil.copy2(f, mine / f.name)
-        dcache_lru(run, root, tid.upper())
     finally: lk.close()
+    # 淘汰放在放锁之后（11-16 极速出包定因：原先拿着同款锁淘汰，同款下一单白等 98 秒）：本款照旧列在「在用」里、整款不动，接手的同款单用的也是这一款
+    dcache_lru(run, root, tid.upper())
     return out
 
 
+def rmtree_loud(p, strict=True):
+    """删整棵目录：不在就算删完；只读文件（只读位，os.unlink 不认、报 WinError 5）先去掉只读再删；还删不掉的报出来——
+    strict 抛错（之后要在原处重建的输出目录，残留会混进新产物），否则说一句黄（只是收尾清理）。原先 rmtree(ignore_errors=True) 静默留残留"""
+    def retry(func, path, exc):
+        error = exc if isinstance(exc, BaseException) else exc[1]
+        if isinstance(error, FileNotFoundError):
+            return
+        if isinstance(error, PermissionError) and os.path.lexists(path) and not os.path.islink(path):
+            for q in (os.path.dirname(path), path):   # Windows 是文件的只读位；别处是父目录没有写权限
+                if not os.path.islink(q):
+                    os.chmod(q, stat.S_IMODE(os.stat(q).st_mode) | stat.S_IWRITE | stat.S_IREAD | (stat.S_IEXEC if os.path.isdir(q) else 0))
+            return func(path)
+        raise error
+    if not os.path.lexists(p):
+        return
+    try:
+        if sys.version_info >= (3, 12):
+            shutil.rmtree(p, onexc=retry)
+        else:
+            shutil.rmtree(p, onerror=retry)
+    except OSError as e:
+        if strict:
+            raise OSError(e.errno, f'删不掉 {p}（{e.strerror or e}；{getattr(e, "filename", "") or ""}）') from e
+        print(f'【黄】没删干净 {p}：{e}', file=sys.stderr)
+
+
 def junction(dst, src):
-    if WIN:   # 目标写真实长路径：短根是工作期的入口，产物里的联接要在它之外也有效；CreateJunction 不受 cmd 的长度限制
-        import _winapi
-        _winapi.CreateJunction(shortroot.to_long(src, shortroot.table_now()), str(dst))
-    else: os.symlink(src, dst)
+    """工作根里联到现行各项 / 直连库。游戏库所在盘建不了联接（exFAT / FAT32，v0.3.1 玩家确认过照用，pack/orch/roots.py links_supported）时整份拷过来：
+    多占一份空间（空间预算已按这类盘多算），产物一样"""
+    target = shortroot.to_long(src, shortroot.table_now())
+    if WIN and shortroot.is_network_path(target):
+        shutil.copytree(src, dst)
+        return
+    try:
+        if WIN:   # 目标写真实长路径：短根是工作期的入口，产物里的联接要在它之外也有效；CreateJunction 不受 cmd 的长度限制
+            import _winapi
+            _winapi.CreateJunction(shortroot.to_long(src, shortroot.table_now()), str(dst))
+        else: os.symlink(src, dst)
+    except OSError:
+        if os.path.lexists(dst):
+            raise
+        shutil.copytree(src, dst)
 
 
 def product(run, cur, dlib, w=None):
@@ -587,7 +671,8 @@ def sub_programs(run, a, x, w, src_dir):
     services Application.ProgramDir：模块目录与游戏数据目录都在这里，Mac 产物根两者同根）。单程序款不进来"""
     n = programs_of(x)
     if n <= 1: return
-    if a.from_extract: raise Fail(f'多程序合集（{n} 支）：--from-extract 只给了序号 0 的解包目录，其余序号要从原件解，改给原件')
+    # --from-extract 的共用解包目录只有序号 0；其余序号从原件解（作业层把游戏库里的原件跟在后面一起给，#613）
+    if a.from_extract and not a.source: raise Fail(f'多程序合集（{n} 支）：--from-extract 只给了序号 0 的解包目录，其余序号要从原件解，原件没一起给')
     for i in range(1, n):
         xi, tid_i, _ = unpack(run, a.source, a.title_id, i)
         if WIN: host_decoder_gate(run, xi); glslc_gate(run, xi)
@@ -623,7 +708,7 @@ def Early(run, a, cur, game):
     d = run.out / 'early'; log = d / 'early.log'
 
     def build():
-        shutil.rmtree(d, ignore_errors=True); d.mkdir(parents=True)
+        rmtree_loud(d); d.mkdir(parents=True)
         w = product(run, cur, None, d / 'product')
         title = subprocess.run([PY, '-X', 'utf8', str(R / 'pack/display_name.py'), str(w), '--title'], capture_output=True, text=True, encoding='utf-8').stdout.strip()
         suffix = a.suffix if a.suffix is not None else 'Win'
@@ -685,7 +770,7 @@ def main(argv=None):
         if hasattr(s, 'reconfigure'): s.reconfigure(encoding='utf-8')
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument('source', nargs='*'); ap.add_argument('--out'); ap.add_argument('--target', choices=('ios', 'mac'), default='ios')
-    ap.add_argument('--title-id'); ap.add_argument('--bundle-id'); ap.add_argument('--shell'); ap.add_argument('--jobs', type=int, default=os.cpu_count() or 8)
+    ap.add_argument('--title-id'); ap.add_argument('--bundle-id'); ap.add_argument('--shell'); ap.add_argument('--jobs', type=int, default=cores())
     ap.add_argument('--check', action='store_true'); ap.add_argument('--from-extract'); ap.add_argument('--events')
     ap.add_argument('--rt-shaders', metavar='DIR')   # 内部验证包：真机转储的着色器并进解包目录（put_rt）；不给 = 不带（缺省行为不变）
     ap.add_argument('--install', metavar='UDID'); ap.add_argument('--name'); ap.add_argument('--suffix'); ap.add_argument('--plumesign'); ap.add_argument('--devpush')
@@ -698,16 +783,23 @@ def main(argv=None):
         return 75 if bad else 0
     if not (a.source or a.from_extract) or not a.out: ap.error('要 <原件>（或 --from-extract <解包目录>）与 --out')
     if WIN:   # 工作区走短根：之后的路径（工具参数、bash、dotnet、TEMP）都短；深路径的玩家数据目录不再踩 MAX_PATH
-        mapped = shortroot.enter(a.out, *([a.from_extract] if a.from_extract else []))
+        # 作业层的工具缓存根（<库>/tool-cache，游戏库结构 P3 起在游戏库里）也走短根：直连 / 翻译缓存（S2A_RUN_ROOT）、cache/* 都经环境变量传下去，
+        #   库在深目录时原先只有工作区短、缓存仍是长路径（v0.3.0 win_cases deep 直连库抽取失败）
+        tool = os.path.dirname(os.path.abspath(os.environ['S2A_RUN_ROOT'])) if os.environ.get('S2A_RUN_ROOT') else None
+        mapped = shortroot.enter(a.out, *([a.from_extract] if a.from_extract else []), *([tool] if tool else []))
         if mapped:
             a.out = mapped[os.path.abspath(a.out)]
             if a.from_extract: a.from_extract = mapped[os.path.abspath(a.from_extract)]
+            # 作业层经环境变量传下来的缓存路径（S2A_RUN_ROOT、cache/*、跟着存放位置走的 S2A_DIRECT_CACHE…）落在哪个入口下就换成经它访问
+            for row in os.environ.get(shortroot.ENV, '').splitlines():
+                long_root, _, short_root = row.partition('\t')
+                if long_root and short_root: shortroot.remap_env(os.environ, long_root, short_root)
     run = Run(a.out, a.events); t0 = time.time(); cur = None
     work_temp(run.out)
     share_walk_dir(a.out)
-    if bad:
-        for n, _, why, *_ in bad: run.say(f'【红】环境缺件 {n}：{why}')
-        run.ev('result', ok=False, msg='环境缺件：' + '、'.join(i[0] for i in bad)); return 75
+    # 自检只当提示、不拦（不许堵门，11-14 诊断#9478d5：一项判缺就整单退 75，什么都不做）：照做，真用到缺的那件的那步才失败、报那步的原话；
+    #   Metal 不是必需的：没有就这次不带着色器库（direct 里跳过），游戏里首次遇到的画面现编
+    for n, _, why, *_ in bad: run.say(f'【黄】环境自检说缺 {n}：{why}（照做，到要用它的那步再看）')
     try:
         x, tid, src_dir = from_extract(run, a.from_extract) if a.from_extract else unpack(run, a.source, a.title_id)
         if a.rt_shaders:

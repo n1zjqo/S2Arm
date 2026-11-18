@@ -7,6 +7,9 @@ public enum GameState: Equatable, Sendable {
     case playable
     case needsGameData
     case needsAppUpdate
+    /// The game's program on this device does not match this app (built for another version, signed from another computer or Apple ID,
+    /// or installed only partly). One state for all three: the fix is the same, install this game again from the computer.
+    case needsGameUpdate
     /// `reason` is one short line for under the title, such as "Game files damaged". `detail` is a plain sentence
     /// for the player (what happened, what to do), shown under the title and in the How to fix sheet. `technical`
     /// is the underlying message, shown only as small secondary Details in the sheet.
@@ -29,7 +32,15 @@ public struct InstallStage: Equatable, Sendable {
     }
     public var phase: Phase
     public var fraction: Double?
-    public init(_ phase: Phase, fraction: Double? = nil) { self.phase = phase; self.fraction = fraction.map { min(1, max(0, $0)) } }
+    /// While installing, which part is under way (single-file game data): 1 unpacking what was sent, 2 taking the small files
+    /// out of the game data file, 3 checking the files on this device; 4 waiting for another game to finish installing, 5 the host is
+    /// organizing the game folders (S2Arm). 0: not told, shown as plain Installing.
+    public var step: Int
+    /// Why the install did not finish, in one plain sentence from the host; nil: the general explanation.
+    public var reason: String?
+    public init(_ phase: Phase, fraction: Double? = nil, step: Int = 0, reason: String? = nil) {
+        self.phase = phase; self.fraction = fraction.map { min(1, max(0, $0)) }; self.step = step; self.reason = reason
+    }
 }
 
 public struct GameTile: Identifiable, Equatable, Sendable {
@@ -46,8 +57,10 @@ public struct GameTile: Identifiable, Equatable, Sendable {
     public var recentlyPlayed: String?
     /// Installed (or updated) and not opened since: a blue dot before its name, as iOS marks a new app.
     public var isNew: Bool
+    /// S-grade enhancements are built into this game (community patches / cheats in its cpatch.tsv): the cover lights a gold S (v0.4.0).
+    public var sgrade: Bool
     public init(id: String, title: String, subtitle: String = "", banner: Artwork? = nil, icon: Artwork? = nil,
-                state: GameState = .playable, recentlyPlayed: String? = nil, isNew: Bool = false) {
+                state: GameState = .playable, recentlyPlayed: String? = nil, isNew: Bool = false, sgrade: Bool = false) {
         self.id = id
         self.title = title
         self.subtitle = subtitle
@@ -56,6 +69,7 @@ public struct GameTile: Identifiable, Equatable, Sendable {
         self.state = state
         self.recentlyPlayed = recentlyPlayed
         self.isNew = isNew
+        self.sgrade = sgrade
     }
 }
 
@@ -259,12 +273,16 @@ public struct ShellActions {
     public var onUseShellCloud: ((String) -> Void)?
     public var onClearShellData: (() -> Void)?
     public var onClearShellCloud: (() -> Void)?
+    /// S2Arm: settings → "Report a problem" (the host packs the logs, uploads them and shows a short code). Nil hides the row.
+    public var onReportProblem: (() -> Void)?
     public var onGlobalPadMapChange: ((String, String) -> Void)?
     public var onGlobalPadMapReset: (() -> Void)?
     /// The button test opened (true) or closed: the host sends `PadSnapshot`s only in between.
     public var onButtonTest: (Bool) -> Void
     /// Deletes the game's data on this device and takes it off the list. `saves`: its saves go too.
     public var onDeleteGame: ((_ gameID: String, _ saves: Bool) -> Void)?
+    /// Opens the game's save management (export / import saves) before it starts. nil: no item in the card's menu.
+    public var onManageSaves: ((_ gameID: String) -> Void)?
     public init(onSelect: @escaping (String) -> Void = { _ in }, onPlay: @escaping (String) -> Void = { _ in },
                 onChange: @escaping (String, String, String) -> Void = { _, _, _ in },
                 onPickGameData: @escaping (String) -> Void = { _ in }, onUseAppData: ((String) -> Void)? = nil,
@@ -276,7 +294,7 @@ public struct ShellActions {
                 onClearShellCloud: (() -> Void)? = nil,
                 onGlobalPadMapChange: ((String, String) -> Void)? = nil,
                 onGlobalPadMapReset: (() -> Void)? = nil, onButtonTest: @escaping (Bool) -> Void = { _ in },
-                onDeleteGame: ((String, Bool) -> Void)? = nil) {
+                onDeleteGame: ((String, Bool) -> Void)? = nil, onManageSaves: ((String) -> Void)? = nil) {
         self.onSelect = onSelect
         self.onPlay = onPlay
         self.onChange = onChange
@@ -297,5 +315,6 @@ public struct ShellActions {
         self.onGlobalPadMapReset = onGlobalPadMapReset
         self.onButtonTest = onButtonTest
         self.onDeleteGame = onDeleteGame
+        self.onManageSaves = onManageSaves
     }
 }

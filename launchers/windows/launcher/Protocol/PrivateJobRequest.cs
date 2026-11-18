@@ -7,83 +7,79 @@ using System.Text;
 
 namespace S2Arm.Launcher.Protocol;
 
-// Requests carry player paths. The parent is private before a request file is created.
+// 作业请求文件：放在启动器自己的数据目录（%LOCALAPPDATA%\S2Arm\…，系统缺省就只归当前用户）里，普通建目录、写文件，不再自设权限。
+//   11-16 维护者：「玩家的电脑就是自己在用，干嘛搞这么多权限给自己设置一堆阻碍？」原先建目录时改属主、关继承、删其他账户的规则、给请求文件设受保护权限，
+//   目录先由别的进程建时把本人的写权限也删了，普通运行（UAC 下 Administrators 只能用来拒绝）点「添加游戏」直接拒绝访问。
+//   旧版收紧过的老目录：第一次用时写不进去，就给本人补回完全控制并恢复继承（旧版把属主设成了本人，补得上）；补不上照实抛，界面换成平实说明
 public sealed class PrivateJobRequest : IDisposable
 {
     public string FilePath { get; }
     private PrivateJobRequest(string path) => FilePath = path;
 
-    // 必须先于私有目录下的任何子目录调用：Directory.CreateDirectory 顺带建出的父目录带继承权限，之后的作业会被权限校验拒绝。
+    /// <summary>补回权限时记一笔（启动器起来时接到自己的日志；缺省不记）</summary>
+    public static Action<string> Note { get; set; } = _ => { };
+
+    private static readonly HashSet<string> Checked = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>建好数据目录；这个进程第一次用到它时核一次能不能写，旧版收紧过、写不进去就给本人补回权限</summary>
     public static void EnsurePrivateRoot(string privateRoot)
     {
-        if (OperatingSystem.IsWindows()) PrepareWindowsRoot(privateRoot);
+        var path = Path.GetFullPath(privateRoot);
+        Directory.CreateDirectory(path);
+        lock (Checked)
+        {
+            if (!Checked.Add(path)) return;
+        }
+        if (OperatingSystem.IsWindows() && !CanWrite(path)) RestoreOwnAccess(path);
     }
 
     public static PrivateJobRequest Create(string privateRoot, string json)
     {
-        if (!OperatingSystem.IsWindows()) throw new PlatformNotSupportedException("Windows request ACL required.");
-        var directory = PrepareWindowsRoot(privateRoot);
-        var path = Path.Combine(directory, "request-" + Guid.NewGuid().ToString("N") + ".json");
+        EnsurePrivateRoot(privateRoot);
+        var path = Path.Combine(Path.GetFullPath(privateRoot), "request-" + Guid.NewGuid().ToString("N") + ".json");
         var created = false;
         try
         {
-            using var file = CreateWindowsFile(path);
+            using var file = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None);
             created = true;
-            var bytes = Encoding.UTF8.GetBytes(json);
-            file.Write(bytes);
+            file.Write(Encoding.UTF8.GetBytes(json));
             file.Flush(flushToDisk: true);
             return new(path);
         }
         catch { if (created) File.Delete(path); throw; }
     }
 
-    [SupportedOSPlatform("windows")]
-    private static FileStream CreateWindowsFile(string path)
+    private static bool CanWrite(string directory)
     {
-        using var identity = WindowsIdentity.GetCurrent();
-        var current = identity.User ?? throw new IOException("Current user SID is missing.");
-        var security = new FileSecurity();
-        security.SetOwner(current);
-        security.SetAccessRuleProtection(true, false);
-        security.AddAccessRule(new FileSystemAccessRule(current, FileSystemRights.FullControl, AccessControlType.Allow));
-        return new FileInfo(path).Create(FileMode.CreateNew, FileSystemRights.Write, FileShare.None, 4096, FileOptions.None, security);
+        var probe = Path.Combine(directory, ".s2arm-write-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            using (new FileStream(probe, FileMode.CreateNew, FileAccess.Write, FileShare.None, 1, FileOptions.DeleteOnClose)) { }
+            return true;
+        }
+        catch (Exception e) when (e is UnauthorizedAccessException or IOException) { return false; }
     }
 
+    /// <summary>旧版收紧过的目录：恢复继承（回到系统缺省、跟上级一样），再加一条本人的可继承完全控制。属主是本人时隐含改权限的权利，补得上；
+    /// 补不上（属主是别的账户、本人也没有改权限的权利）不再报自设的提示，照常往下走、真写不进去时由调用方报「这个位置写不进去」</summary>
     [SupportedOSPlatform("windows")]
-    private static string PrepareWindowsRoot(string path)
+    private static void RestoreOwnAccess(string path)
     {
-        path = Path.GetFullPath(path);
-        using var identity = WindowsIdentity.GetCurrent();
-        var current = identity.User ?? throw new IOException("Current user SID is missing.");
-        var directory = new DirectoryInfo(path);
-        if (!directory.Exists)
+        try
         {
-            var security = new DirectorySecurity();
-            security.SetOwner(current);
-            security.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
-            security.AddAccessRule(new FileSystemAccessRule(current, FileSystemRights.FullControl,
+            using var identity = WindowsIdentity.GetCurrent();
+            var directory = new DirectoryInfo(path);
+            var acl = directory.GetAccessControl();
+            acl.SetAccessRuleProtection(isProtected: false, preserveInheritance: true);
+            acl.AddAccessRule(new FileSystemAccessRule(identity.User!, FileSystemRights.FullControl,
                 InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit, PropagationFlags.None, AccessControlType.Allow));
-            directory.Create(security);
+            directory.SetAccessControl(acl);
+            Note($"data folder was not writable (tightened by an older S2Arm); restored this account's access: {path}");
         }
-        directory.Refresh();
-        if ((directory.Attributes & FileAttributes.ReparsePoint) != 0)
-            throw new IOException("Private job root cannot be a reparse point.");
-        var acl = directory.GetAccessControl();
-        if (!current.Equals(acl.GetOwner(typeof(SecurityIdentifier))))
-            throw new IOException("Private job root is not owned by this user.");
-        var readers = FileSystemRights.ReadData | FileSystemRights.ReadAttributes | FileSystemRights.ReadExtendedAttributes |
-            FileSystemRights.ReadPermissions | FileSystemRights.Write | FileSystemRights.ChangePermissions | FileSystemRights.TakeOwnership;
-        var system = new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null);
-        var administrators = new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null);
-        foreach (FileSystemAccessRule rule in acl.GetAccessRules(true, true, typeof(SecurityIdentifier)))
+        catch (Exception e) when (e is UnauthorizedAccessException or InvalidOperationException or PrivilegeNotHeldException or IOException)
         {
-            if (rule.AccessControlType != AccessControlType.Allow) continue;
-            if ((rule.FileSystemRights & readers) != 0 && !rule.IdentityReference.Equals(current) &&
-                !rule.IdentityReference.Equals(system) && !rule.IdentityReference.Equals(administrators))
-                throw new IOException("Private job root grants another identity access.");
+            Note($"data folder is not writable and access could not be restored: {path} {e.Message}");
         }
-        if (!acl.AreAccessRulesProtected) throw new IOException("Private job root inherits permissions.");
-        return path;
     }
 
     public void Dispose() => File.Delete(FilePath);

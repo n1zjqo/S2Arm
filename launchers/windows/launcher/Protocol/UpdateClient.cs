@@ -30,16 +30,18 @@ public static class UpdateClient
     public static Task<JsonElement?> RunAsync(LauncherPaths paths, IEnumerable<string> command, Action<JsonElement>? onEvent, TimeSpan limit) =>
         RunScriptAsync(paths, "updater.py", command, onEvent, limit);
 
-    /// <summary>用随包 Python 跑 pack/jobs 下一个只用标准库的脚本（updater.py、batch.py），逐行交 JSON，返回最后一行；起不来或超时返回 null。</summary>
+    /// <summary>用随包 Python 跑 pack/jobs 下一个只用标准库的脚本（updater.py、batch.py），逐行交 JSON，返回最后一行；起不来或超时返回 null。
+    /// 超时 / 读失败时连子进程树一起结束：不然超时的下载还在后台跑，玩家点重试会再起一份同时写同一个暂存目录。</summary>
     internal static async Task<JsonElement?> RunScriptAsync(LauncherPaths paths, string script, IEnumerable<string> command, Action<JsonElement>? onEvent, TimeSpan limit)
     {
         var python = Path.Combine(Path.GetFullPath(paths.Runtime), "python", "python.exe");
         var scriptPath = Path.Combine(Path.GetFullPath(paths.Engine), "pack", "jobs", script);
         JsonElement? last = null;
         using var cancel = new CancellationTokenSource(limit);
+        Process? process = null;
         try
         {
-            using var process = Process.Start(Start(python, new[] { scriptPath }.Concat(command)))!;
+            process = Process.Start(Start(python, new[] { scriptPath }.Concat(command)))!;
             process.StandardInput.Close();
             var drain = process.StandardError.ReadToEndAsync(cancel.Token);
             while (await process.StandardOutput.ReadLineAsync(cancel.Token) is { } line)
@@ -53,16 +55,11 @@ public static class UpdateClient
             return last;
         }
         catch (Exception error) when (error is IOException or OperationCanceledException or System.ComponentModel.Win32Exception or InvalidOperationException) { return last; }
-    }
-
-    /// <summary>起独立的替换进程：它等本进程退出后换掉安装目录并重启，用的是 updates 里的 Python，不占安装目录。</summary>
-    public static void Apply(JsonElement ready, string installDir, string privateRoot, IEnumerable<string> relaunchArguments)
-    {
-        var info = new ProcessStartInfo(ready.GetProperty("python").GetString()!) { UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = Path.GetTempPath() };
-        foreach (var argument in new[] { "-X", "utf8", "-B", "-I", ready.GetProperty("updater").GetString()!, "apply",
-                     "--staged", ready.GetProperty("staged").GetString()!, "--install", installDir, "--pid", Environment.ProcessId.ToString(), "--private-root", privateRoot })
-            info.ArgumentList.Add(argument);
-        foreach (var argument in relaunchArguments) info.ArgumentList.Add("--arg=" + argument);
-        Process.Start(info)?.Dispose();
+        finally
+        {
+            try { if (process is { HasExited: false }) { process.Kill(entireProcessTree: true); process.WaitForExit(TimeSpan.FromSeconds(5)); } }
+            catch (Exception error) when (error is InvalidOperationException or System.ComponentModel.Win32Exception or NotSupportedException) { }
+            process?.Dispose();
+        }
     }
 }

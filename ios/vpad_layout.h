@@ -24,16 +24,21 @@ CGFloat S2AVPadKeyOpacity(CGFloat idle, BOOL active);
 + (nullable instancetype)readData:(NSData *)data error:(NSError **)error;
 // The built-in layout keeps the historical point geometry at each viewport size.
 + (instancetype)defaultForSafeRect:(CGRect)rect;
++ (instancetype)defaultForSafeRect:(CGRect)rect split:(BOOL)split;
 + (instancetype)twoDForSafeRect:(CGRect)rect;
 // 八方向十字键（没有摇杆的布局，即 2D 和从它改出来的）：触点落在十字键圆区内 → 方向位（上 1 / 下 2 / 左 4 / 右 8，斜角两位），
 //   圆区外或有摇杆的布局 → -1。圆心 = 四个方向键中心的平均，半径 = 最远方向键中心 + 半个键宽；正中心一小圈（半径 0.2）不算方向
 - (int)dpadDirectionsAt:(CGPoint)p safeRect:(CGRect)rect;
 + (BOOL)isBuiltinIdentifier:(NSString *)identifier;
 - (CGRect)frameForButton:(NSDictionary *)button safeRect:(CGRect)rect;
+- (CGRect)frameForButton:(NSDictionary *)button safeRect:(CGRect)rect avoiding:(CGRect)division;
+- (CGRect)frameForButton:(NSDictionary *)button safeRect:(CGRect)rect avoiding:(CGRect)division scale:(CGFloat)scale;
 // 触点落在哪个按键上（各键框外扩 slop 点，重叠处按 buttons 顺序取第一个）；没有返回 nil。vpad.m keyAt 用它，单测 t_vpad_stick_press 直接调
 - (nullable NSString *)buttonAt:(CGPoint)p safeRect:(CGRect)rect slop:(CGFloat)slop;
 // 同上，按每键缩放算框（绕键中心）；scales 里值为 0 的键不参与（隐藏），没列出的键取 scales[@"*"]，再没有按 1
 - (nullable NSString *)buttonAt:(CGPoint)p safeRect:(CGRect)rect slop:(CGFloat)slop scales:(nullable NSDictionary<NSString *, NSNumber *> *)scales;
+- (nullable NSString *)buttonAt:(CGPoint)p safeRect:(CGRect)rect slop:(CGFloat)slop avoiding:(CGRect)division nearest:(BOOL)nearest;
+- (nullable NSString *)buttonAt:(CGPoint)p safeRect:(CGRect)rect slop:(CGFloat)slop avoiding:(CGRect)division nearest:(BOOL)nearest scales:(nullable NSDictionary<NSString *, NSNumber *> *)scales;
 - (CGRect)activationForStick:(NSDictionary *)stick safeRect:(CGRect)rect;
 - (CGFloat)radiusForStick:(NSDictionary *)stick safeRect:(CGRect)rect;
 - (nullable NSData *)JSONData:(NSError **)error;
@@ -72,12 +77,16 @@ CGPoint S2AVPadStickResponse(CGPoint input, CGFloat deadzone, CGFloat saturation
 // 灵敏度：先把手指相对半径的位移乘 sensitivity，再钳到单位圆内。sensitivity = 1 与不调用相同
 CGPoint S2AVPadStickSensitivity(CGPoint input, CGFloat sensitivity);
 
-// 每键外观：大小倍率 0.6–1.6、不透明度 0.2–1、是否隐藏；与布局几何分开存，布局文件格式不变
+// 大小倍率范围（每键与整体同一范围）：上限原 1.6，#372 连打类游戏要更大的键，放到 4（文件格式不变，旧存档照读）
+#define S2A_VPAD_SCALE_MIN 0.6
+#define S2A_VPAD_SCALE_MAX 4.0
+// 每键外观：大小倍率 S2A_VPAD_SCALE_MIN–MAX、不透明度 0.2–1、是否隐藏；与布局几何分开存，布局文件格式不变
 typedef struct { CGFloat scale, opacity; BOOL hidden; } S2AVPadKeyStyle;
 static const NSInteger kS2AVPadKeyThemeCount = 5;   // 0 = 默认描线，1–4 = 配色
 
 @interface S2AVPadLayoutStore : NSObject
 @property(nonatomic, readonly, copy) NSURL *directory;
+@property(nonatomic, readonly) BOOL split;
 @property(nonatomic, readonly, copy) NSString *selectedIdentifier;
 // Invalid files remain on disk and are returned as visible diagnostics.
 @property(nonatomic, readonly, copy) NSArray<NSString *> *diagnostics;
@@ -105,7 +114,7 @@ static const NSInteger kS2AVPadKeyThemeCount = 5;   // 0 = 默认描线，1–4 
 - (S2AVPadKeyStyle)keyStyle:(NSString *)identifier;
 - (BOOL)setKeyStyle:(S2AVPadKeyStyle)style forKey:(NSString *)identifier persist:(BOOL)persist error:(NSError **)error;
 @property(nonatomic, readonly) NSInteger keyTheme;
-// 整体大小 0.6–1.6、整体不透明度 0.2–1：乘在每键值之上，也作用于摇杆；persist 同上
+// 整体大小 S2A_VPAD_SCALE_MIN–MAX、整体不透明度 0.2–1：乘在每键值之上，也作用于摇杆；persist 同上
 @property(nonatomic, readonly) CGFloat globalScale, globalOpacity;
 - (BOOL)setGlobalScale:(CGFloat)scale opacity:(CGFloat)opacity persist:(BOOL)persist error:(NSError **)error;
 - (BOOL)setKeyTheme:(NSInteger)theme error:(NSError **)error;
@@ -118,6 +127,8 @@ static const NSInteger kS2AVPadKeyThemeCount = 5;   // 0 = 默认描线，1–4 
 - (instancetype)initWithDirectory:(NSURL *)directory;
 // 布局与选择记录存 directory（多款容器壳 = 该游戏自己的目录），闲置透明度 / 触感 / 摇杆手感存 settingsDirectory（App 级，全部游戏共用）
 - (instancetype)initWithDirectory:(NSURL *)directory settingsDirectory:(NSURL *)settingsDirectory;
+// 分屏几何与选择存 directory/split；键/触模式、长按锁定和手动选择标记仍与普通布局共用。
+- (instancetype)initWithDirectory:(NSURL *)directory settingsDirectory:(NSURL *)settingsDirectory split:(BOOL)split;
 @property(nonatomic, readonly, copy) NSURL *settingsDirectory;
 // 拖动编辑的结果：同 id 原子覆盖（导入仍拒绝同 id，见 saveLayout:）；内置 id 拒绝
 - (BOOL)replaceLayout:(S2AVPadLayout *)layout error:(NSError **)error;
@@ -132,5 +143,10 @@ static const NSInteger kS2AVPadKeyThemeCount = 5;   // 0 = 默认描线，1–4 
 // 玩家手动选过方案（切换钮 / 提示条「切到触屏」/ 设置里的触屏布局）：.manual 标记，持久化；自动切（游戏声明触屏配置）见到它就不切
 @property(nonatomic, readonly) BOOL manualChosen;
 - (BOOL)markManual:(NSError **)error;
+/// 旧版 App 级「我的布局」接进这款（11-15 维护者「每款游戏记住自己的触屏布局」）：11-07 以前布局存在 App 级 VPadLayouts，按游戏存以后没人读。
+///   打开一款时把 App 级目录里玩家自己的布局（*.json，内置名除外、读得通的）复制进这款的布局目录，只复制不替玩家选上（每款从默认布局开始，
+///   默认布局所有游戏都能用；旧布局可能没有摇杆，不能当所有游戏的缺省）。这款已有同名文件不覆盖；每款只做一次（.legacy_adopted），玩家删了不再冒出来。
+///   两个目录相同（单款壳）时什么都不做。返回复制了几份
++ (NSUInteger)adoptLegacyLayoutsFrom:(NSURL *)appDirectory into:(NSURL *)gameDirectory;
 @end
 NS_ASSUME_NONNULL_END

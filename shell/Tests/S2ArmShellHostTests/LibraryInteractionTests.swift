@@ -92,8 +92,13 @@ import SwiftUI
     defer { defaults.removePersistentDomain(forName: suite) }
     let tiles = (1...4).map { GameTile(id: "\($0)", title: "Game \($0)") }
     var ready = Set(["1", "3", "4"])
+    // 隐藏项 = 玩家在这台设备上删掉、资源也不在的款（审计 P1-155 起，资源没到位但没删过的款留在库里）
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("s2a-hidden-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: root) }
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    try Data("2".utf8).write(to: root.appendingPathComponent(".s2a-removed.txt"))
     let model = S2ArmShellHostModel(catalogue: Catalogue(tiles: tiles, problems: []),
-        stores: .init(game: { _ in nil }, app: defaults), installState: { ready.contains($0) ? 1 : 0 })
+        stores: .init(game: { _ in nil }, app: defaults), installState: { ready.contains($0) ? 1 : 0 }, gamesRoot: root)
     let reorder = try #require(model.actions.onReorderGames)
     #expect(!reorder(["1", "2"], "4"))
     #expect(!reorder(["1"], "2"))
@@ -169,5 +174,17 @@ import SwiftUI
             }
         }
     }
+}
+#endif
+
+#if canImport(SwiftUI)
+@Test func phoneUprightGetsASplitScreenForTheEditor() {
+    // 11-13 不许堵门：普通 iPhone 也能开上下分屏，编辑器原先只给折叠屏 / iPad 竖屏，iPhone 改不了分屏布局。
+    //   手算：440×956 点竖屏、上安全区 62、下有主屏指示条 → 竖屏画布 440×956、上 62 下 34；无折痕按中线 478 分：上区 (0,62,440,416)、按键区从 478 起
+    let s = TouchLayoutScreens.device(window: CGSize(width: 440, height: 956), insets: EdgeInsets(top: 62, leading: 0, bottom: 34, trailing: 0), isPad: false)
+    #expect(s.upright?.size == CGSize(width: 440, height: 956))
+    #expect(s.upright?.insets.top == 62 && s.upright?.insets.bottom == 34 && s.upright?.division == nil)
+    let r = PadGeo.region(s.upright!)
+    #expect(r.separated && r.controls.minY == 478 && r.game.width == 440)
 }
 #endif

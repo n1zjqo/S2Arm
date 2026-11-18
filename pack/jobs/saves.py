@@ -19,9 +19,10 @@ import struct
 import unicodedata
 import uuid
 import zipfile
+import zlib
 from pathlib import Path, PurePosixPath
 
-from core import Failure, atomic, contained
+from core import Failure, atomic, contained, resolve_path
 from library import input_identity, selected_packages
 import save_formats
 import layout
@@ -132,6 +133,8 @@ def scan(c, root):
     for parent, children, leaves in os.walk(root, followlinks=False):
         for name in sorted(children + leaves):
             c.check()
+            if _lay.os_junk(name):   # 系统自动生成的附属文件（exFAT / FAT 上的 ._<名>、访达 .DS_Store 等）不是存档：不备份、不导入、不算「存档变了」
+                continue
             p = Path(parent) / name
             rel = p.relative_to(root).as_posix()
             path_name(rel)
@@ -353,7 +356,6 @@ def write_archive(c, game, root, destination):
     done = 0
     try:
         with temporary.open("xb") as f:
-            os.chmod(temporary, 0o600)
             with zipfile.ZipFile(f, "w", zipfile.ZIP_DEFLATED, compresslevel=3) as z:
                 for name, info in selected.items():
                     h = hashlib.sha256()
@@ -374,7 +376,14 @@ def write_archive(c, game, root, destination):
             if checked != manifest:
                 raise ValueError("backup validation failed")
         c.check()
-        os.link(temporary, destination)
+        try:
+            os.link(temporary, destination)   # 不覆盖地放到位：目标已在就失败
+        except FileExistsError:
+            raise
+        except OSError:   # 盘上建不了硬链接（exFAT / FAT32，v0.3.1 玩家确认过照用）：先核没有同名，再改名放到位
+            if os.path.lexists(destination):
+                raise FileExistsError(destination)
+            os.replace(temporary, destination)
         fsync_dir(destination.parent)
     finally:
         temporary.unlink(missing_ok=True)
@@ -533,17 +542,29 @@ def validate_archive(c, z):
         or not any(n.startswith("bis/user/save/") for n in file_names)
     ):
         raise ValueError("unexpected or missing backup entries")
+    # 维护者 11-17：个别文件 CRC / SHA 对不上不再整份拒绝——记下这几个（damaged），恢复时不写它们、保留目标原来的那份，其余照常恢复。
+    #   账号索引与用户表坏了没法知道哪份存档归谁，照旧拒绝（恢复出来的存档会对不上账号）
+    damaged = []
     for item in files:
         h, count = hashlib.sha256(), 0
-        with z.open("payload/" + item["path"]) as stream:
-            while chunk := stream.read(CHUNK):
-                c.check()
-                count += len(chunk)
-                if count > item["size"]:
-                    raise ValueError("oversized backup entry")
-                h.update(chunk)
+        try:
+            with z.open("payload/" + item["path"]) as stream:
+                while chunk := stream.read(CHUNK):
+                    c.check()
+                    count += len(chunk)
+                    if count > item["size"]:
+                        break
+                    h.update(chunk)
+        except zipfile.BadZipFile as e:   # 只有这一份内容的 CRC 坏了才算坏文件；文件名与目录不一致等结构问题是安全检查，照旧整份拒绝
+            if not str(e).startswith("Bad CRC-32"):
+                raise ValueError("unsafe ZIP structure") from e
+            count = -1
+        except (zlib.error, EOFError):   # 这一份的压缩流坏了
+            count = -1
         if count != item["size"] or h.hexdigest() != item["sha256"]:
-            raise ValueError("backup checksum mismatch")
+            if item["path"] in (PROFILE, SAVE_INDEX):
+                raise ValueError("backup checksum mismatch in account metadata")
+            damaged.append(item["path"])
     if z.getinfo("payload/" + PROFILE).file_size > MAX_MANIFEST:
         raise ValueError("oversized user profile")
     profile_names(json_object(z.read("payload/" + PROFILE)))
@@ -571,6 +592,8 @@ def validate_archive(c, z):
     manifest = manifest | dict(
         saveEntries=indexed, users=save_users(indexed), deviceSettings=settings
     )
+    if damaged:
+        manifest["damaged"] = damaged
     yield manifest
 
 
@@ -604,9 +627,9 @@ class RecoveryFailed(Exception):
 def recovery_message(error):
     # 与 iPhone 存档页同一口径：说清记录在哪、可以先备份、单独确认后仍可启动、记录不删（审计 18:00 P0-3）
     return (
-        f"存档恢复事务尚未完成，自动回退失败。事务记录在 {error.journal}"
-        + (f"，上次的数据副本在 {error.transaction}" if error.transaction else "")
-        + "。可以先「备份存档」把当前存档拷走；确认可能丢掉这次没做完的导入 / 恢复后，可选择「仍要启动」。"
+        f"存档恢复事务尚未完成，自动回退失败。事务记录在 {error.journal}"  # 非玩家句
+        + (f"，上次的数据副本在 {error.transaction}" if error.transaction else "")  # 非玩家句
+        + "。可以先「备份存档」把当前存档拷走；确认可能丢掉这次没做完的导入 / 恢复后，可选择「仍要启动」。"  # 非玩家句
         "记录不会删除，下次启动会再试恢复。"
     )
 
@@ -667,7 +690,7 @@ def recover(c, game, override=False):
     except RecoveryFailed as error:
         if not override:
             fail(c, recovery_message(error), "recovery")
-        report(c, recovery_message(error) + "（玩家已确认仍要启动）", "recovery_overridden", "warning")
+        report(c, recovery_message(error) + "（玩家已确认仍要启动）", "recovery_overridden", "warning")  # 非玩家句
         return False
 
 
@@ -720,12 +743,13 @@ def backup(c):
     with stopped(c, tolerate=True) as (game, _, _):
         root, _, _ = locations(c, game)
         destination = Path(c.r["path"]).expanduser()
-        destination = destination.parent.resolve() / destination.name
-        home = layout.root_of(c, game["id"]).resolve()   # 这款所在存放位置（可以不是默认游戏库）也不许放
+        destination = resolve_path(destination.parent) / destination.name
+        home = resolve_path(layout.root_of(c, game["id"]))   # 这款所在存放位置（可以不是默认游戏库）也不许放
+        library = resolve_path(c.library)   # 玩家写的样子（映射盘保留盘符）→ 和解析过的 destination 同一写法再比
         if (
             not destination.parent.is_dir()
-            or destination == c.library
-            or c.library in destination.parents
+            or destination == library
+            or library in destination.parents
             or destination == home
             or home in destination.parents
             or destination == c.private
@@ -805,6 +829,58 @@ def save_top(read, files, dirs, game):
     }
 
 
+# 本地玩家（#623）：启动器顶栏选的玩家。起局（build.runtime_env）与导入社区存档都按它定用户号，规则同服务层
+#   services/S2A.Services/LocalPlayer.cs：其他玩家 = 请求里的用户号；第一个玩家 = 他的存档位置 SaveData 里记的用户号
+#   （SaveFolder.FolderUser：user 文件，否则 Ryujinx 导出的 ExtraData0），都没有 = Ryujinx 缺省用户
+FIRST_PLAYER = "first"
+DEFAULT_USER = "00000000000000010000000000000000"   # Ryujinx AccountManager.DefaultUserId
+
+
+def requested_player(r):
+    """请求里的 player {user: first | 32 位小写十六进制, name, folder: SaveData | SaveData-…}；没带 = None（没建过玩家，旧行为）"""
+    player = r.get("player")
+    if player is None:
+        return None
+    if not (
+        isinstance(player, dict)
+        and isinstance(player.get("name", ""), str)
+        and (player.get("user") == FIRST_PLAYER or re.fullmatch(r"(?!0{32})[0-9a-f]{32}", str(player.get("user", ""))))
+        and re.fullmatch(r"SaveData(-[^/\\:]{1,120})?", str(player.get("folder", "")))
+        and (player["user"] == FIRST_PLAYER) == (player["folder"] == "SaveData")
+    ):
+        raise Failure("玩家设置无效。")
+    return player
+
+
+def folder_user(folder, program):
+    """存档位置里记的用户号（同 services SaveFolder.FolderUser）；没有 = None"""
+    with contextlib.suppress(OSError):
+        hint = (folder / "user").read_text(encoding="utf-8").strip()
+        return hint.lower() if re.fullmatch(r"[0-9a-fA-F]{32}", hint) else None
+    if not folder.is_dir():
+        return None
+    for meta in sorted(folder.rglob("ExtraData0")):
+        with contextlib.suppress(OSError):
+            data = meta.read_bytes()[:0x40]
+            if len(data) < 0x40:
+                continue
+            owner, high, low, static = struct.unpack_from("<4Q", data)
+            if owner == program and data[0x20] == 1 and static == 0 and (high or low):
+                return f"{high:016x}{low:016x}"
+    return None
+
+
+def player_user(c, game, player):
+    """这个玩家起局时用的用户号"""
+    if player["user"] != FIRST_PLAYER:
+        return player["user"]
+    try:
+        folder = safe_path(_lay.root_of(c, game["id"]), _lay.path(c, game["id"], "SaveData", create=False))
+    except ValueError:
+        fail(c, "存档目录包含链接，已停止操作。", "unsafe_path")
+    return folder_user(folder, int(game["id"], 16)) or DEFAULT_USER
+
+
 def import_notice(c, game, root, source):
     """只跑识别、不写归档：取这个来源该不该提示「目录结构存疑」。早于提示小文件的缓存补算这一句用。
     补算失败只少一句提示，绝不挡导入。"""
@@ -831,7 +907,9 @@ def external_archive(c, game, root, source):
     与归档同时写进缓存旁的小文件，缓存命中时不必重跑识别也能取回。
     """
     try:
-        key = hashlib.sha256((source_digest(c, source) + fingerprint(c, root)).encode()).hexdigest()[:32]
+        player = requested_player(c.r)
+        user = player_user(c, game, player) if player else ""   # 换个玩家导同一份来源 = 另一份转换结果
+        key = hashlib.sha256((source_digest(c, source) + fingerprint(c, root) + user).encode()).hexdigest()[:32]
         cache = safe_path(_lay.root_of(c, game["id"]), _lay.root_of(c, game["id"]) / "save-imports" / game["id"])
     except ValueError:
         fail(c, "存档目录包含链接，已停止操作。", "unsafe_path")
@@ -869,6 +947,11 @@ def external_archive(c, game, root, source):
                 for e in save_entries(read, files, dirs)
                 if e["programId"] == game["id"].lower() and (kind is None or e["type"] == kind)
             ]
+            if user:   # 本地玩家：账号存档只认这个玩家的；这款有别人的账号存档、没有他的 = 他还没玩过，不往别人或设备存档里放
+                others = [e for e in entries if e["type"] == "account" and e["userId"] != user]
+                entries = [e for e in entries if e not in others]
+                if others and kind != "device" and not any(e["type"] == "account" for e in entries):
+                    fail(c, "这位玩家还没有这款游戏的存档。请先选这位玩家运行一次游戏并存档，再导入。", "no_target")
             if kind is None and len(entries) > 1:   # 同时有账户存档和设备存档的游戏：没说明类型的来源按账户存档
                 entries = [e for e in entries if e["type"] == "account"] or entries
             if len(entries) != 1:
@@ -880,7 +963,7 @@ def external_archive(c, game, root, source):
                     "no_target",
                 )
             sid = entries[0]["saveId"]
-            cache.mkdir(parents=True, exist_ok=True, mode=0o700)
+            cache.mkdir(parents=True, exist_ok=True)
             stage = Path(tempfile.mkdtemp(prefix=".import.", dir=cache))
             try:
                 tree = stage / "root"
@@ -909,10 +992,18 @@ def external_archive(c, game, root, source):
     return destination, notice
 
 
+VERSION_NOTICE = "备份与当前游戏版本或更新、DLC 组合不符，仍可恢复；游戏可能读不到这份进度，恢复前的存档会自动保留一份副本。"
+CHANGED_NOTICE = "确认之后当前存档又变了，已把当前进度另存一份恢复前副本，照常恢复。"
+USER_NOTICE = "备份用户与当前存档用户不符，仍可恢复；恢复后当前用户的进度会换成备份里的，恢复前的存档会自动保留一份副本。"
+
+
 def checked_archive(c, game, root):
-    """校验来源（我方备份或社区存档）→ (归档路径, 清单, 归档 sha, 提示)；提示只给界面显示，不参与任何判定。"""
+    """校验来源（我方备份或社区存档）→ (归档路径, 清单, 归档 sha, 提示)；提示只给界面显示，不参与任何判定。
+    维护者 11-17：版本 / DLC 组合、用户归属对不上不再拒绝恢复——玩家手动恢复时写进提示（确认前看得到）、发 warning 照常恢复，
+    恢复前副本照留。云存档自动同步（请求带 sync，没人看提示、也不经玩家确认）照旧拒绝，免得悄悄换掉进度"""
     source = Path(c.r["path"]).expanduser()
     notice = ""
+    mismatch = []
     try:
         external = (source.exists() or source.is_symlink()) and not own_backup(source)
     except (ValueError, OSError, zipfile.BadZipFile):
@@ -920,7 +1011,7 @@ def checked_archive(c, game, root):
     if external:
         source, notice = external_archive(c, game, root, source)
     try:
-        if source.stat().st_size > MAX_BYTES + (64 << 20) or root in source.resolve().parents:
+        if source.stat().st_size > MAX_BYTES + (64 << 20) or root in resolve_path(source).parents:
             raise ValueError("invalid backup location or size")
         before = hash_file(c, source)
         with open_archive(c, source) as (_, manifest):
@@ -931,7 +1022,9 @@ def checked_archive(c, game, root):
                 manifest["game"].get("version") != wanted["version"]
                 or manifest["game"].get("contentIdentity") != wanted["contentIdentity"]
             ):
-                fail(c, "备份与当前游戏版本或更新、DLC 组合不符，已拒绝恢复。", "version")
+                if c.r.get("sync"):
+                    fail(c, "备份与当前游戏版本或更新、DLC 组合不符，已拒绝恢复。", "version")
+                mismatch.append((VERSION_NOTICE, "version"))
             if root.exists():
                 files, dirs = scan(c, root)
                 if any(n.startswith("bis/user/save/") for n in files):
@@ -941,17 +1034,31 @@ def checked_archive(c, game, root):
                         save_entries(lambda name: (root / name).read_bytes(), files, dirs)
                     )
                     incoming = ownership(manifest["saveEntries"])
-                    if any(target[key] != incoming[key] for key in target.keys() & incoming.keys()):
-                        fail(c, "备份用户与当前存档用户不符，已拒绝恢复。", "wrong_user")
+                    # 本地玩家（#623）：账号集合是包含关系（一边多了 / 少了玩家）照常恢复，各有对方没有的才拒绝（同 SaveTransferArchive.cs Identity）
+                    if any(not (target[key] <= incoming[key] or incoming[key] <= target[key])
+                           for key in target.keys() & incoming.keys()):
+                        if c.r.get("sync"):
+                            fail(c, "备份用户与当前存档用户不符，已拒绝恢复。", "wrong_user")
+                        mismatch.append((USER_NOTICE, "wrong_user"))
+        damaged = manifest.get("damaged") or []
+        if damaged:
+            if c.r.get("sync"):
+                fail(c, "备份文件 CRC 或 SHA-256 校验失败，已拒绝恢复。", "damaged")
+            names = "、".join(damaged[:5]) + (" 等" if len(damaged) > 5 else "")
+            mismatch.append((f"备份里有 {len(damaged)} 个文件校验对不上（{names}），这几个不恢复、保留当前存档里原来的，其余照常恢复。", "damaged"))
         if before != hash_file(c, source):
             fail(c, "备份已变化，请重新检查。", "changed")
-        return source, manifest, before, notice
+        for text, code in mismatch:
+            report(c, text, code, "warning")
+        return source, manifest, before, "\n".join([notice] * bool(notice) + [text for text, _ in mismatch])
     except (ValueError, OSError, zipfile.BadZipFile, KeyError, TypeError, RuntimeError):
         fail(c, "备份损坏、格式不支持或包含不安全路径，已拒绝恢复。", "invalid")
 
 
 SEED_NOTICE = "这款游戏在这台电脑上还没玩过：存档会在下次启动游戏时放进去。"
-SEED_DONE_LINE = "S2A 带存档起局："
+# 服务层 SeedFrom 每一类都灌入后才打这一句（services/S2A.Services/Saves.cs SeedAllDoneLine，两边一字不差；审计 P1-156：
+#   原先认「S2A 带存档起局：」，它在真正灌入前的「当前用户」行和每一类成功行都有，前一类成功、后一类失败也删了种子）
+SEED_DONE_LINE = "S2A 带存档起局完成："  # 非玩家句
 
 
 def pending_seed(c, gid):
@@ -1032,7 +1139,7 @@ def seed_restore(c, game, root, source):
     pending = pending_seed(c, game["id"])
     stage = pending.with_name(".pending-seed.new")
     shutil.rmtree(stage, ignore_errors=True)
-    stage.mkdir(parents=True, mode=0o700)
+    stage.mkdir(parents=True)
     with opened_seed(c, game, source) as (data, kind):
         copy_tree(c, Path(data), stage / seed_kind(c, game, kind))
     shutil.rmtree(pending, ignore_errors=True)
@@ -1047,7 +1154,7 @@ def claim_seed(c, gid):
 
 
 def finish_seed(c, gid, log):
-    """一局结束后：运行时报了灌入成功才删；没成功留着，下次启动再放"""
+    """一局结束后：运行时报了每一类都灌入成功才删；没全成功留着，下次启动再放"""
     pending = pending_seed(c, gid)
     with contextlib.suppress(OSError):
         if SEED_DONE_LINE in Path(log).read_text(encoding="utf-8", errors="replace"):
@@ -1083,7 +1190,6 @@ def copy_tree(c, source, destination):
         target = destination / name
         target.parent.mkdir(parents=True, exist_ok=True)
         with target.open("xb") as f:
-            os.chmod(target, 0o600)
             for chunk in file_chunks(c, source / name):
                 f.write(chunk)
             f.flush()
@@ -1099,19 +1205,21 @@ def restore(c):
             return seed_restore(c, game, root, seed)
         source, manifest, sha, _ = checked_archive(c, game, root)
         target_hash = fingerprint(c, root)
-        if (
-            c.r.get("archiveSha256") != sha
-            or c.r.get("targetFingerprint") != target_hash
-            or c.r.get("previewLibraryId") != c.r["libraryId"]
-        ):
+        # 维护者 11-17：检查之后备份或当前存档又变了（玩家刚又存了一次）不再拒绝——上面刚按现在的内容重新校验过，恢复前副本也在下面这次执行时现拍，
+        #   刚存的进度就在副本里；提示一句照常恢复。换了游戏库照旧拒绝。云存档自动同步（sync）照旧拒绝
+        if c.r.get("previewLibraryId") != c.r["libraryId"]:
             fail(c, "备份或当前存档已变化，请重新检查备份后再确认恢复。", "changed")
+        if c.r.get("archiveSha256") != sha or c.r.get("targetFingerprint") != target_hash:
+            if c.r.get("sync"):
+                fail(c, "备份或当前存档已变化，请重新检查备份后再确认恢复。", "changed")
+            report(c, CHANGED_NOTICE, "changed", "warning")
         token = uuid.uuid4().hex
-        transactions.mkdir(parents=True, exist_ok=True, mode=0o700)
+        transactions.mkdir(parents=True, exist_ok=True)
         transaction = transactions / token
-        transaction.mkdir(mode=0o700)
+        transaction.mkdir()
         atomic(transaction / "owner.json", dict(schema=1, gameId=game["id"], transaction=token))
         previous = backups / token
-        previous.mkdir(parents=True, mode=0o700)
+        previous.mkdir(parents=True)
         sync_parents(transaction, layout.root_of(c, game["id"]))
         sync_parents(previous, layout.root_of(c, game["id"]))   # 备份目录在这款所在的存放位置下，不一定在默认游戏库里
         new, old = transaction / "new", previous / "data"
@@ -1142,12 +1250,18 @@ def restore(c):
                 for name in manifest["directories"]:
                     (new / name).mkdir(parents=True, exist_ok=True)
                 done, total = 0, sum(f["size"] for f in manifest["files"])
+                damaged = set(manifest.get("damaged") or ())
                 for item in manifest["files"]:
                     path = new / item["path"]
                     path.parent.mkdir(parents=True, exist_ok=True)
+                    if item["path"] in damaged:   # 校验对不上的：不写坏的，目标原来有就留原来的那份
+                        kept = root / item["path"]
+                        if kept.is_file() and not kept.is_symlink():
+                            shutil.copyfile(kept, path)
+                        done += item["size"]
+                        continue
                     h = hashlib.sha256()
                     with z.open("payload/" + item["path"]) as src, path.open("xb") as dst:
-                        os.chmod(path, 0o600)
                         while chunk := src.read(CHUNK):
                             c.check()
                             dst.write(chunk)
@@ -1159,7 +1273,12 @@ def restore(c):
                     if h.hexdigest() != item["sha256"]:
                         raise ValueError("backup changed while extracting")
             if fingerprint(c, root) != target_hash:
-                fail(c, "当前存档已变化，请停止游戏并重新检查备份。", "changed")
+                if c.r.get("sync"):
+                    fail(c, "当前存档已变化，请停止游戏并重新检查备份。", "changed")
+                # 恢复途中当前存档又被写了：再拍一份恢复前副本（刚写的进度在里面），照常恢复；原目录本来也整份留在恢复前副本旁边
+                if any(n.startswith("bis/user/save/") for n in scan(c, root)[0]):
+                    write_archive(c, game, root, previous / "before-restore-2.s2asave")
+                report(c, CHANGED_NOTICE, "changed", "warning")
             for parent, _dirs, _ in os.walk(new, topdown=False):
                 fsync_dir(parent)
             record = dict(

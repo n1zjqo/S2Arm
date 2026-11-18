@@ -6,7 +6,7 @@ Mac 的 pack/ipa.sh 与 Windows 的 Python 编排调同一份（原 ipa.sh 这�
 
   ipa_tail.py --work <工作根> --game <款> --shell <壳目录> --bundle-id <包名> --suffix <显示名后缀> --key <包键串> --title <游戏名>
               --sign none|adhoc|dev [--team <签名团队>] [--save-identity <存档身份 json>] [--app-only]
-  步骤：组装（ship_ext build）→ 存档身份 → 图标 → Info.plist（包号 / 着色器目标 / 画面模式 / 出包时间）→ 签名 → 提高内存上限权限核实 → 打 ipa
+  步骤：组装（ship_ext build）→ 存档身份 → 图标 → Info.plist（包号 / 着色器目标 / 画面模式 / 显示版本 / 出包时间）→ 签名 → 提高内存上限权限核实 → 打 ipa
         → Metal 3 辅助库进包核对 →（--app-only 到此为止）→ 资源包要件核对 → 资源包（pack.py）→ 资源包核对（verify.py）
   签名：none = 不签（Windows / 交给侧载工具签：壳主程序与游戏镜像包已各自带 ad-hoc 签名，侧载工具重签）；adhoc = 本机 codesign 自签（只 Mac）；
         dev = 开发直签（只 Mac，pack/dev_sign.py，缺描述文件时 ensure_profile.sh 补）
@@ -35,13 +35,22 @@ PY = os.environ.get('S2A_PY') or sys.executable
 class Red(Exception): pass
 
 
-PROG = [int(os.environ.get('S2A_PKG_PROG_DONE', '0')), int(os.environ.get('S2A_PKG_PROG_TOTAL', '5'))]   # 出包进度：调用方已走的步数 / 总步数（出壳那步在调用方）
+PROG = [int(os.environ.get('S2A_PKG_PROG_DONE', '0')), 0]   # 出包进度：已走的步数（含调用方出壳那步）/ 总步数（main 里按 plan_steps 定）
+
+
+def plan_steps(sign, app_only):
+    """这次收尾要走的计时步（每步 step() 记一行、进度加 1）：总步数只从这张表推，不手写常数
+    （维护者截图「出包 6/5」：原先总数在 pack/ipa.sh 手写 5，后加「单文件镜像」没跟上，Mac 签名出包实走 6 步）。
+    改 assemble 的 step() 调用必须同改这里，tests/test_ipa_tail.py 按各分支真跑核对"""
+    return (['组装（预编壳）'] + (['签名'] if sign in ('adhoc', 'dev') else []) + ['打ipa']
+            + ([] if app_only else ['资源包', '资源包核对', '单文件镜像']))
 
 
 def dev_facilities():
-    """Info.plist S2ADevFacilities：启动器给玩家出包（S2A_PACK_PURPOSE=user）写 "0"，宿主不起停住现场 / 地址走势 / 内存与音频周期账；
-    别的用途（实验 / 普查 / 手测）返回空串 = 删键 = 开发设施照开（11-07 质量线，cmdr/壳内开发设施盘点.md）"""
-    return '0' if os.environ.get('S2A_PACK_PURPOSE') == 'user' else ''
+    """Info.plist S2ADevFacilities：只有我们自己的开发包（S2A_PACK_PURPOSE=dev）写 "1"；其余一律写 "0"（宿主不起停住现场 / 地址走势 /
+    内存与音频周期账 / 录手柄）。11-17 反过来：原先只有玩家包写 "0"、别的删键 = 开，哪条出包路径漏设 S2A_PACK_PURPOSE 就漏开
+    （玩家手机 Documents/padrec 一小时长 3 GB）。宿主缺省也改关（runtime/src/dev_facilities.h），要开发设施的局起局时设 S2A_DEV_FACILITIES=1"""
+    return '1' if os.environ.get('S2A_PACK_PURPOSE') == 'dev' else '0'
 
 def tick():   # = tools/progress.sh prog_tick 出包 <已走> <总>（启动器进度条读 S2A_PROGRESS）
     PROG[0] += 1
@@ -138,7 +147,7 @@ def assemble(a):
     al = os.path.join(pkg, 'archive.log')   # 打 ipa 自己的输出（原先直接落进调用方的 tail.out，失败时随临时产物根一起删掉）
     app = os.path.join(w, 'build', 'ios', 'S2Arm.app')
     if os.path.lexists(os.path.join(w, 'build')): shutil.rmtree(os.path.join(w, 'build'), onerror=_writable)   # 上次组装的临时 App（重跑 / 失败残留）
-    icon = os.path.join(R, 'launchers/macos/Branding/AppIcon-1024.png')   # 宿主 App 永远用 S2Arm 自己的图标；游戏图标只给库里的入局入口（11-08 维护者）
+    icon = os.path.join(R, 'launchers/macos/Branding/AppIcon-iOS.png')   # iPhone 用鲜艳版玻璃 S（11-13 维护者：Mac 不动）；宿主 App 永远用 S2Arm 自己的图标；游戏图标只给库里的入局入口（11-08 维护者）
     if not os.path.isfile(icon): raise Red(f'引擎里缺 S2Arm 图标（{icon}）')
     if step(tl, '组装（预编壳）', [PY, os.path.join(H, 'ship_ext.py'), 'build', '--shell', a.shell, '--root', w, '--out', app,
                                    '--bundle-id', a.bundle_id, '--suffix', a.suffix, '--icon', icon], bl):
@@ -149,10 +158,11 @@ def assemble(a):
         if run([PY, os.path.join(H, 'save_identity.py'), '--check', a.save_identity, '--output', si], bl): raise Red('存档游戏身份校验失败')
         shutil.copyfile(si, os.path.join(app, 'save-identity.json'))
     if run([PY, os.path.join(H, 'app_bundle.py'), 'write_icons', icon, app], bl): raise Red(f'加图标失败（{last(bl)}）')
+    sys.path.insert(0, os.path.join(H, 'jobs')); from core import display_version   # 界面版本字（设置页 / 游戏库顶部，同容器 ship_ext --display-version；空 = 删键）
     kv = [('S2ABuildID', build_id(a.key)), ('S2APsoTarget', pso_target(w)), ('S2AGameTitle', a.title), ('S2AGraphicsMode', 'direct'),   # 只有直连（11-07 拆通用模式）
-          ('S2ADirectLibVersion', direct_lib_version(w)),
+          ('S2ADirectLibVersion', direct_lib_version(w)), ('S2ADisplayVersion', display_version(R)),
           ('S2APackTime', datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')),
-          ('S2ADevFacilities', dev_facilities())]   # 开发设施开关（runtime/src/os.c s2a_dev_on）：玩家包写 "0"，开发包删键（= 开）
+          ('S2ADevFacilities', dev_facilities())]   # 开发设施开关（runtime/src/os.c s2a_dev_on）：开发包（S2A_PACK_PURPOSE=dev）写 "1"，其余 "0"
     for k, v in kv:
         if run([PY, os.path.join(H, 'app_bundle.py'), 'update_metadata', app, '--set', f'{k}={v}'], bl): raise Red(f'Info.plist 写 {k} 失败')
     ent = os.path.join(H, 'app.entitlements')
@@ -179,7 +189,8 @@ def assemble(a):
     want = sorted((n for n in os.listdir(hl) if n.endswith('.metallib')), key=lambda s: s.encode()) if os.path.isdir(hl) else []
     with zipfile.ZipFile(ipa) as z:
         got = sorted((n.rsplit('/', 1)[1] for n in z.namelist() if re.match(r'Payload/[^/]+\.app/gal_helpers/m3/[^/]+\.metallib$', n)), key=lambda s: s.encode())
-    if not want or want != got: raise Red(f'ipa 里 Metal 3 兼容辅助库与构建目录不符（构建 {len(want)} 个、包里 {len(got)} 个）')
+    if not want or want != got:   # 维护者 11-17：校验不过不再整个拒绝——只影响这款，黄字说清后照常出包
+        print(f'🟡 ipa 里 Metal 3 兼容辅助库与构建目录不符（构建 {len(want)} 个、包里 {len(got)} 个），照常继续；Metal 3 机型首次进新场景可能现编卡顿')
     if a.app_only: return ipa
     check_pack_inputs(w, g)
     srcs = os.path.join(pkg, 'srcs.txt')
@@ -229,7 +240,10 @@ def main():
     p.add_argument('--bundle-id', required=True); p.add_argument('--suffix', default=''); p.add_argument('--key', required=True)
     p.add_argument('--title', required=True); p.add_argument('--sign', choices=('none', 'adhoc', 'dev'), required=True)
     p.add_argument('--team', default=''); p.add_argument('--save-identity', default=''); p.add_argument('--app-only', action='store_true')
+    p.add_argument('--count-steps', action='store_true', help='只打印这次要走几步（pack/ipa.sh 算出壳那步的总数用）')
     a = p.parse_args()
+    if a.count_steps: print(len(plan_steps(a.sign, a.app_only))); return 0
+    PROG[1] = PROG[0] + len(plan_steps(a.sign, a.app_only))
     if a.sign == 'dev' and not a.team: print('【红】开发直签要 --team'); return 1
     if a.sign != 'none' and sys.platform != 'darwin': print(f'【红】签名方式 {a.sign} 只能在 Mac 上（Windows 用 none，交给侧载工具签）'); return 1
     try: assemble(a)
